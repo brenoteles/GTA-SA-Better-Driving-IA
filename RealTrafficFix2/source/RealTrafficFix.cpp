@@ -1381,6 +1381,7 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 // Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
 // 120 km/h and more; curves under 70 km/h as before. Fast curves were braked far below what the car could do
 static float cfgFastCurveGripBoost = 1.6f;
+static float cfgHighwayGapFactor = 0.5f;  // following time gap on freeways/fast roads, x the profile's
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
     float t = std::clamp((v - 70.0f / 3.6f) / ((120.0f - 70.0f) / 3.6f), 0.0f, 1.0f);
@@ -2459,15 +2460,20 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
                     exitDir *= 1.0f / exitLen;
                     const CVector2D er(exitDir.y, -exitDir.x);
                     const int exitLanes = LanesToward(xdata.pathLink[j], addrs[j + 1]);
-                    const float room = halfWidth * 2.0f + 8.0f; // our length or so, and a bit
+                    // Room for the whole car past the far side of the junction: from ~6 m past its centre (beyond its middle),
+                    // our length + 8 m. It looked 4-10 m past the centre only (the car's width was used as its length):
+                    // in big junctions that's still inside, and the queue beyond went unseen. Crawling queues count too
+                    const float carLen = std::max(veh->GetColModel() ? veh->GetColModel()->m_boundBox.m_vecMax.y -
+                        veh->GetColModel()->m_boundBox.m_vecMin.y : 5.0f, 4.0f);
+                    const float exitStart = std::max(6.0f, exitLanes * LANE_WIDTH * 0.5f + 3.0f);
                     bool boxBlocked = false;
                     for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && !boxBlocked; k++) {
                         CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
                         if (!o || o == veh || std::abs(o->GetPosition().z - xdata.path[j].z) > 4.0f) continue;
-                        if (o->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS > 2.0f) continue;
+                        if (o->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS > 3.0f) continue;
                         CVector2D op = o->GetPosition().To2D();
                         float lon = CVector2D::Dot(op - junctionPos, exitDir);
-                        if (lon < 4.0f || lon > 4.0f + room) continue;
+                        if (lon < exitStart || lon > exitStart + carLen + 8.0f) continue;
                         float laneF = CVector2D::Dot(op - xdata.pathLinkPos[j], er) / LANE_WIDTH - xdata.pathLaneOffset[j];
                         boxBlocked = laneF > -0.6f && laneF < exitLanes - 0.4f;
                     }
@@ -3259,6 +3265,7 @@ public:
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
         ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
+        ReadIniFloat(ini, "HighwayGapFactor", cfgHighwayGapFactor);
         ReadIniBool(ini, "StabilityControl", cfgStabilityControl);
         ReadIniBool(ini, "CounterSteer", cfgCounterSteer);
         ReadIniBool(ini, "PedalControl", cfgPedalControl);
@@ -3866,13 +3873,19 @@ public:
         float accelWanted = accel * (1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f));
         if (xdata.obstacle != OBSTACLE_NONE) {
             float dv = v - xdata.leaderSpeed;
+            // Freeways and fast roads: closer (HighwayGapFactor of the time gap, at least 0.3 s), as on real freeways
+            const bool fastRoadGap = xdata.roadType == ROAD_HIGHWAY || xdata.roadType == ROAD_FAST;
             // Getting ready to overtake: 40-60% of the following gap (at least 0.25 s), like a driver closing up before
             // pulling out to pass
-            float tg = timeGap;
+            float tg = fastRoadGap ? std::max(timeGap * cfgHighwayGapFactor, 0.3f) : timeGap;
             if (CTimer::m_snTimeInMilliseconds < xdata.overtakePrepUntil && xdata.leaderSpeed > 1.5f)
-                tg = std::max(timeGap * Lerp(0.6f, 0.4f, xdata.aggression), 0.25f);
+                tg = std::max(tg * Lerp(0.6f, 0.4f, xdata.aggression), 0.25f);
             float sStar = minGap + std::max(0.0f, v * tg + (v * dv) / (2.0f * std::sqrt(accel * decel)));
-            accelWanted -= accel * std::pow(sStar / std::max(xdata.gap, 0.1f), 2.0f);
+            // IDM+: the lower of the free-road and the following accelerations. Plain IDM subtracts one from the other:
+            // behind a car going about the speed it wants, the free-road term is ~0 and it settled far behind (the gap
+            // grows as 1/sqrt(1 - (v/v0)^4)); IDM+ settles at the gap it wants
+            accelWanted = accel * std::min(1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f),
+                1.0f - std::pow(sStar / std::max(xdata.gap, 0.1f), 2.0f));
         }
 
         // Making room for a vehicle that signals into our lane: follow it as if it were already in front, with a shorter
@@ -4959,9 +4972,10 @@ public:
         const float latSpeed = std::max(std::min(Lerp(2.2f, 3.4f, aggr), speed * 0.12f), 0.8f);
         // At most 3.5 s: a slow car taking 5 s across the lanes of a freeway had someone fast arrive behind it mid-way
         const float changeDuration = std::clamp(1.5f * LANE_WIDTH / latSpeed, 2.2f, 3.5f);
-        // Overtakes: out of the slipstream quickly and decisively, 1.3-2.2 s (peak 3.5-5.5 m/s sideways, a sharper angle)
-        const float overtakeLat = std::max(std::min(Lerp(3.5f, 5.5f, aggr), speed * 0.2f), 1.2f);
-        const float overtakeDuration = std::clamp(1.5f * LANE_WIDTH / overtakeLat, 1.3f, 2.2f);
+        // Overtakes: out of the slipstream quickly and decisively, 1.8-2.6 s (1.3 s cut into a car beside it in a freeway
+        // curve before the side check could see it)
+        const float overtakeLat = std::max(std::min(Lerp(3.1f, 4.5f, aggr), speed * 0.16f), 1.2f);
+        const float overtakeDuration = std::clamp(1.5f * LANE_WIDTH / overtakeLat, 1.8f, 2.6f);
         auto durationFor = [&](unsigned char action) { return action == 1 ? overtakeDuration : changeDuration; };
         const bool roomToChange = xdata.requiredDist > speed * changeDuration + 40.0f;
         auto betterThanMine = [&](int lane) {
@@ -5010,7 +5024,7 @@ public:
             xdata.pendingAction = action;
             xdata.signalStart = now;
             // Indicator on before moving: shorter for overtakes (the others see it, the board already gave it the space)
-            xdata.signalUntil = now + static_cast<unsigned int>(action == 1 ? Lerp(500.0f, 150.0f, aggr) : Lerp(1500.0f, 500.0f, aggr));
+            xdata.signalUntil = now + static_cast<unsigned int>(action == 1 ? Lerp(600.0f, 300.0f, aggr) : Lerp(1500.0f, 500.0f, aggr));
             SetIndicator(xdata, lane > myLane ? 1 : -1, 6000);
             return true;
         };
