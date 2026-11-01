@@ -105,13 +105,13 @@ static constexpr float MIN_PREPARE_SPEED = 4.0f;      // m/s, changing to the la
 static constexpr float RED_LIGHT_RUN_SPEED = 35.0f / 3.6f; // m/s, drivers that run red lights, through them
 static DriverProfile profiles[NUM_PROFILES] = {
     //  chance speed accel decel gap  min  grip  top   overtake  interval aggr keepR light  racing ignoreRoad redLights
-    {   10,   0.85f, 1.2f, 2.0f, 1.55f, 1.5f, 0.36f, 0.78f, 0.65f, 25.0f, 0.00f,  2, 40.0f, false, false, false }, // calm
-    {   25,   0.95f, 1.6f, 2.5f, 1.25f, 1.2f, 0.44f, 0.86f, 0.80f, 15.0f, 0.25f,  2, 45.0f, false, false, false }, // safe
-    {   35,   1.00f, 2.0f, 3.0f, 1.05f, 1.0f, 0.52f, 0.94f, 0.85f, 10.0f, 0.50f,  1, 50.0f, false, false, false }, // normal
-    {   15,   1.15f, 2.8f, 3.5f, 0.8f, 0.9f, 0.62f, 0.98f, 0.92f,  8.0f, 0.70f,  1, 60.0f, false, false, false }, // fast
-    {   10,   1.30f, 3.5f, 4.5f, 0.6f, 0.8f, 0.72f, 1.00f, 0.97f,  6.0f, 0.95f,  1, 70.0f, false, false, false }, // aggressive
-    {    2,   1.70f, 9.0f, 6.0f, 0.6f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
-    {    3,   1.00f, 9.0f, 7.0f, 0.6f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
+    {   10,   0.85f, 1.2f, 2.0f, 0.78f, 1.5f, 0.36f, 0.78f, 0.65f, 25.0f, 0.00f,  2, 40.0f, false, false, false }, // calm
+    {   25,   0.95f, 1.6f, 2.5f, 0.63f, 1.2f, 0.44f, 0.86f, 0.80f, 15.0f, 0.25f,  2, 45.0f, false, false, false }, // safe
+    {   35,   1.00f, 2.0f, 3.0f, 0.53f, 1.0f, 0.52f, 0.94f, 0.85f, 10.0f, 0.50f,  1, 50.0f, false, false, false }, // normal
+    {   15,   1.15f, 2.8f, 3.5f, 0.4f, 0.9f, 0.62f, 0.98f, 0.92f,  8.0f, 0.70f,  1, 60.0f, false, false, false }, // fast
+    {   10,   1.30f, 3.5f, 4.5f, 0.3f, 0.8f, 0.72f, 1.00f, 0.97f,  6.0f, 0.95f,  1, 70.0f, false, false, false }, // aggressive
+    {    2,   1.70f, 9.0f, 6.0f, 0.3f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
+    {    3,   1.00f, 9.0f, 7.0f, 0.3f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
 };
 
 // Lane changes of the mod (overtaking, keeping right)
@@ -205,6 +205,7 @@ public:
     float filtLat = 0.0f;   // m/s2, smoothed
     float filtLong = 0.0f;  // m/s2, smoothed
     float filtYawRate = 0.0f; // rad/s, smoothed (heading limiter)
+    float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
     // Acceleration limit of the profile (pedal control)
@@ -815,18 +816,18 @@ static bool AmbientSpotFree(const CVector& pos, float radius) {
     return true;
 }
 
-// Room on that road: within 100 m of the spot along it, fewer cars than its lanes hold at one per 25 m, and none of them
-// stopped (a queue: one more car only makes it longer)
+// Room on that road: within 100 m of the spot along it, fewer cars than its lanes hold at one per 25 m, and no queue (3+
+// cars stopped: one more car only makes it longer). One car waiting at a light kept whole roads empty
 static bool AmbientRoadHasRoom(const CVector& pos, const CVector2D& dir, CCarPathLink* link) {
     const int lanes = std::max(link->m_nNumLeftLanes + link->m_nNumRightLanes, 1);
-    int count = 0;
+    int count = 0, stopped = 0;
     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
         CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
         if (!v) continue;
         CVector2D rel = (v->GetPosition() - pos).To2D();
         float along = CVector2D::Dot(rel, dir), across = std::abs(dir.x * rel.y - dir.y * rel.x);
         if (std::abs(along) > 100.0f || across > lanes * LANE_WIDTH || std::abs(v->GetPosition().z - pos.z) > 6.0f) continue;
-        if (v->m_pDriver && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 2.0f) return false;
+        if (v->m_pDriver && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 2.0f && ++stopped >= 3) return false;
         count++;
     }
     return count < lanes * 200 / 25;
@@ -1368,13 +1369,22 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
     return style == DRIVINGSTYLE_STOP_FOR_CARS || style == DRIVINGSTYLE_SLOW_DOWN_FOR_CARS || style == 5 || style == 6;
 }
 
+// Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
+// 120 km/h and more; curves under 70 km/h as before. Fast curves were braked far below what the car could do
+static float cfgFastCurveGripBoost = 1.3f;
+static float CurveSpeedFor(float grip, float curvature) {
+    float v = std::sqrt(grip * GRAVITY / curvature);
+    float t = std::clamp((v - 70.0f / 3.6f) / ((120.0f - 70.0f) / 3.6f), 0.0f, 1.0f);
+    return v * std::sqrt(1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
+}
+
 // Max speed (m/s) through a corner of 'angle' radians whose road segments around it are lenIn and lenOut long
 static float CornerSpeed(float angle, float lenIn, float lenOut, float grip, float& outHalfLen) {
     // Arc tangent to both segments at their midpoints (where the AI's car path links are)
     outHalfLen = 0.5f * std::min(lenIn, lenOut);
     if (angle < 0.0175f) return 1000.0f; // < 1 degree, straight
     float radius = outHalfLen / std::tan(angle * 0.5f);
-    return std::sqrt(grip * GRAVITY * radius);
+    return CurveSpeedFor(grip, 1.0f / radius);
 }
 
 static float TurnAngle(const CVector& a, const CVector& b, const CVector& c, float& lenIn, float& lenOut) {
@@ -2240,7 +2250,7 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             if (curvature < 0.002f) continue;            // radius > 500 m
             // Junction turns (the short window): less of the grip. Into them at the open-road share, cars swung wide across
             // the oncoming lanes
-            float cornerSpeed = std::sqrt(grip * (k == kTurn ? cfgJunctionGripFactor : 1.0f) * GRAVITY / curvature);
+            float cornerSpeed = CurveSpeedFor(grip * (k == kTurn ? cfgJunctionGripFactor : 1.0f), curvature);
             // Tight junction turns: a handbrake turn rotates the car, it goes in faster (and doesn't brake to a crawl)
             if (k == kTurn && xdata.handbrakeCapable && curvature > 1.0f / 30.0f) cornerSpeed *= cfgHandbrakeEntryBoost;
             applyLimit(cornerSpeed, sd[j], sn[j], false);
@@ -2540,7 +2550,7 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
     float yawCurvature = speed > 1.0f ? std::abs(xdata.filtYawRate) / speed : 0.0f;
     float curvature = std::max(steerCurvature, yawCurvature);
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
-    return std::max(std::sqrt(grip * GRAVITY / curvature), 5.0f);
+    return std::max(CurveSpeedFor(grip, curvature), 5.0f);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2743,11 +2753,21 @@ static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, flo
         *brake *= (frameCounter & 1) ? 0.35f : 0.8f; // pulse
         xdata.aidFlags |= AID_ABS;
     }
-    // Not when pulling away: some wheelspin starting up a steep hill is normal, and cutting the gas there made weak cars
-    // roll back down the hills of Las Colinas
-    if (cfgTractionControl && *gas > 0.2f && spinning && speed > 5.0f) {
-        *gas *= 0.5f;
-        xdata.aidFlags |= AID_TC;
+    // Progressive: the cut grows while the wheels spin and gives the gas back gradually once they grip (halving the gas
+    // each frame they spun and giving it all back the next made the car surge and spin again, losing acceleration). More
+    // spinning wheels, more cut. Not pulling away on a hill: some wheelspin there is normal, and cutting the gas made weak
+    // cars roll back down the hills of Las Colinas
+    if (cfgTractionControl) {
+        int spinCount = 0;
+        for (int i = 0; i < numWheels; i++) spinCount += wheels[i] == WHEEL_STATE_SPINNING;
+        const float step = std::min(CTimer::ms_fTimeStep, 3.0f);
+        const bool hillStart = speed < 5.0f && veh->GetForward().z > 0.08f;
+        if (spinCount > 0 && *gas > 0.2f && !hillStart) xdata.tcCut = std::min(xdata.tcCut + (0.06f + 0.04f * spinCount) * step, 0.8f);
+        else xdata.tcCut = std::max(xdata.tcCut - 0.04f * step, 0.0f);
+        if (xdata.tcCut > 0.0f && *gas > 0.0f) {
+            *gas *= 1.0f - xdata.tcCut;
+            xdata.aidFlags |= AID_TC;
+        }
     }
     if (cfgStabilityControl && speed > 10.0f && *gas > 0.3f && GetSlipAngle(veh) > 0.25f) { // sliding > 14 degrees
         *gas = 0.3f;
@@ -3185,6 +3205,7 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniBool(ini, "StabilityControl", cfgStabilityControl);
         ReadIniBool(ini, "CounterSteer", cfgCounterSteer);
         ReadIniBool(ini, "PedalControl", cfgPedalControl);
@@ -4762,7 +4783,7 @@ public:
 
         auto laneSafe = [&](int lane) {
             const LaneInfo& info = laneInfo[lane];
-            float frontNeed = std::max(10.0f, speed * prof.timeGap * 1.2f);
+            float frontNeed = std::max(10.0f, speed * prof.timeGap * 2.4f); // x2: the following gap was halved
             bool frontOk = info.frontGap > frontNeed || (info.frontSpeed > speed + 2.0f && info.frontGap > frontNeed * 0.6f);
             // The one behind is making room for us (it saw the indicator): a smaller gap is enough
             bool backYields = false;
