@@ -156,6 +156,7 @@ public:
     // Last real vehicle/ped seen ahead: one sensor reading that misses it (ray grazing a bumper) doesn't make it vanish
     CVehicle* leaderVeh = nullptr;      // vehicle seen ahead (check it's still in the pool before using it)
     CVehicle* memLeaderVeh = nullptr;
+    CNodeAddress forcedExit;           // the route's exit at the junction being decided (see ForceRouteExit)
     CVehicle* deadlockIgnore = nullptr; // the vehicle it waits for in a circle of waiting cars: not seen for a while
     unsigned int deadlockUntil = 0;
     eObstacleType memObstacle = OBSTACLE_NONE;
@@ -1563,9 +1564,12 @@ static void ReleaseLaneSpace(CVehicle* veh) {
         laneBoard.end());
 }
 
+// Roads the game itself leaves unused (switched off in the map data: dirt roads, country tracks) count as roads too;
+// roads a mission/the story switched off (bridges to locked islands, roadblocks) don't
+static bool cfgUseUnusedRoads = true;
 static bool IsUsableCarNode(const CNodeAddress& addr, CPathNode* node) {
     return node && addr.Region < NUM_PATH_MAP_AREAS && addr.Index < ThePaths.m_dwNumVehicleNodes[addr.Region] &&
-        !node->SwitchedOff && !node->WaterNode && !node->InteriorNode;
+        (!node->SwitchedOff || (cfgUseUnusedRoads && node->SwitchedOffOriginal)) && !node->WaterNode && !node->InteriorNode;
 }
 
 // Speed (m/s) a route "thinks" a road segment has. Narrow roads are made look slower than they are (single lane each
@@ -1626,35 +1630,6 @@ static void PickDestination(ExtendedData& xdata, CVehicle* veh) {
 // A* from the node the vehicle is heading to, to its destination. Cost = travel time (by road type) + turns
 // (left 8 s, right 3 s, no U-turns), only legal directions. When the destination isn't reachable through the loaded
 // roads, the route goes to the explored node closest to it, and is calculated again when it gets there
-// Exits the game won't take (PickNextNodeRandomly refuses them for its own reasons, every car, every time): learned
-// when a car is sent another way at a junction, and left out of every route after that. Kept in
-// RealTrafficFix.refused.txt. Cars kept getting lost near Grove Street on the same two exits
-static std::unordered_set<uint64_t> refusedExits;
-static std::string refusedFile;
-static int refusedLearned = 0;
-static uint64_t EdgeKey(const CNodeAddress& a, const CNodeAddress& b) {
-    return (static_cast<uint64_t>((static_cast<uint32_t>(a.Region) << 16) | a.Index) << 32) | ((static_cast<uint32_t>(b.Region) << 16) | b.Index);
-}
-static void LoadRefusedExits() {
-    std::ifstream in(refusedFile);
-    int ar, ai, br, bi;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (sscanf_s(line.c_str(), "%d:%d %d:%d", &ar, &ai, &br, &bi) == 4)
-            refusedExits.insert(EdgeKey(CNodeAddress(static_cast<short>(ar), static_cast<short>(ai)), CNodeAddress(static_cast<short>(br), static_cast<short>(bi))));
-    }
-}
-static std::unordered_map<uint64_t, int> refusedSeen;
-static void LearnRefusedExit(const CNodeAddress& junction, const CNodeAddress& exit) {
-    // Four times before it's avoided (a car can be sent another way for its own reasons: pushed, going round something)
-    if (++refusedSeen[EdgeKey(junction, exit)] < 4) return;
-    if (!refusedExits.insert(EdgeKey(junction, exit)).second) return;
-    refusedLearned++;
-    std::ofstream out(refusedFile, std::ios::app);
-    out << junction.Region << ":" << junction.Index << " " << exit.Region << ":" << exit.Index << "\n";
-    lg << "Exit the game refuses learned: " << junction.Region << ":" << junction.Index << " -> " << exit.Region << ":" << exit.Index << "\n";
-}
-
 static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     const CAutoPilot& ap = veh->m_autoPilot;
     xdata.route.clear();
@@ -1718,10 +1693,9 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
             if (nk == parentKey) continue; // no U-turns
             CPathNode* nbNode = GetNode(nb);
             if (!IsUsableCarNode(nb, nbNode) || (nbNode->NumberAdjNodes <= 1 && nk != goalKey)) continue;
-            // The game doesn't send traffic into "don't wander here" areas from outside them: it would take another exit
-            if (nbNode->DontWanderHere && !node->DontWanderHere && nk != goalKey) continue;
-            // Nor into nodes with a special function (parking, valet, nightclub, deliveries, drive-through): its
-            // "appropriate node" check (0x42DAB0) refuses them, the car was sent another way and got lost
+            // "Don't wander here" roads too (the game's random wandering avoids them, the route's exit is forced: see
+            // ForceRouteExit). Not into nodes with a special function (parking, valet, nightclub, deliveries, drive-through)
+            if (!cfgUseUnusedRoads && nbNode->DontWanderHere && !node->DontWanderHere && nk != goalKey) continue;
             if (nbNode->SpecialFunction != 0 && nk != goalKey) continue;
             CCarPathLink* link = GetLinkBetween(addr, node, nb);
             int lanes = link ? LanesToward(link, nb) : 0;
@@ -1730,8 +1704,6 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
             float len = (nbPos - nodePos).Magnitude2D();
             float cost = len / RouteEdgeSpeed(node, nbNode, lanes);
             if (!oldEdges.empty() && oldEdges.count((static_cast<uint64_t>(k) << 32) | nk)) cost *= cfgRejoinRouteFactor;
-            // Avoided, not banned: banned, junctions lost every exit (one had all three) and there was no route at all
-            if (!refusedExits.empty() && refusedExits.count((static_cast<uint64_t>(k) << 32) | nk)) cost += 90.0f;
             if (parent && node->NumberAdjNodes > 2) {
                 CVector2D in = (nodePos - GetNodePos(parent)).To2D(), out = (nbPos - nodePos).To2D();
                 float turn = WrapAngle(CGeneral::GetATanOfXY(out.x, out.y) - CGeneral::GetATanOfXY(in.x, in.y));
@@ -1824,16 +1796,6 @@ static void UpdateDestination(ExtendedData& xdata, CVehicle* veh) {
             else {
                 offRouteRejected++;
                 why = "game took another exit";
-                // The junction is the current node (the game picks the node after it when the car gets there): the route's
-                // next node after it is the exit the game refused (it went to m_startingRouteNode instead)
-                for (int i = std::max(xdata.routePos - 3, 0); i + 1 < static_cast<int>(xdata.route.size()) && i <= xdata.routePos + 4; i++) {
-                    if (xdata.route[i] == ap.m_currentAddress && !(xdata.route[i + 1] == ap.m_startingRouteNode)) {
-                        // Only driving normally: not going round something, not just hit
-                        if (!xdata.bypassUntil && CTimer::m_snTimeInMilliseconds - veh->m_nLastCollisionTime > 5000)
-                            LearnRefusedExit(ap.m_currentAddress, xdata.route[i + 1]);
-                        break;
-                    }
-                }
             }
             if (offRouteCount <= 25) {
                 bool onRoute = false;
@@ -2979,15 +2941,30 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
 // Route planning: CCarCtrl::PickNextNodeRandomly tries the junction exits in the order given by
 // CCarCtrl::InitSequence, starting at SequenceRandomOffset, and takes the first one that passes its checks
 // (lanes, one-way, etc). We make it try our planned exit first; if it's not legal the game goes on as usual
+// The exit the route (or the junction plan) takes at the junction the vehicle has just reached
+static CNodeAddress PlannedExit(CVehicle* veh, ExtendedData& xdata) {
+    const CAutoPilot& ap = veh->m_autoPilot;
+    if (cfgDestinations) {
+        int last = static_cast<int>(xdata.route.size()) - 1;
+        for (int i = std::max(xdata.routePos, 1); i < last && i <= xdata.routePos + 8; i++)
+            if (xdata.route[i] == ap.m_currentAddress && xdata.route[i - 1] == ap.field_8) return xdata.route[i + 1];
+    }
+    for (int p = 0; p < xdata.planCount; p++)
+        if (xdata.plans[p].junction == ap.m_currentAddress && xdata.plans[p].from == ap.field_8) return xdata.plans[p].exit;
+    return CNodeAddress();
+}
+
 static void __cdecl InitSequenceForVehicle(int numElements, CVehicle* veh) {
     plugin::Call<0x421740, int>(numElements); // CCarCtrl::InitSequence
     if (!cfgRoutePlanning || !veh) return;
     ExtendedData& xdata = vehExData.Get(veh);
+    xdata.forcedExit = CNodeAddress();
     if (CTimer::m_snTimeInMilliseconds - xdata.lastProcessed > 500) return; // not driven by the mod
 
     const CAutoPilot& ap = veh->m_autoPilot; // already shifted: current = the junction, field_8 = where we came from
     CPathNode* junctionNode = GetNode(ap.m_currentAddress);
     if (!junctionNode || junctionNode->NumberAdjNodes != numElements) return;
+    xdata.forcedExit = PlannedExit(veh, xdata);
     auto force = [&](const CNodeAddress& exit) {
         for (int k = 0; k < numElements; k++) {
             if (GetAdjacentNode(junctionNode, ap.m_currentAddress, k) == exit) {
@@ -3019,6 +2996,42 @@ static void __cdecl InitSequenceForVehicle(int numElements, CVehicle* veh) {
         return;
     }
     if (numElements > 2) seqNoPlan++;
+}
+
+// The game's checks for each exit (0x42DAB0 "appropriate node": "don't wander here", unused roads, special nodes,
+// vehicle type...) refused the route's exit and sent the car another way, lost. The route's exit is taken whenever it's
+// a legal way to drive: lanes towards it, not a U-turn, not into water. Called instead of 0x42DAB0 at 0x42E18B
+static int forcedExitCount = 0;
+static bool __cdecl ForceRouteExit(CVehicle* veh, uint32_t candidateRaw) {
+    if (!cfgRoutePlanning || !veh) return false;
+    ExtendedData& xdata = vehExData.Get(veh);
+    if (CTimer::m_snTimeInMilliseconds - xdata.lastProcessed > 500 || xdata.forcedExit.IsEmpty()) return false;
+    CNodeAddress candidate;
+    memcpy(&candidate, &candidateRaw, sizeof(candidate));
+    if (!(candidate == xdata.forcedExit)) return false;
+    const CAutoPilot& ap = veh->m_autoPilot;
+    CPathNode* junction = GetNode(ap.m_currentAddress);
+    CPathNode* exitNode = GetNode(candidate);
+    if (!junction || !exitNode || candidate == ap.field_8 || exitNode->WaterNode != junction->WaterNode) return false;
+    CCarPathLink* link = GetLinkBetween(ap.m_currentAddress, junction, candidate);
+    if (!link || LanesToward(link, candidate) <= 0) return false;
+    forcedExitCount++;
+    return true;
+}
+static uintptr_t gameExitCheck = 0x42DAB0, gameExitTaken = 0x42E468;
+static void __declspec(naked) ExitCheckHook() {
+    __asm {
+        push dword ptr [esp + 10h] // the exit tried (4th argument)
+        push dword ptr [esp + 8]   // the vehicle (1st argument)
+        call ForceRouteExit
+        add esp, 8
+        test al, al
+        jnz taken
+        jmp dword ptr [gameExitCheck] // the game's own check, same arguments and return address
+    taken:
+        add esp, 1Ch                  // return address + the 6 arguments
+        jmp dword ptr [gameExitTaken] // where PickNextNodeRandomly goes with the exit it chose
+    }
 }
 
 // Call @ 0x42E039 inside PickNextNodeRandomly; the vehicle is in esi there
@@ -3205,6 +3218,7 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniBool(ini, "StabilityControl", cfgStabilityControl);
         ReadIniBool(ini, "CounterSteer", cfgCounterSteer);
@@ -3330,6 +3344,10 @@ public:
         }
         if (cfgRoutePlanning) {
             patch::RedirectCall(0x42E039, InitSequenceHook, true);
+            // The exit checks: only patched where the game's code is what we expect (call 0x42DAB0)
+            if (*reinterpret_cast<unsigned char*>(0x42E18B) == 0xE8 && 0x42E190 + *reinterpret_cast<int*>(0x42E18C) == 0x42DAB0)
+                patch::RedirectCall(0x42E18B, ExitCheckHook, true);
+            else lg << "PickNextNodeRandomly: unexpected code at 0x42E18B, the route's exits are not forced\n";
         }
 
         // The game only keeps the road nodes around the player loaded (CPathFind::UpdateStreaming @ 0x450A60: clears
@@ -3363,9 +3381,6 @@ public:
         }
 
         if (cfgRouteFixes) LoadRouteFixes(dir + "RealTrafficFix.routefixes.txt");
-        refusedFile = dir + "RealTrafficFix.refused.txt";
-        LoadRefusedExits();
-        lg << "Refused exits known: " << refusedExits.size() << "\n";
         learnedFile = dir + "RealTrafficFix.limits.txt"; // v2 measurement (the old .learned.txt values were inflated);
         if (cfgAdaptiveLimits) LoadLearnedLimits();
 

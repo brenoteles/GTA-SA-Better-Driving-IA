@@ -1106,7 +1106,7 @@ void Update() {
         out << Format("bypasses by changing lanes (2+ lanes): %d; broken-down cars removed out of sight: %d\n", bypassLaneCount, brokenRemovedCount);
         out << Format("circles of waiting cars broken (deadlocks): %d\n", deadlockBreakCount);
         out << Format("going round through the oncoming lanes refused (two-way roads): %d\n", noOncomingBypassCount);
-        out << Format("exits the game refuses: %d learned this run, %d known\n", refusedLearned, (int)refusedExits.size());
+        out << Format("route exits the game would have refused, taken anyway: %d\n", forcedExitCount);
         out << Format("ambient cars created around the player out of sight: %d\n", ambientSpawnCount);
         out << Format("lane data corrections (routefixes) loaded %d, applied %d times\n", (int)routeFixes.size(), routeFixesApplied);
         if (scanMode) out << Format("road scan: %d lines across the road in scan.txt\n", scanSamples);
