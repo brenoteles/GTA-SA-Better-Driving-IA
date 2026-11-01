@@ -2961,8 +2961,17 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
         }
     }
 
+    // Long vehicles (trucks, buses): the game steers the front onto the path, and the rear wheels cut inside the turn by
+    // ~L^2/2R (the cement truck ran over kerbs and pavements). Steering atan(sin d) instead of d puts the rear axle on the
+    // path: the front swings wider, as truck drivers do. Same for small angles, 36 -> 30 degrees in a tight turn
+    CVector bodyMin, bodyMax;
+    GetEntityDimensions(veh, bodyMin, bodyMax);
+    const bool longVehicle = GetWheelBase(veh, bodyMin, bodyMax) > 4.5f;
+    if (longVehicle && std::isfinite(*steer)) *steer = std::atan(std::sin(*steer));
+
     // Turning: someone on the outside of the turn (beside us, or coming the other way on that side): turn tighter and ease
-    // off. Cars swung wide in turns into the next lane and the oncoming one
+    // off. Cars swung wide in turns into the next lane and the oncoming one (long vehicles only ease off: tighter put their
+    // rear wheels on the pavement)
     if (cfgTurnSideGuard && speed > 3.0f && std::abs(xdata.filtYawRate) > 0.15f && veh->m_nVehicleSubClass != VEHICLE_BIKE) {
         const int outside = xdata.filtYawRate > 0.0f ? 1 : -1; // turning left: the right side is the outside
         CVector mn, mx;
@@ -2989,7 +2998,7 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
         }
         if (threat) {
             float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh);
-            *steer = std::clamp(*steer - outside * 0.12f, -maxSteer, maxSteer); // towards the inside
+            if (!longVehicle) *steer = std::clamp(*steer - outside * 0.12f, -maxSteer, maxSteer); // towards the inside
             *gas = std::min(*gas, 0.15f);
             if (speed > 6.0f) *brake = std::max(*brake, 0.35f);
             if (CTimer::m_snTimeInMilliseconds - xdata.turnGuardTime > 2000) turnGuardCount++;
