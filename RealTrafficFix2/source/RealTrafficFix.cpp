@@ -2840,7 +2840,10 @@ static void ApplyCounterSteer(CVehicle* veh, ExtendedData& xdata, float speed, f
 // DriftSlip (~11 degrees) towards the inside of the turn: the gas (PI: on a rear-wheel-drive car more gas = more slide)
 // and a counter-steer around that angle (P: steers towards where it's going when it slides past it). A short pull of the
 // handbrake starts the slide on the way into a curve. Traction/stability control off (they'd kill it)
-static float cfgDriftSlip = 0.19f;
+static float cfgDriftSlip = 0.16f;
+// Its steering lock: the game's AI lock shrinks with speed (0.7 rad up to ~36 km/h, 0.2 rad at 126): the counter-steer
+// couldn't hold a slide at speed and it spun. The drifter turns the wheel as far as a driver would
+static float cfgDriftMaxSteer = 0.9f;
 static void ApplyDrift(CVehicle* veh, ExtendedData& xdata, float speed, float* steer, float* gas, float* brake, bool* handbrake) {
     if (xdata.profile != PROFILE_DRIFTER || veh->m_nVehicleSubClass != VEHICLE_AUTOMOBILE) return;
     const float dt = std::min(CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS, 0.1f);
@@ -2856,14 +2859,21 @@ static void ApplyDrift(CVehicle* veh, ExtendedData& xdata, float speed, float* s
     float slip = WrapAngle(CGeneral::GetATanOfXY(vel.x, vel.y) - CGeneral::GetATanOfXY(fwd.x, fwd.y));
     float wanted = -dir * cfgDriftSlip;
     float error = cfgDriftSlip - (-dir * slip); // > 0: not sliding enough
-    // Gas: PI around the wanted slide; past it by 0.12 rad (7 degrees) off the gas
-    xdata.driftI = std::clamp(xdata.driftI + error * 1.5f * dt, -0.4f, 0.4f);
-    float driftGas = std::clamp(0.45f + error * 2.5f + xdata.driftI, 0.0f, 1.0f);
-    if (error < -0.12f) driftGas *= 0.3f;
-    *gas = std::max(std::min(driftGas, std::max(*gas, 0.35f)), 0.0f);
-    // Counter-steer around the wanted slip (towards where it's going when past it), within the lock
-    float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh);
-    *steer = std::clamp(*steer + (slip - wanted) * 1.4f, -maxSteer, maxSteer);
+    // Too far (> 0.45 rad, 26 degrees): catching it, off the gas, the wheel towards where it's going
+    if (std::abs(slip) > 0.45f) {
+        xdata.driftI = 0.0f;
+        *gas = 0.0f;
+        *steer = std::clamp(slip * 1.2f, -cfgDriftMaxSteer, cfgDriftMaxSteer);
+        xdata.aidFlags |= AID_COUNTERSTEER;
+        return;
+    }
+    // Gas: PI around the wanted slide (gentle: it overshot); past it by 0.08 rad (5 degrees) off the gas
+    xdata.driftI = std::clamp(xdata.driftI + error * 0.8f * dt, -0.3f, 0.3f);
+    float driftGas = std::clamp(0.4f + error * 1.5f + xdata.driftI, 0.0f, 1.0f);
+    if (error < -0.08f) driftGas *= 0.3f;
+    *gas = std::max(std::min(driftGas, std::max(*gas, 0.3f)), 0.0f);
+    // Counter-steer around the wanted slip (towards where it's going when past it), with the drifter's lock
+    *steer = std::clamp(*steer + (slip - wanted) * 2.0f, -cfgDriftMaxSteer, cfgDriftMaxSteer);
     // Into the curve and not sliding: a short pull of the handbrake (0.15 s, at most every 2 s)
     if (error > 0.12f && speed > 12.0f && speed < 38.0f && std::abs(yaw) > 0.2f && now - xdata.driftTapLast > 2000) {
         xdata.driftTapUntil = now + 150;
@@ -3402,6 +3412,7 @@ public:
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
         ReadIniFloat(ini, "DriftSlip", cfgDriftSlip);
+        ReadIniFloat(ini, "DriftMaxSteer", cfgDriftMaxSteer);
         ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniFloat(ini, "HighwayGapFactor", cfgHighwayGapFactor);
