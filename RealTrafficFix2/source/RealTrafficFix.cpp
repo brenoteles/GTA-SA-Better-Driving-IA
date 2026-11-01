@@ -4442,7 +4442,11 @@ public:
                     bool parallel = CVector2D::Dot(hitVeh->GetForward().To2D(), f2) > 0.85f;
                     // Only within 40 m (a margin of 1 m): further on the curve estimate is metres off and a car stopped in
                     // our lane at 50-66 m read as "the next lane" (one at 129 km/h hit it, seen again at 22 m)
-                    if (parallel && lon > 0.0f && lon < 40.0f && std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 1.0f) {
+                    // And only one going about our speed (within 5 m/s): a stopped or much slower one always counts, a
+                    // wrong guess there is a hard rear-end (the Cadrona at 108 km/h lost a stopped car at 37 m in a curve)
+                    const float hitFwdSpeed = CVector::Dot(hitVeh->m_vecMoveSpeed, forward) * GAME_SPEED_TO_MPS;
+                    if (parallel && lon > 0.0f && lon < 40.0f && hitFwdSpeed > speed - 5.0f &&
+                        std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 1.0f) {
                         xdata.rayColor[i] = { 255, 140, 0, 255 };
                         otherLaneHitCount++;
                         continue;
