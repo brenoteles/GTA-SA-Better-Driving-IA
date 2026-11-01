@@ -58,6 +58,8 @@ def main():
     ap.add_argument('--target', type=int, default=60000)
     ap.add_argument('--min-seg', type=float, default=10.0)
     ap.add_argument('--cap', type=int, default=1000)
+    ap.add_argument('--split-junctions', action='store_true',
+                    help='also split links touching a junction (8 m pieces there swung cars wide in turns)')
     args = ap.parse_args()
 
     areas = load_all(args.src)
@@ -94,7 +96,8 @@ def main():
     lo, hi = args.min_seg, 200.0
     for _ in range(40):
         seg = (lo + hi) / 2
-        total = sum(1 + splits(length(u, v), seg) for (u, v) in edges)
+        total = sum(1 + (splits(length(u, v), seg) if args.split_junctions or (len(nbrs[u]) <= 2 and len(nbrs[v]) <= 2) else 0)
+                    for (u, v) in edges)
         if total > args.target:
             lo = seg
         else:
@@ -143,6 +146,8 @@ def main():
         orig = navi_of(nav)
         L = length(u, v)
         k = splits(L, seg) if L > 0.5 else 0
+        if not args.split_junctions and (len(nbrs[u]) > 2 or len(nbrs[v]) > 2):
+            k = 0   # turns keep their geometry
         X = (orig.tarea, orig.tnode)
         if X not in (u, v):
             X = v
