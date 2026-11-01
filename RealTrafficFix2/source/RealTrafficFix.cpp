@@ -2612,6 +2612,10 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
     float yawRate = veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS; // rad/s
     xdata.filtYawRate += (yawRate - xdata.filtYawRate) * std::min(0.05f * CTimer::ms_fTimeStep, 1.0f);
     float yawCurvature = speed > 1.0f ? std::abs(xdata.filtYawRate) / speed : 0.0f;
+    // The steering only at low speed (anticipating a junction turn; full up to 36 km/h, none from 72): at speed the
+    // tyres turn the car far less than the wheels point (slip angle) and small corrections read as tight turns (0.2 rad at
+    // 120 km/h = a 50 m radius, capped at ~60 km/h in a curve good for far more). There the real turn (yaw rate) counts
+    steerCurvature *= std::clamp((20.0f - speed) / 10.0f, 0.0f, 1.0f);
     float curvature = std::max(steerCurvature, yawCurvature);
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
     return std::max(CurveSpeedFor(grip, curvature), 5.0f);
