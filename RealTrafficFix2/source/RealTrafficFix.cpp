@@ -401,6 +401,7 @@ static bool cfgV2VOvertakes = true;              // overtakes planned with every
 static bool cfgTurnSideGuard = true;             // turning: watch the outside of the turn for vehicles there
 static int turnGuardCount = 0, boxWaitCount = 0, firstComeWaitCount = 0, lowSpeedBrakeCount = 0, bypassScrapeCount = 0;
 static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0, brokenLightCount = 0;
+static int otherLaneHitCount = 0; // sensor hits on a car in another lane, not taken as the one ahead
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
 // One list for all junctions: a big intersection is several junction nodes close together (each way across it has its
 // own), the claims of all of them within 30 m count together
@@ -4294,10 +4295,28 @@ public:
             float leaderSpeed = 0.0f;
             if (entity) {
                 switch (entity->m_nType) {
-                case ENTITY_TYPE_VEHICLE:
+                case ENTITY_TYPE_VEHICLE: {
+                    // In another lane: beside our path (the curve we're on taken into account), its body not overlapping
+                    // ours sideways, going our way. Not the one ahead: cars braked for one in the next lane with theirs free
+                    // (the side rays open out with speed into the next lane, and in curves the centre one points at it)
+                    CVehicle* hitVeh = static_cast<CVehicle*>(entity);
+                    CVector2D rel = (hitVeh->GetPosition() - vehicle->GetPosition()).To2D();
+                    CVector2D f2 = forward.To2D();
+                    float lon = CVector2D::Dot(rel, f2);
+                    float curv = speed > 3.0f ? xdata.filtYawRate / speed : 0.0f;  // > 0: turning left
+                    float lat = f2.x * rel.y - f2.y * rel.x - 0.5f * curv * lon * lon; // left of our path
+                    CVector oMin, oMax;
+                    GetEntityDimensions(hitVeh, oMin, oMax);
+                    bool parallel = CVector2D::Dot(hitVeh->GetForward().To2D(), f2) > 0.85f;
+                    if (parallel && lon > 0.0f && std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 0.5f) {
+                        xdata.rayColor[i] = { 255, 140, 0, 255 };
+                        otherLaneHitCount++;
+                        continue;
+                    }
                     type = OBSTACLE_VEHICLE;
-                    leaderSpeed = std::max(CVector::Dot(static_cast<CVehicle*>(entity)->m_vecMoveSpeed, forward) * GAME_SPEED_TO_MPS, 0.0f);
+                    leaderSpeed = std::max(CVector::Dot(hitVeh->m_vecMoveSpeed, forward) * GAME_SPEED_TO_MPS, 0.0f);
                     break;
+                }
                 case ENTITY_TYPE_PED: type = OBSTACLE_PED; break;
                 case ENTITY_TYPE_OBJECT: type = OBSTACLE_OBJECT; break;
                 default: break;
