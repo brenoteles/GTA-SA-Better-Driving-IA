@@ -4440,7 +4440,9 @@ public:
                     CVector oMin, oMax;
                     GetEntityDimensions(hitVeh, oMin, oMax);
                     bool parallel = CVector2D::Dot(hitVeh->GetForward().To2D(), f2) > 0.85f;
-                    if (parallel && lon > 0.0f && std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 0.5f) {
+                    // Only within 40 m (a margin of 1 m): further on the curve estimate is metres off and a car stopped in
+                    // our lane at 50-66 m read as "the next lane" (one at 129 km/h hit it, seen again at 22 m)
+                    if (parallel && lon > 0.0f && lon < 40.0f && std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 1.0f) {
                         xdata.rayColor[i] = { 255, 140, 0, 255 };
                         otherLaneHitCount++;
                         continue;
@@ -4738,7 +4740,9 @@ public:
 
     // Side sensors: three lines from the side of the vehicle (front corner forward, middle, rear corner backwards), one
     // lane wide towards 'side'. A vehicle there = that lane isn't free beside us
-    static bool SideClear(CVehicle* veh, ExtendedData& xdata, int side, float speed, float lanes = 0.9f) {
+    // 'passing': the vehicle being overtaken, not counted while it's still ahead (the diagonal front ray crossed its rear
+    // corner when pulling out from close behind it: most overtakes were given up as "someone beside")
+    static bool SideClear(CVehicle* veh, ExtendedData& xdata, int side, float speed, float lanes = 0.9f, CVehicle* passing = nullptr) {
         CVector mn, mx;
         GetEntityDimensions(veh, mn, mx);
         const float x0 = (side > 0 ? mx.x : mn.x) - side * 0.4f; // from inside the body: something already touching counts
@@ -4760,6 +4764,8 @@ public:
             // reach it in curves) isn't someone in it
             bool hit = CWorld::ProcessLineOfSight(a, b, colPoint, entity, false, true, false, false, false, false, false, false);
             if (hit && entity == veh->m_pTrailer) hit = false;
+            if (hit && passing && entity == passing &&
+                CVector2D::Dot((passing->GetPosition() - veh->GetPosition()).To2D(), veh->GetForward().To2D()) > mx.y) hit = false;
             clear &= !hit;
             xdata.sideRayA[i] = a;
             xdata.sideRayB[i] = b;
@@ -5236,7 +5242,7 @@ public:
             stillWanted &= speed > (prepare ? (zipper ? 1.5f : MIN_PREPARE_SPEED) : MIN_LANE_CHANGE_SPEED);
             bool safeNow = xdata.pendingAction == 5 ? yieldSafe(lane) :
                 (overtake && cfgV2VOvertakes ? overtakeClear(lane) : laneSafe(lane));
-            if (stillWanted && safeNow && SideClear(veh, xdata, lane > myLane ? 1 : -1, speed)) {
+            if (stillWanted && safeNow && SideClear(veh, xdata, lane > myLane ? 1 : -1, speed, 0.9f, overtake ? mine.frontVeh : nullptr)) {
                 change(lane, xdata.pendingAction, overtake ? LANE_OVERTAKING : LANE_KEEP);
                 if (overtake) {
                     xdata.overtakeTarget = mine.frontVeh;
@@ -5285,7 +5291,8 @@ public:
                 fastBehind = target.backVeh && closing > 3.0f && target.backGap / closing < 1.5f;
             }
             if (xdata.changeTarget != xdata.changeOrigin && (fastBehind ||
-                !SideClear(veh, xdata, xdata.changeTarget > xdata.changeOrigin ? 1 : -1, speed, lanesLeft))) {
+                !SideClear(veh, xdata, xdata.changeTarget > xdata.changeOrigin ? 1 : -1, speed, lanesLeft,
+                    xdata.changeAfter == LANE_OVERTAKING ? xdata.overtakeTarget : nullptr))) {
                 sideAbortCount++;
                 if (xdata.changeAfter == LANE_OVERTAKING) { overtakeAbortCount++; overtakeAbortWhy[fastBehind ? 3 : 2]++; }
                 xdata.changeTarget = xdata.changeOrigin;
