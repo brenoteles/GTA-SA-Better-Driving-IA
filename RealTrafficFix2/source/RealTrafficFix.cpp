@@ -2883,6 +2883,32 @@ static float GetSmoothLaneSteer(CVehicle* veh, const ExtendedData& xdata, float 
     }
     if (n < 3) return NAN;
     const CVector2D pos = veh->GetPosition().To2D();
+    // The lane it's really in (never the game's lane number: when they differed, the smooth lane steered it across into
+    // the next lane without looking, a side contact at 56 km/h); only when it's well inside one
+    {
+        CVector2D d = xdata.path[2].To2D() - xdata.path[1].To2D();
+        float len = d.Magnitude();
+        if (len < 0.5f) return NAN;
+        d *= 1.0f / len;
+        // Across the road along the link's own direction (the line between the nodes is metres off on curving roads)
+        if (const CCarPathLink* l = xdata.pathLink[1]) {
+            CVector2D ld(l->m_nDirX / 100.0f, l->m_nDirY / 100.0f);
+            float ll = ld.Magnitude();
+            if (ll > 0.5f) { ld *= 1.0f / ll; d = CVector2D::Dot(ld, d) < 0.0f ? ld * -1.0f : ld; }
+        }
+        float physical = CVector2D::Dot(pos - xdata.pathLinkPos[1], CVector2D(d.y, -d.x)) / LANE_WIDTH - xdata.pathLaneOffset[1];
+        float lane = std::floor(physical + 0.5f);
+        if (std::abs(physical - lane) > 0.3f || lane < 0.0f) return NAN;
+        if (lane != laneF) {
+            // Rebuild the lane centres for that lane
+            for (int i = 0, seg = 1; i < n; i++, seg++) {
+                CVector2D e = xdata.path[seg + 1].To2D() - xdata.path[seg].To2D();
+                float el = e.Magnitude();
+                e *= 1.0f / std::max(el, 0.01f);
+                pts[i] = xdata.pathLinkPos[seg] + CVector2D(e.y, -e.x) * ((xdata.pathLaneOffset[seg] + lane) * LANE_WIDTH);
+            }
+        }
+    }
     const float lookDist = std::clamp(speed * 0.55f + 4.0f, 7.0f, 24.0f);
     // Walk the spline: every metre, from the first piece the car is at or past the start of
     auto at = [&](int i, float t) {
