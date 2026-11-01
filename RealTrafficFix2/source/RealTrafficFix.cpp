@@ -179,6 +179,8 @@ public:
     CNodeAddress destNode;
     bool hasDestination = false;
     bool fixedDestination = false;    // given from outside (AutoTest): kept until it gets there, even far beyond the loaded roads
+    float goalRadius = 0.0f;          // > 0: any node this close to the destination is the end of the route (a waypoint)
+    bool goalFreeway = false;         // ...and it must be a freeway node
     unsigned int destinationTime = 0;
     std::vector<CNodeAddress> route;  // from the node it came from to the destination (or as close as the loaded roads go)
     std::vector<CNodeAddress> oldRoute; // what was left of the route when it went off it (to get back onto it)
@@ -1674,6 +1676,7 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     float bestH = 1e9f;
     int expansions = 0;
     bool found = false;
+    uint32_t goalHit = goalKey;
     while (!open.empty() && expansions < 80000) {
         uint32_t k = open.top().second;
         open.pop();
@@ -1687,7 +1690,11 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
         CVector nodePos = GetNodePos(node);
         float h = (nodePos - goalPos).Magnitude2D();
         if (h < bestH) { bestH = h; bestKey = k; }
-        if (k == goalKey) { found = true; break; }
+        if (k == goalKey || (xdata.goalRadius > 0.0f && h < xdata.goalRadius && (!xdata.goalFreeway || node->Speed >= 2))) {
+            found = true;
+            goalHit = k;
+            break;
+        }
         CPathNode* parent = rec.parent != 0xFFFFFFFF ? GetNode(addrOf(rec.parent)) : nullptr;
         float g = rec.g;
         uint32_t parentKey = rec.parent;
@@ -1721,7 +1728,7 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
             open.push({ g + cost + (nbPos - goalPos).Magnitude2D() / heurSpeed, nk });
         }
     }
-    uint32_t end = found ? goalKey : bestKey;
+    uint32_t end = found ? goalHit : bestKey;
     if (end == startKey && !found) { routeFailCount++; return false; }
     for (uint32_t k = end; k != 0xFFFFFFFF; k = recs[k].parent) {
         xdata.route.push_back(addrOf(k));
@@ -1750,8 +1757,12 @@ static void ResolveFixedDestination(ExtendedData& xdata) {
     }
 }
 
-void SetFixedDestination(CVehicle* veh, const CVector2D& destination) {
+// radius > 0: a waypoint, passed through anywhere within radius (its nearest node can be on the other carriageway: the
+// route went round the city to reach it from the other side); freeway: through a freeway node there
+void SetFixedDestination(CVehicle* veh, const CVector2D& destination, float radius = 0.0f, bool freeway = false) {
     ExtendedData& xdata = vehExData.Get(veh);
+    xdata.goalRadius = radius;
+    xdata.goalFreeway = freeway;
     xdata.destination = destination;
     xdata.destNode.Clear();
     xdata.hasDestination = true;

@@ -106,6 +106,13 @@ static bool SnapWaypoint(CVehicle* veh, const CVector2D& at, int kind) {
     return true;
 }
 
+// Waypoints are areas (120 m, a freeway one through a freeway node within 150 m); the end is a point
+static void SetWaypointDestination(CVehicle* veh, const Location& l, int i) {
+    int kind = WaypointKind(l, i);
+    if (i >= l.numWaypoints) SetFixedDestination(veh, WaypointPos(l, i));
+    else SetFixedDestination(veh, WaypointPos(l, i), kind == 1 ? 150.0f : 120.0f, kind == 1);
+}
+
 struct Sample {
     unsigned int t;
     float speed, fwd, target, gap, leader, stuck;
@@ -902,7 +909,7 @@ void Update() {
                 x.speedVariation = 1.0f;
                 c.wp = 0;
                 c.snapped = false;
-                SetFixedDestination(c.veh, WaypointPos(l, 0));
+                SetWaypointDestination(c.veh, l, 0);
                 c.lastPos = c.veh->GetPosition();
                 c.lastProgress = now;
             }
@@ -944,8 +951,8 @@ void Update() {
                     const CVector2D wpPos = WaypointPos(l, c.wp);
                     const float toWp = (wpPos - carPos).Magnitude();
                     const int kind = WaypointKind(l, c.wp);
-                    // Freeway/parking waypoints: their node once the roads there are loaded (every 2 s while within 700 m)
-                    if (kind != 0 && !c.snapped && toWp < 700.0f && now - c.snapTry > 2000) {
+                    // The parking place at the end: its node once the roads there are loaded (every 2 s while within 700 m)
+                    if (kind == 2 && !c.snapped && toWp < 700.0f && now - c.snapTry > 2000) {
                         c.snapTry = now;
                         c.snapped = SnapWaypoint(c.veh, wpPos, kind);
                     }
@@ -956,7 +963,7 @@ void Update() {
                         c.wp++;
                         c.snapped = false;
                         c.snapTry = 0;
-                        SetFixedDestination(c.veh, WaypointPos(l, c.wp));
+                        SetWaypointDestination(c.veh, l, c.wp);
                     }
                     left = TripLeft(l, c.wp, carPos);
                     if (left < c.bestLeft - 100.0f) { c.bestLeft = left; c.lastProgress = now; }
@@ -1073,10 +1080,10 @@ void Update() {
                     TripCar& c = tripCars[k];
                     if (!c.veh || !CPools::ms_pVehiclePool->IsObjectValid(c.veh)) { out << Format(" %s: gone |", c.label); continue; }
                     ExtendedData& cx = vehExData.Get(c.veh);
-                    out << Format(" %s%s: %.0f m left, %.0f km/h (%s), %.2f km, %d coll, route %d/%d, road %s |", k == followed ? ">" : "",
-                        c.label, (CVector2D(l.destX, l.destY) - c.veh->GetPosition().To2D()).Magnitude(),
+                    out << Format(" %s%s: %.0f m left, %.0f km/h (%s), %.2f km, %d coll, route %d/%d, road %s, waypoint %d/%d |", k == followed ? ">" : "",
+                        c.label, TripLeft(l, c.wp, c.veh->GetPosition().To2D()),
                         c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS * MPS_TO_KMH, limiterNames[cx.limiter], c.driven / 1000.0f,
-                        c.collisions, cx.routePos, (int)cx.route.size(), roadNames[cx.roadType]);
+                        c.collisions, cx.routePos, (int)cx.route.size(), roadNames[cx.roadType], std::min(c.wp + 1, l.numWaypoints + 1), l.numWaypoints + 1);
                 }
                 out << "\n";
             }
