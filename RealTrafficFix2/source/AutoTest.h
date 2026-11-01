@@ -24,8 +24,23 @@ namespace AutoTest {
 
 using namespace plugin;
 
-// highway: start on a class 2 (freeway) node. route: drive from here to (destX, destY) with the mod's route, no resets
-struct Location { const char* name; float x, y, z; bool highway = false; bool route = false; float destX = 0.0f, destY = 0.0f; };
+// A point the route trip goes through. kind: 0 any road, 1 a freeway (the nearest class 2 node), 2 a parking place (the
+// nearest parking node: the car stops there)
+struct Waypoint { const char* name; float x, y; int kind; };
+// highway: start on a class 2 (freeway) node. route: drive from here to (destX, destY) with the mod's route, no resets,
+// through the waypoints first; park: the end is a parking place where the car stops
+struct Location {
+    const char* name; float x, y, z; bool highway = false; bool route = false; float destX = 0.0f, destY = 0.0f;
+    const Waypoint* waypoints = nullptr; int numWaypoints = 0; bool park = false;
+};
+// Bayside -> the toll at the south end of the Gant Bridge (toll_sfw) -> the road past Mount Chiliad with the Whetstone
+// truck stop (cw_fuelpay) -> Santa Maria Beach -> the freeway by the LS airport -> a parking place downtown
+static const Waypoint baysideToLS[] = {
+    { "SF toll (Gant Bridge)",        -2681.0f,  1275.0f, 0 },
+    { "Whetstone gas station",        -1622.0f, -2692.0f, 0 },
+    { "Santa Maria Beach",              400.0f, -1780.0f, 0 },
+    { "LS airport freeway",            1700.0f, -2150.0f, 1 },
+};
 static const Location locations[] = {
     { "LS Ganton/Grove",        2440.0f, -1660.0f, 13.0f },
     { "LS Downtown",            1480.0f, -1740.0f, 13.0f },
@@ -48,10 +63,48 @@ static const Location locations[] = {
     { "SF Freeway",             -1700.0f,  -300.0f, 20.0f, true },
     // One long trip through everything: city streets, lights, freeways, ramps, countryside, bridges
     { "Grove Street -> Bayside", 2495.0f, -1668.0f, 13.0f, false, true, -2410.0f, 2330.0f },
+    { "Bayside -> LS Downtown",  -2420.0f, 2340.0f, 5.0f, false, true, 1550.0f, -1350.0f, baysideToLS, 4, true },
 };
+static std::string routeFilter; // Route = part of the trip's name: only that trip (all of them when empty)
 static constexpr int NUM_LOCATIONS = sizeof(locations) / sizeof(locations[0]);
 static constexpr int HISTORY = 150;              // samples kept per vehicle
 static constexpr unsigned int SAMPLE_MS = 100;   // -> 15 s of history
+
+static CVector2D WaypointPos(const Location& l, int i) {
+    return i < l.numWaypoints ? CVector2D(l.waypoints[i].x, l.waypoints[i].y) : CVector2D(l.destX, l.destY);
+}
+static int WaypointKind(const Location& l, int i) { return i < l.numWaypoints ? l.waypoints[i].kind : (l.park ? 2 : 0); }
+static const char* WaypointName(const Location& l, int i) { return i < l.numWaypoints ? l.waypoints[i].name : "the end"; }
+// Straight-line distance still to go: to the next waypoint, then waypoint to waypoint to the end
+static float TripLeft(const Location& l, int wp, const CVector2D& pos) {
+    float left = (WaypointPos(l, wp) - pos).Magnitude();
+    for (int i = wp; i < l.numWaypoints; i++) left += (WaypointPos(l, i + 1) - WaypointPos(l, i)).Magnitude();
+    return left;
+}
+// The road node a freeway/parking waypoint really is, once the roads there are loaded: the nearest freeway node (class 2)
+// or parking node (special function 1/2) within 500 m
+static bool SnapWaypoint(CVehicle* veh, const CVector2D& at, int kind) {
+    float best = 500.0f;
+    CNodeAddress bestAddr;
+    for (int a = 0; a < NUM_PATH_MAP_AREAS; a++) {
+        if (!ThePaths.m_pPathNodes[a]) continue;
+        for (unsigned int i = 0; i < ThePaths.m_dwNumVehicleNodes[a]; i++) {
+            CNodeAddress addr(static_cast<short>(a), static_cast<short>(i));
+            CPathNode* node = GetNode(addr);
+            if (!node || node->WaterNode || node->InteriorNode || node->NumberAdjNodes < 1) continue;
+            if (kind == 1 && node->Speed < 2) continue;
+            if (kind == 2 && node->SpecialFunction != CPathNode::SPECIAL_PARKING_PARALLEL &&
+                node->SpecialFunction != CPathNode::SPECIAL_PARKING_PERPENDICULAR) continue;
+            float d = (GetNodePos(node).To2D() - at).Magnitude();
+            if (d < best) { best = d; bestAddr = addr; }
+        }
+    }
+    if (bestAddr.IsEmpty()) return false;
+    CVector2D pos = GetNodePos(GetNode(bestAddr)).To2D();
+    SetFixedDestination(veh, pos);
+    vehExData.Get(veh).destNode = bestAddr;
+    return true;
+}
 
 struct Sample {
     unsigned int t;
@@ -109,6 +162,9 @@ struct TripCar {
     CVehicle* veh = nullptr;
     CVector lastPos;
     float driven = 0.0f, still = 0.0f, bestLeft = 1e9f, doneMinutes = 0.0f;
+    int wp = 0;                  // waypoint it's heading to (numWaypoints: the end)
+    bool snapped = false;        // that waypoint's road node chosen (freeway / parking)
+    unsigned int snapTry = 0, nearSince = 0;
     unsigned int lastProgress = 0;
     bool done = false;
     const char* result = "";
@@ -273,6 +329,7 @@ void Init(const std::string& moduleDir) {
     highwayOnly = ini.ReadInteger("AutoTest", "HighwayOnly", 0) != 0;
     scanMode = ini.ReadString("AutoTest", "Scenario", "") == "scan";
     routeMode = scanMode || ini.ReadString("AutoTest", "Scenario", "") == "route";
+    routeFilter = ini.ReadString("AutoTest", "Route", "");
     noPeds = ini.ReadInteger("AutoTest", "NoPeds", 1) != 0;
     tripCarCount = std::clamp(ini.ReadInteger("AutoTest", "TripCars", 1), 1, 2);
     // Driver of the (first) test car
@@ -762,7 +819,8 @@ void Update() {
         RemoveTestCar();
         locIndex++;
         while (highwayOnly && locIndex < NUM_LOCATIONS && !locations[locIndex].highway) locIndex++;
-        while (routeMode && locIndex < NUM_LOCATIONS && !locations[locIndex].route) locIndex++;
+        while (routeMode && locIndex < NUM_LOCATIONS && (!locations[locIndex].route ||
+            (!routeFilter.empty() && std::string(locations[locIndex].name).find(routeFilter) == std::string::npos))) locIndex++;
         if (!routeMode) while (locIndex < NUM_LOCATIONS && locations[locIndex].route) locIndex++;
         if (locIndex >= (highwayOnly || routeMode ? NUM_LOCATIONS : maxLocations)) { state = DONE; break; }
         const Location& l = locations[locIndex];
@@ -842,13 +900,17 @@ void Update() {
                 x.bRacer = profiles[c.profile].racingLogic;
                 x.aggression = profiles[c.profile].aggression;
                 x.speedVariation = 1.0f;
-                SetFixedDestination(c.veh, CVector2D(l.destX, l.destY));
+                c.wp = 0;
+                c.snapped = false;
+                SetFixedDestination(c.veh, WaypointPos(l, 0));
                 c.lastPos = c.veh->GetPosition();
                 c.lastProgress = now;
             }
             followed = 0;
             out << Format("  route trip to (%.0f, %.0f), %.0f m in a straight line: %s and %s drivers, Left/Right arrow to switch\n",
-                l.destX, l.destY, (CVector2D(l.destX, l.destY) - pos.To2D()).Magnitude(), tripCars[0].label, tripCars[1].label);
+                l.destX, l.destY, TripLeft(l, 0, pos.To2D()), tripCars[0].label, tripCars[1].label);
+            for (int i = 0; i < l.numWaypoints; i++)
+                out << Format("    waypoint %d: %s (%.0f, %.0f)\n", i + 1, l.waypoints[i].name, l.waypoints[i].x, l.waypoints[i].y);
         }
         Command<COMMAND_SET_CAMERA_BEHIND_PLAYER>();
         lastCarPos = testCar->GetPosition();
@@ -878,14 +940,44 @@ void Update() {
                     if (step < 50.0f) c.driven += step;
                     c.lastPos = c.veh->GetPosition();
                     c.still = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f ? c.still + dt : 0.0f;
-                    left = (CVector2D(l.destX, l.destY) - c.veh->GetPosition().To2D()).Magnitude();
+                    const CVector2D carPos = c.veh->GetPosition().To2D();
+                    const CVector2D wpPos = WaypointPos(l, c.wp);
+                    const float toWp = (wpPos - carPos).Magnitude();
+                    const int kind = WaypointKind(l, c.wp);
+                    // Freeway/parking waypoints: their node once the roads there are loaded (every 2 s while within 700 m)
+                    if (kind != 0 && !c.snapped && toWp < 700.0f && now - c.snapTry > 2000) {
+                        c.snapTry = now;
+                        c.snapped = SnapWaypoint(c.veh, wpPos, kind);
+                    }
+                    // Through a waypoint (within 150 m): on to the next one
+                    if (c.wp < l.numWaypoints && toWp < 150.0f) {
+                        out << Format("  [%s] waypoint %d (%s) at %.2f min, %.2f km driven\n", c.label, c.wp + 1, WaypointName(l, c.wp),
+                            Minutes(), c.driven / 1000.0f);
+                        c.wp++;
+                        c.snapped = false;
+                        c.snapTry = 0;
+                        SetFixedDestination(c.veh, WaypointPos(l, c.wp));
+                    }
+                    left = TripLeft(l, c.wp, carPos);
                     if (left < c.bestLeft - 100.0f) { c.bestLeft = left; c.lastProgress = now; }
                     else if (now - c.lastProgress > 180000) {
                         out << Format("  [%s] NO PROGRESS: 3 min without getting 100 m closer (%.0f m left), at (%.0f, %.0f)\n",
                             c.label, left, c.veh->GetPosition().x, c.veh->GetPosition().y);
                         c.lastProgress = now;
                     }
-                    if (left < 200.0f) c.result = "ARRIVED";
+                    if (c.wp >= l.numWaypoints && l.park) {
+                        // The parking place: stop there (within 12 m of its node, or 60 m of the end when there's none)
+                        ExtendedData& px = vehExData.Get(c.veh);
+                        CPathNode* parkNode = c.snapped ? GetNode(px.destNode) : nullptr;
+                        float toPark = parkNode ? (GetNodePos(parkNode).To2D() - carPos).Magnitude() : 1e9f;
+                        bool there = c.snapped ? toPark < 12.0f : (c.snapTry != 0 && toWp < 60.0f); // no parking node found: the end point
+                        if (there) {
+                            px.speedCap = 0.01f;
+                            if (!c.nearSince) c.nearSince = now;
+                            if (c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f || now - c.nearSince > 20000) c.result = "ARRIVED (parked)";
+                        }
+                    }
+                    else if (c.wp >= l.numWaypoints && left < 200.0f) c.result = "ARRIVED";
                     else if (c.still > 90.0f) { c.result = "FAIL: stopped for 90 s"; DumpHistory(c.veh, histories[c.veh]); }
                 }
                 if (*c.result) {

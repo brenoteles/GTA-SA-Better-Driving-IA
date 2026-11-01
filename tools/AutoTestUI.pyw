@@ -44,10 +44,11 @@ DRIVERS = {'calmo': 'calm', 'seguro': 'safe', 'normal': 'normal', 'rapido': 'fas
 DEFAULT_XLSX = os.path.join(os.path.expanduser('~'), 'Desktop', 'RealTrafficFix_Testes.xlsx')
 
 SCENARIOS = {
-    'Viagem Grove Street -> Bayside': {'Scenario': 'route', 'HighwayOnly': '0'},
+    'Viagem Bayside -> LS Centro (estacionar)': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Bayside -> LS'},
+    'Viagem Grove Street -> Bayside': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Grove Street'},
     'Rodovias (7 trechos)': {'Scenario': '', 'HighwayOnly': '1'},
     'Cidade (11 locais)': {'Scenario': '', 'HighwayOnly': '0'},
-    'Varredura da rota (laser, sem trafego)': {'Scenario': 'scan', 'HighwayOnly': '0'},
+    'Varredura da rota (laser, sem trafego)': {'Scenario': 'scan', 'HighwayOnly': '0', 'Route': 'Bayside -> LS'},
 }
 
 LIVE_RE = re.compile(r'\[live ([\d.]+) min\] driving collisions (\d+) \(([\d.]+)/min\), spawn (\d+), oscillations (\d+) \| '
@@ -358,7 +359,7 @@ class App:
             sc = SCENARIOS[self.scenario.get()]
             autotest = ['[AutoTest]', 'Mode = mod', f'Tag = {tag}', f'SecondsPerLocation = {self.seconds.get()}',
                         f'StopOnOscillation = {int(self.stoposc.get())}', f'CarModel = {self.car.get()}', 'MaxLocations = 20',
-                        f'HighwayOnly = {sc["HighwayOnly"]}', f'Scenario = {sc["Scenario"]}', f'RouteMaxMinutes = {self.maxmin.get()}',
+                        f'HighwayOnly = {sc["HighwayOnly"]}', f'Scenario = {sc["Scenario"]}', f'Route = {sc.get("Route", "")}', f'RouteMaxMinutes = {self.maxmin.get()}',
                         f'NoPeds = {int(self.nopeds.get())}', f'TripCars = {2 if self.twocars.get() else 1}', f'TripProfile = {DRIVERS[self.driver.get()]}', 'ExitWhenDone = 1']
             with open(AUTOTEST_INI, 'w', encoding='ascii', newline='') as f:
                 f.write('\r\n'.join(autotest) + '\r\n')
