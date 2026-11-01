@@ -1206,6 +1206,9 @@ void Update() {
             laneChanges / std::max(aiKm, 0.01f), laneChangesMidLink);
         out << Format("overtakes started by the mod: %d, finished (passed the slower vehicle): %d, aborted: %d, back to the right: %d\n",
             overtakeCount, overtakeDoneCount, overtakeAbortCount, keepRightCount);
+        out << Format("  overtakes given up: lane changes stopped (lane drop/junction) %d, almost stopped or hit while moving over %d, "
+            "someone beside %d, someone fast coming in that lane %d, timed out or the slower one sped up %d\n", overtakeAbortWhy[0],
+            overtakeAbortWhy[1], overtakeAbortWhy[2], overtakeAbortWhy[3], overtakeAbortWhy[4]);
         out << Format("lane changes for the route (exit/turn lane): %d, to the fast lane: %d, indicator on but cancelled: %d, "
             "drivers that made room for a signalling vehicle: %d, lane set by position after a junction: %d\n", prepareLaneCount,
             fastLaneCount, signalCancelCount, yieldCount, junctionLaneCount);

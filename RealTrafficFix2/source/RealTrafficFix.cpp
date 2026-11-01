@@ -111,8 +111,8 @@ static DriverProfile profiles[NUM_PROFILES] = {
     {   35,   1.00f, 2.0f, 3.0f, 0.53f, 1.0f, 0.52f, 0.94f, 0.85f, 10.0f, 0.50f,  1, 50.0f, false, false, false }, // normal
     {   15,   1.15f, 2.8f, 3.5f, 0.4f, 0.9f, 0.62f, 0.98f, 0.92f,  8.0f, 0.70f,  1, 60.0f, false, false, false }, // fast
     {   10,   1.30f, 3.5f, 4.5f, 0.3f, 0.8f, 0.72f, 1.00f, 0.97f,  6.0f, 0.95f,  1, 70.0f, false, false, false }, // aggressive
-    {    2,   1.70f, 9.0f, 6.0f, 0.3f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
-    {    3,   1.00f, 9.0f, 7.0f, 0.3f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
+    {    0,   1.70f, 9.0f, 6.0f, 0.3f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
+    {    0,   1.00f, 9.0f, 7.0f, 0.3f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
     {    0,   1.25f, 3.5f, 4.0f, 0.3f, 1.0f, 0.62f, 1.00f, 0.95f,  6.0f, 0.85f,  1, 65.0f, false, false, false }, // wheelspin (see ApplyWheelspin)
 };
 
@@ -478,6 +478,9 @@ static float cfgBypassSpeed = 20.0f;   // km/h
 static int bypassCount = 0;
 // Lane change statistics (AutoTest)
 static int overtakeCount = 0, overtakeDoneCount = 0, overtakeAbortCount = 0, keepRightCount = 0;
+// Overtakes given up, by why: 0 lane changes stopped (lane drop, junction, disabled), 1 almost stopped or hit something while
+// moving over, 2 the side check (someone beside), 3 someone fast coming in that lane, 4 timed out / the slower one sped up
+static int overtakeAbortWhy[5] = {};
 static int prepareLaneCount = 0, fastLaneCount = 0, signalCancelCount = 0, yieldCount = 0, junctionLaneCount = 0;
 static int sideAbortCount = 0, pathLeaderCount = 0, predictedConflictCount = 0, overtakeWaitCount = 0, bikeHoldCount = 0, spawnSpeedMatchCount = 0, laneSyncCount = 0, sunkSpawnFixCount = 0;
 static int spawnRemovedCount = 0;
@@ -840,10 +843,10 @@ static bool AmbientRoadHasRoom(const CVector& pos, const CVector2D& dir, CCarPat
         CVector2D rel = (v->GetPosition() - pos).To2D();
         float along = CVector2D::Dot(rel, dir), across = std::abs(dir.x * rel.y - dir.y * rel.x);
         if (std::abs(along) > 100.0f || across > lanes * LANE_WIDTH || std::abs(v->GetPosition().z - pos.z) > 6.0f) continue;
-        if (v->m_pDriver && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 2.0f && ++stopped >= 3) return false;
+        if (v->m_pDriver && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 2.0f && ++stopped >= 2) return false;
         count++;
     }
-    return count < lanes * 200 / 25;
+    return count < lanes * 200 / 35; // one car per 35 m of lane at most (25: the streets at the start were packed)
 }
 
 static void UpdateAmbientSpawn() {
@@ -1406,7 +1409,8 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 // Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
 // 110 km/h and more; curves under 60 km/h as before. Fast curves were braked far below what the car could do
 static float cfgFastCurveGripBoost = 1.7f;
-static float cfgHighwayGapFactor = 0.3f;  // following time gap on freeways/fast roads, x the profile's
+static float cfgHighwayGapFactor = 0.3f;
+static float cfgCityGapFactor = 0.7f;     // following time gap elsewhere, x the profile's  // following time gap on freeways/fast roads, x the profile's
 // Lateral g the vehicle being driven can take before it tips over (see GetRollGrip): the fast-curve boost never goes past it
 static float curRollGrip = 1000.0f;
 static float CurveSpeedFor(float grip, float curvature) {
@@ -2531,7 +2535,8 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
                         if (o->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS > 3.0f) continue;
                         CVector2D op = o->GetPosition().To2D();
                         float lon = CVector2D::Dot(op - junctionPos, exitDir);
-                        if (lon < exitStart || lon > exitStart + carLen + 8.0f) continue;
+                        // Long vehicles (trucks, buses): 1.5 x their length, they need the room to straighten up
+                        if (lon < exitStart || lon > exitStart + carLen * (carLen > 7.0f ? 1.5f : 1.0f) + 8.0f) continue;
                         float laneF = CVector2D::Dot(op - xdata.pathLinkPos[j], er) / LANE_WIDTH - xdata.pathLaneOffset[j];
                         boxBlocked = laneF > -0.6f && laneF < exitLanes - 0.4f;
                     }
@@ -3385,6 +3390,7 @@ public:
         ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniFloat(ini, "HighwayGapFactor", cfgHighwayGapFactor);
+        ReadIniFloat(ini, "CityGapFactor", cfgCityGapFactor);
         ReadIniBool(ini, "StabilityControl", cfgStabilityControl);
         ReadIniBool(ini, "CounterSteer", cfgCounterSteer);
         ReadIniBool(ini, "PedalControl", cfgPedalControl);
@@ -4000,7 +4006,7 @@ public:
             const bool fastRoadGap = xdata.roadType == ROAD_HIGHWAY || xdata.roadType == ROAD_FAST;
             // Getting ready to overtake: 40-60% of the following gap (at least 0.25 s), like a driver closing up before
             // pulling out to pass
-            float tg = fastRoadGap ? std::max(timeGap * cfgHighwayGapFactor, 0.25f) : timeGap;
+            float tg = fastRoadGap ? std::max(timeGap * cfgHighwayGapFactor, 0.25f) : std::max(timeGap * cfgCityGapFactor, 0.3f);
             if (CTimer::m_snTimeInMilliseconds < xdata.overtakePrepUntil && xdata.leaderSpeed > 1.5f)
                 tg = std::max(tg * Lerp(0.6f, 0.4f, xdata.aggression), 0.25f);
             float sStar = minGap + std::max(0.0f, v * tg + (v * dv) / (2.0f * std::sqrt(accel * decel)));
@@ -4813,7 +4819,7 @@ public:
         xdata.yieldTo = nullptr;
         xdata.yieldGap = 1000.0f;
         auto stopLaneChanges = [&]() {
-            if (xdata.laneState == LANE_OVERTAKING) overtakeAbortCount++;
+            if (xdata.laneState == LANE_OVERTAKING) { overtakeAbortCount++; overtakeAbortWhy[0]++; }
             xdata.laneState = LANE_KEEP;
             xdata.pendingLane = -1;
             xdata.returnLane = -1;
@@ -5262,7 +5268,7 @@ public:
             bool hitSomething = now - veh->m_nLastCollisionTime < 300 && veh->m_pDamageEntity;
             if (speed < 3.0f || hitSomething) {
                 sideAbortCount++;
-                if (xdata.changeAfter == LANE_OVERTAKING) overtakeAbortCount++;
+                if (xdata.changeAfter == LANE_OVERTAKING) { overtakeAbortCount++; overtakeAbortWhy[1]++; }
                 xdata.laneState = LANE_KEEP;
                 xdata.overtakeTarget = nullptr;
                 xdata.indicatorUntil = now;
@@ -5281,7 +5287,7 @@ public:
             if (xdata.changeTarget != xdata.changeOrigin && (fastBehind ||
                 !SideClear(veh, xdata, xdata.changeTarget > xdata.changeOrigin ? 1 : -1, speed, lanesLeft))) {
                 sideAbortCount++;
-                if (xdata.changeAfter == LANE_OVERTAKING) overtakeAbortCount++;
+                if (xdata.changeAfter == LANE_OVERTAKING) { overtakeAbortCount++; overtakeAbortWhy[fastBehind ? 3 : 2]++; }
                 xdata.changeTarget = xdata.changeOrigin;
                 xdata.changeFromF = myLaneF;
                 xdata.changeStart = now;
@@ -5305,6 +5311,7 @@ public:
             }
             else if (now - xdata.overtakeStart > 30000 || lon > 150.0f) { // it didn't work out (it sped up, we got stuck)
                 overtakeAbortCount++;
+                overtakeAbortWhy[4]++;
                 xdata.laneState = LANE_KEEP;
                 xdata.overtakeTarget = nullptr;
             }
