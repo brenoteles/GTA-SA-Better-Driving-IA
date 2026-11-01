@@ -192,7 +192,7 @@ class App:
         frm = ttk.LabelFrame(root, text='Teste')
         frm.pack(fill='x', padx=8, pady=6)
         self.scenario = tk.StringVar(value=list(SCENARIOS)[0])
-        self.car = tk.StringVar(value='524')
+        self.car = tk.StringVar(value='527')
         self.seconds = tk.StringVar(value='90')
         self.maxmin = tk.StringVar(value='35')
         self.nopeds = tk.BooleanVar(value=True)
@@ -208,7 +208,7 @@ class App:
         row = 0
         ttk.Label(frm, text='Cenario').grid(row=row, column=0, sticky='w', padx=4, pady=2)
         ttk.Combobox(frm, textvariable=self.scenario, values=list(SCENARIOS), state='readonly', width=34).grid(row=row, column=1, sticky='w')
-        ttk.Label(frm, text='Carro (modelo, 524 = Cement Truck)').grid(row=row, column=2, sticky='w', padx=8)
+        ttk.Label(frm, text='Carro (modelo, 527 = Cadrona)').grid(row=row, column=2, sticky='w', padx=8)
         ttk.Entry(frm, textvariable=self.car, width=8).grid(row=row, column=3, sticky='w')
         row += 1
         ttk.Label(frm, text='Segundos por local').grid(row=row, column=0, sticky='w', padx=4, pady=2)
