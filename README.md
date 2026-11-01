@@ -31,3 +31,14 @@ Realistic AI traffic for GTA San Andreas (1.0 US), built on top of
 Visual Studio with [plugin-sdk](https://github.com/DK22Pac/plugin-sdk) (`PLUGIN_SDK_DIR` set), `RealTrafficFix.sln`,
 configuration `Release GTA-SA`, platform Win32. Output: `RealTrafficFix.SA.asi`; with `GTA_SA_DIR` set the build copies
 it to the game's `scripts` folder. Copy `RealTrafficFix.ini` and `RealTrafficFix.routefixes.txt` there too.
+
+## Path data tools
+
+| Path | |
+|---|---|
+| `tools/sa_paths.py` | reader/writer and analysis of the game's road network (`data/paths/NODES*.DAT`) |
+| `tools/lights_everywhere.py` | traffic lights at every urban junction, coherent cycles (main axis / crossing roads) |
+
+`python tools/lights_everywhere.py "<game>/data/paths" "<game>/modloader/RealTrafficFix Paths/gta3.img"` writes the
+changed `NODESn.DAT` files; modloader puts them in `gta3.img`. Delete that folder to go back to the original lights.
+The game's files themselves aren't in this repository.
