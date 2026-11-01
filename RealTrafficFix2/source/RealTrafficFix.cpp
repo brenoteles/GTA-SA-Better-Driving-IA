@@ -1380,7 +1380,7 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 
 // Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
 // 110 km/h and more; curves under 60 km/h as before. Fast curves were braked far below what the car could do
-static float cfgFastCurveGripBoost = 2.0f;
+static float cfgFastCurveGripBoost = 1.7f;
 static float cfgHighwayGapFactor = 0.3f;  // following time gap on freeways/fast roads, x the profile's
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
@@ -1394,7 +1394,9 @@ static float CornerSpeed(float angle, float lenIn, float lenOut, float grip, flo
     outHalfLen = 0.5f * std::min(lenIn, lenOut);
     if (angle < 0.0175f) return 1000.0f; // < 1 degree, straight
     float radius = outHalfLen / std::tan(angle * 0.5f);
-    return CurveSpeedFor(grip, 1.0f / radius);
+    // No fast-curve boost here: sharp corners between two nodes are ramps and junction turns (a car took an off-ramp at
+    // 115 km/h with the boost and went over the edge)
+    return std::sqrt(grip * GRAVITY * radius);
 }
 
 static float TurnAngle(const CVector& a, const CVector& b, const CVector& c, float& lenIn, float& lenOut) {
@@ -2230,7 +2232,8 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             if (curvature < 0.002f) continue;            // radius > 500 m
             // Junction turns (the short window): less of the grip. Into them at the open-road share, cars swung wide across
             // the oncoming lanes
-            float cornerSpeed = CurveSpeedFor(grip * (k == kTurn ? cfgJunctionGripFactor : 1.0f), curvature);
+            // The fast-curve boost only for curves along the road (the long window), not junction/ramp turns
+            float cornerSpeed = k == kTurn ? std::sqrt(grip * cfgJunctionGripFactor * GRAVITY / curvature) : CurveSpeedFor(grip, curvature);
             // Tight junction turns: a handbrake turn rotates the car, it goes in faster (and doesn't brake to a crawl)
             if (k == kTurn && xdata.handbrakeCapable && curvature > 1.0f / 30.0f) cornerSpeed *= cfgHandbrakeEntryBoost;
             applyLimit(cornerSpeed, sd[j], sn[j], false);
