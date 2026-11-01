@@ -216,6 +216,10 @@ public:
     float prevFwdSpeed = 0.0f;
     unsigned int prevFwdFrame = 0;
     float gasTrim = 0.0f;         // gas above the cruise gas that gives accelLimit
+    float speedTrim = 0.0f;       // speed control: gas the cruise estimate is off by (integral term)
+    float pedalGas = 0.0f;        // speed control: last gas given (moved gradually)
+    bool pedalBraking = false;    // speed control: braking for being too fast (hysteresis)
+    signed char pedalSide = 0;    // speed control: last pedal really pressed (1 gas, -1 brake), to count switches
     bool accelLimiting = false;   // the limiter was running last frame
 
     // Personality: 0 = calm, 1 = very aggressive
@@ -1372,7 +1376,7 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 
 // Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
 // 120 km/h and more; curves under 70 km/h as before. Fast curves were braked far below what the car could do
-static float cfgFastCurveGripBoost = 1.3f;
+static float cfgFastCurveGripBoost = 1.6f;
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
     float t = std::clamp((v - 70.0f / 3.6f) / ((120.0f - 70.0f) / 3.6f), 0.0f, 1.0f);
@@ -2629,6 +2633,10 @@ static float CruiseGas(CVehicle* veh, float speed) {
     return std::clamp((speed / topSpeed) * (speed / topSpeed) * 1.1f + 0.08f, 0.0f, 0.9f);
 }
 
+// Gas<->brake switches of the speed control, and its driving time (AutoTest: switches per minute)
+static int pedalSwitchCount = 0;
+static float pedalSeconds = 0.0f;
+
 // Our own pedals: follow the target speed precisely instead of the game's rough gas dosing.
 // Whenever the game itself wants to stop (car ahead, red light, train crossing, parking) its decision stays
 static void ApplyPedalControl(CVehicle* veh, ExtendedData& xdata, float speed, float* gas, float* brake, bool* handbrake) {
@@ -2644,23 +2652,41 @@ static void ApplyPedalControl(CVehicle* veh, ExtendedData& xdata, float speed, f
     if (queued && speed < 6.0f) return;
     const float gameBrake = *brake;
 
+    // Like a driver holding a speed: gas from the estimate of what holds it, corrected slowly (integral) and quickly
+    // (proportional); the brake only when clearly too fast (from ~5 km/h over, until ~1.5 km/h over), coasting in
+    // between. It used to switch gas/brake every few frames around the target (P only, braking from 3.6 km/h over)
+    const float dt = std::min(CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS, 0.1f);
     float error = target - speed;
     float gain = Lerp(0.8f, 1.25f, xdata.aggression);
     float cruiseGas = CruiseGas(veh, speed);
+    if (xdata.pedalBraking ? error > -0.4f : error < -1.4f) xdata.pedalBraking = !xdata.pedalBraking;
 
-    if (error > 0.3f) {            // speed up
-        *gas = std::clamp(cruiseGas + error * 0.25f * gain, 0.0f, 1.0f);
-        *brake = 0.0f;
-    }
-    else if (error > -1.0f) {      // hold the speed
-        *gas = std::clamp(cruiseGas + error * 0.3f, 0.0f, 1.0f);
-        *brake = 0.0f;
-    }
-    else {                          // slow down: brake proportionally to how far above the target we are
+    if (xdata.pedalBraking) {
+        xdata.pedalGas = 0.0f;
+        xdata.speedTrim = std::max(xdata.speedTrim - 0.05f * dt, -0.3f); // it was too fast: the estimate was high
         *gas = 0.0f;
-        *brake = std::max(std::clamp((-error - 1.0f) * 0.2f * gain, 0.0f, 1.0f), gameBrake); // never less than the game wanted
+        *brake = std::max(std::clamp((-error - 0.4f) * 0.2f * gain, 0.05f, 1.0f), gameBrake); // never less than the game wanted
     }
-    if (gameBrake > 0.05f && error > -1.0f) *brake = gameBrake, *gas = 0.0f;
+    else {
+        // Integral only near the target (no wind-up while speeding up or when the gas is at a stop)
+        if (std::abs(error) < 3.0f && xdata.pedalGas > 0.02f && xdata.pedalGas < 0.98f)
+            xdata.speedTrim = std::clamp(xdata.speedTrim + error * 0.06f * dt, -0.3f, 0.3f);
+        float kp = error > 0.0f ? (error > 3.0f ? 0.25f : 0.15f) * gain : 0.3f;
+        float want = std::clamp(cruiseGas + xdata.speedTrim + error * kp, 0.0f, 1.0f);
+        // The foot moves: up to ~2.5/s pressing, ~5/s letting go
+        float delta = std::clamp(want - xdata.pedalGas, -5.0f * dt, 2.5f * dt);
+        xdata.pedalGas = std::clamp(xdata.pedalGas + delta, 0.0f, 1.0f);
+        *gas = xdata.pedalGas;
+        *brake = 0.0f;
+    }
+    // A little over the target the game brakes lightly for that alone (we coast instead); hard, it has a reason
+    if (gameBrake > 0.5f && !xdata.pedalBraking) { *brake = gameBrake; *gas = 0.0f; xdata.pedalGas = 0.0f; }
+    signed char side = *brake > 0.1f ? -1 : (*gas > 0.1f ? 1 : 0);
+    if (side != 0) {
+        if (xdata.pedalSide != 0 && side != xdata.pedalSide) pedalSwitchCount++;
+        xdata.pedalSide = side;
+    }
+    pedalSeconds += dt;
     xdata.aidFlags |= AID_PEDALS;
 }
 
@@ -3912,7 +3938,9 @@ public:
         }
         cruise = std::min(cruise, 127.0f);
         xdata.targetSpeed = cruise / MPS_TO_CRUISE;
-        ap.m_nCruiseSpeed = static_cast<char>(cruise);
+        // Rounded up: truncated, the game's own speed control braked down to just under our target, and we let its brake
+        // through (it looked like braking for a reason): a gas/brake loop at the target speed
+        ap.m_nCruiseSpeed = static_cast<char>(std::min(std::ceil(cruise), 127.0f));
     }
 
     // Stopped/slow vehicle or ped right in front. CCarAI::UpdateCarAI (0x41FA99) reverses a car whose cruise speed isn't 0,
