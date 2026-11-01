@@ -1420,6 +1420,9 @@ struct JunctionSignal {
     int demand[3] = {};                 // cars arriving on cycle 1/2 roads within 60 m
     bool arriving[3] = {};              // one of them within the gap time of the stop line
     unsigned int lastGreen[3] = {};     // when each cycle last had green
+    // Its roads arriving with a light: direction from the junction out along the road, and the light's cycle
+    std::vector<std::pair<CVector2D, int>> legs;
+    bool legsKnown = false;
 };
 static int signalForcedCount = 0;
 static std::unordered_map<uint32_t, JunctionSignal> junctionSignals;
@@ -1434,17 +1437,36 @@ static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsi
     const CVector jp = GetNodePos(jn);
     sig.demand[1] = sig.demand[2] = 0;
     sig.arriving[1] = sig.arriving[2] = false;
+    if (!sig.legsKnown) {
+        sig.legsKnown = true;
+        for (int k = 0; k < jn->NumberAdjNodes; k++) {
+            CNodeAddress nb = GetAdjacentNode(jn, junction, k);
+            CPathNode* nn = GetNode(nb);
+            CCarPathLink* link = nn ? GetLinkBetween(junction, jn, nb) : nullptr;
+            if (!link || !link->m_nTrafficLightState) continue;
+            CVector2D d = GetNodePos(nn).To2D() - jp.To2D();
+            float len = d.Magnitude();
+            if (len > 0.5f) sig.legs.push_back({ d * (1.0f / len), link->m_nTrafficLightState });
+        }
+    }
+    // Who's waiting/arriving: by where it is (the road it's on, the one whose direction from the junction is closest to
+    // it) and that it's heading for the junction. By the cars' next node, the ones queued further back or with the light a
+    // few nodes before the junction weren't counted: nobody waiting, the junction never gave them green
     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
         CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
-        if (!v || !v->m_pDriver) continue;
-        float dist = (jp - v->GetPosition()).Magnitude2D();
-        if (dist > 60.0f || std::abs(jp.z - v->GetPosition().z) > 6.0f) continue;
-        const CAutoPilot& ap = v->m_autoPilot;
-        if (!(ap.m_startingRouteNode == junction)) continue;
-        CPathNode* cur = GetNode(ap.m_currentAddress);
-        CCarPathLink* link = cur ? GetLinkBetween(ap.m_currentAddress, cur, ap.m_startingRouteNode) : nullptr;
-        if (!link || !link->m_nTrafficLightState) continue;
-        int c = link->m_nTrafficLightState;
+        if (!v || !v->m_pDriver || sig.legs.empty()) continue;
+        CVector2D rel = v->GetPosition().To2D() - jp.To2D();
+        float dist = rel.Magnitude();
+        if (dist > 60.0f || dist < 3.0f || std::abs(jp.z - v->GetPosition().z) > 6.0f) continue;
+        CVector2D out = rel * (1.0f / dist);
+        if (CVector2D::Dot(v->GetForward().To2D(), out) > -0.5f) continue; // not heading for the junction
+        int c = 0;
+        float bestDot = 0.8f; // within ~37 degrees of a road
+        for (const auto& leg : sig.legs) {
+            float dd = CVector2D::Dot(leg.first, out);
+            if (dd > bestDot) { bestDot = dd; c = leg.second; }
+        }
+        if (!c) continue;
         sig.demand[c]++;
         float speed = v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
         if (speed > 1.0f && dist < 10.0f + speed * cfgSignalGap) sig.arriving[c] = true;
