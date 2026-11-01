@@ -75,11 +75,11 @@ static const char* roadNames[] = { "?", "dirt", "narrow", "street", "rural", "av
 // Driver profiles. Each driver gets one when the vehicle is created (weights in the ini, biased by vehicle type and driver)
 enum eDriverProfile : unsigned char {
     PROFILE_CALM, PROFILE_SAFE, PROFILE_NORMAL, PROFILE_FAST, PROFILE_AGGRESSIVE, PROFILE_FLEEING, PROFILE_MAX_PERFORMANCE,
-    PROFILE_DRIFTER, NUM_PROFILES
+    PROFILE_WHEELSPIN, NUM_PROFILES
 };
-static const char* profileNames[NUM_PROFILES] = { "calm", "safe", "normal", "fast", "aggressive", "fleeing", "max perf", "drifter" };
+static const char* profileNames[NUM_PROFILES] = { "calm", "safe", "normal", "fast", "aggressive", "fleeing", "max perf", "wheelspin" };
 static const char* profileSections[NUM_PROFILES] = { "Profile.Calm", "Profile.Safe", "Profile.Normal", "Profile.Fast",
-    "Profile.Aggressive", "Profile.Fleeing", "Profile.MaxPerformance", "Profile.Drifter" };
+    "Profile.Aggressive", "Profile.Fleeing", "Profile.MaxPerformance", "Profile.Wheelspin" };
 
 struct DriverProfile {
     int chance;                 // relative weight
@@ -113,7 +113,7 @@ static DriverProfile profiles[NUM_PROFILES] = {
     {   10,   1.30f, 3.5f, 4.5f, 0.3f, 0.8f, 0.72f, 1.00f, 0.97f,  6.0f, 0.95f,  1, 70.0f, false, false, false }, // aggressive
     {    2,   1.70f, 9.0f, 6.0f, 0.3f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
     {    3,   1.00f, 9.0f, 7.0f, 0.3f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
-    {    0,   1.25f, 3.5f, 4.0f, 0.3f, 1.0f, 0.62f, 1.00f, 0.95f,  6.0f, 0.85f,  1, 65.0f, false, false, false }, // drifter (see ApplyDrift)
+    {    0,   1.25f, 3.5f, 4.0f, 0.3f, 1.0f, 0.62f, 1.00f, 0.95f,  6.0f, 0.85f,  1, 65.0f, false, false, false }, // wheelspin (see ApplyWheelspin)
 };
 
 // Lane changes of the mod (overtaking, keeping right)
@@ -213,8 +213,6 @@ public:
     float filtLong = 0.0f;  // m/s2, smoothed
     float filtYawRate = 0.0f; // rad/s, smoothed (heading limiter)
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
-    float driftI = 0.0f;      // drifter: integral of the slip angle error (gas)
-    unsigned int driftTapUntil = 0, driftTapLast = 0; // drifter: handbrake tap to start a slide
     unsigned char aidFlags = 0;   // eAidFlags
 
     // Acceleration limit of the profile (pedal control)
@@ -2823,7 +2821,7 @@ static void ApplyAccelLimit(CVehicle* veh, ExtendedData& xdata, float speed, flo
 
 // Counter-steer: when the car slides, steer into the direction it's really going, like a driver catching a slide
 static void ApplyCounterSteer(CVehicle* veh, ExtendedData& xdata, float speed, float* steer) {
-    if (!cfgCounterSteer || speed < 6.0f || xdata.profile == PROFILE_DRIFTER) return; // the drifter has its own (ApplyDrift)
+    if (!cfgCounterSteer || speed < 6.0f) return;
     CVector2D vel = veh->m_vecMoveSpeed.To2D();
     CVector2D fwd = veh->GetForward().To2D();
     if (CVector2D::Dot(vel, fwd) <= 0.0f) return;
@@ -2836,56 +2834,29 @@ static void ApplyCounterSteer(CVehicle* veh, ExtendedData& xdata, float speed, f
     xdata.aidFlags |= AID_COUNTERSTEER;
 }
 
-// Drifter: in curves the car slides a little, under control. The slip angle (heading vs. where it's going) is held at
-// DriftSlip (~11 degrees) towards the inside of the turn: the gas (PI: on a rear-wheel-drive car more gas = more slide)
-// and a counter-steer around that angle (P: steers towards where it's going when it slides past it). A short pull of the
-// handbrake starts the slide on the way into a curve. Traction/stability control off (they'd kill it)
-static float cfgDriftSlip = 0.16f;
-// Its steering lock: the game's AI lock shrinks with speed (0.7 rad up to ~36 km/h, 0.2 rad at 126): the counter-steer
-// couldn't hold a slide at speed and it spun. The drifter turns the wheel as far as a driver would
-static float cfgDriftMaxSteer = 0.9f;
-static void ApplyDrift(CVehicle* veh, ExtendedData& xdata, float speed, float* steer, float* gas, float* brake, bool* handbrake) {
-    if (xdata.profile != PROFILE_DRIFTER || veh->m_nVehicleSubClass != VEHICLE_AUTOMOBILE) return;
-    const float dt = std::min(CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS, 0.1f);
-    const unsigned int now = CTimer::m_snTimeInMilliseconds;
-    CVector2D vel = veh->m_vecMoveSpeed.To2D();
-    CVector2D fwd = veh->GetForward().To2D();
-    const float yaw = xdata.filtYawRate; // > 0: turning left
-    const bool inCurve = speed > 9.0f && std::abs(yaw) > 0.12f && CVector2D::Dot(vel, fwd) > 0.0f && veh->GetNumContactWheels() >= 3;
-    if (!inCurve || *brake > 0.3f) { xdata.driftI = 0.0f; return; }
-    const float dir = yaw > 0.0f ? 1.0f : -1.0f;
-    // Slip: where it's going minus where it points. Sliding through a left turn the nose points further left than the
-    // velocity: the slip is negative. The wanted one is -dir * DriftSlip
-    float slip = WrapAngle(CGeneral::GetATanOfXY(vel.x, vel.y) - CGeneral::GetATanOfXY(fwd.x, fwd.y));
-    float wanted = -dir * cfgDriftSlip;
-    float error = cfgDriftSlip - (-dir * slip); // > 0: not sliding enough
-    // Too far (> 0.45 rad, 26 degrees): catching it, off the gas, the wheel towards where it's going
-    if (std::abs(slip) > 0.45f) {
-        xdata.driftI = 0.0f;
-        *gas = 0.0f;
-        *steer = std::clamp(slip * 1.2f, -cfgDriftMaxSteer, cfgDriftMaxSteer);
+// Wheelspin driver: on the straight, speeding up, the wheels spin (full gas, no traction control), the car kept straight:
+// when it starts stepping sideways (> ~3 degrees) the gas comes back to 60% and a little counter-steer. In curves it
+// drives like the others, traction control on: no sliding there (a drifting profile took bad angles and spun)
+static bool WheelspinStraight(CVehicle* veh, const ExtendedData& xdata) {
+    return xdata.profile == PROFILE_WHEELSPIN && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE && std::abs(xdata.filtYawRate) < 0.08f &&
+        std::abs(veh->m_fSteerAngle) < 0.12f && xdata.curveSpeed > veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS * 1.2f;
+}
+static void ApplyWheelspin(CVehicle* veh, ExtendedData& xdata, float speed, float* steer, float* gas, float* brake) {
+    if (!WheelspinStraight(veh, xdata) || *brake > 0.05f || *gas < 0.3f || speed > 45.0f) return;
+    CVector2D vel = veh->m_vecMoveSpeed.To2D(), fwd = veh->GetForward().To2D();
+    float slip = speed > 3.0f ? WrapAngle(CGeneral::GetATanOfXY(vel.x, vel.y) - CGeneral::GetATanOfXY(fwd.x, fwd.y)) : 0.0f;
+    if (std::abs(slip) > 0.05f) {
+        *gas = 0.6f;
+        float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh);
+        *steer = std::clamp(*steer + slip * 1.0f, -maxSteer, maxSteer);
         xdata.aidFlags |= AID_COUNTERSTEER;
-        return;
     }
-    // Gas: PI around the wanted slide (gentle: it overshot); past it by 0.08 rad (5 degrees) off the gas
-    xdata.driftI = std::clamp(xdata.driftI + error * 0.8f * dt, -0.3f, 0.3f);
-    float driftGas = std::clamp(0.4f + error * 1.5f + xdata.driftI, 0.0f, 1.0f);
-    if (error < -0.08f) driftGas *= 0.3f;
-    *gas = std::max(std::min(driftGas, std::max(*gas, 0.3f)), 0.0f);
-    // Counter-steer around the wanted slip (towards where it's going when past it), with the drifter's lock
-    *steer = std::clamp(*steer + (slip - wanted) * 2.0f, -cfgDriftMaxSteer, cfgDriftMaxSteer);
-    // Into the curve and not sliding: a short pull of the handbrake (0.15 s, at most every 2 s)
-    if (error > 0.12f && speed > 12.0f && speed < 38.0f && std::abs(yaw) > 0.2f && now - xdata.driftTapLast > 2000) {
-        xdata.driftTapUntil = now + 150;
-        xdata.driftTapLast = now;
-    }
-    if (now < xdata.driftTapUntil) { *handbrake = true; *brake = 0.0f; }
-    xdata.aidFlags |= AID_COUNTERSTEER;
+    else *gas = 1.0f;
 }
 
 // ABS, traction control and stability control on the pedals
 static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, float* gas, float* brake) {
-    if (xdata.profile == PROFILE_DRIFTER) return; // they'd kill the slide
+    if (WheelspinStraight(veh, xdata)) return; // the wheelspin driver's straights: spinning on purpose
     eWheelState wheels[4];
     int numWheels = GetWheelStates(veh, wheels);
     bool locked = false, spinning = false;
@@ -3118,7 +3089,7 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     ApplyPedalControl(veh, xdata, speed, gas, brake, handbrake);
     ApplyAccelLimit(veh, xdata, speed, gas, brake);
     ApplyDriverAids(veh, xdata, speed, gas, brake);
-    ApplyDrift(veh, xdata, speed, steer, gas, brake, handbrake);
+    ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
     if (handbrakeTurn) {
         *handbrake = true;
@@ -3411,8 +3382,6 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
-        ReadIniFloat(ini, "DriftSlip", cfgDriftSlip);
-        ReadIniFloat(ini, "DriftMaxSteer", cfgDriftMaxSteer);
         ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniFloat(ini, "HighwayGapFactor", cfgHighwayGapFactor);
