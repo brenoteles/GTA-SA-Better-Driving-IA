@@ -38,6 +38,8 @@ it to the game's `scripts` folder. Copy `RealTrafficFix.ini` and `RealTrafficFix
 |---|---|
 | `tools/sa_paths.py` | reader/writer and analysis of the game's road network (`data/paths/NODES*.DAT`) |
 | `tools/lights_everywhere.py` | traffic lights at every urban junction, coherent cycles (main axis / crossing roads) |
+| `tools/densify_paths.py` | ~2x the road nodes: links split on a Catmull-Rom curve, navis spilled to areas with room (needs LoadAllPathNodes) |
+| `tools/check_paths.py` | structural check of path files (link symmetry, navi references, lanes) |
 
 `python tools/lights_everywhere.py "<game>/data/paths" "<game>/modloader/RealTrafficFix Paths/gta3.img"` writes the
 changed `NODESn.DAT` files; modloader puts them in `gta3.img`. Delete that folder to go back to the original lights.

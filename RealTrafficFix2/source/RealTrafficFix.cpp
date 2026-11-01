@@ -54,7 +54,7 @@ static constexpr float MPS_TO_CRUISE = 60.0f / 50.0f;
 static constexpr float MPS_TO_KMH = 3.6f;
 static constexpr float GRAVITY = 9.81f;
 static constexpr float MAGIC = 50.0f / 30.0f;
-static constexpr int MAX_LOOKAHEAD_NODES = 32;
+static constexpr int MAX_LOOKAHEAD_NODES = 80; // the denser road data (densify_paths.py) has ~2x the nodes
 static constexpr float MAX_LOOKAHEAD_DIST = 450.0f;
 static constexpr float LANE_WIDTH = 5.4f;  // CCarCtrl lane width @ 0x858C50
 static constexpr int MAX_RAYS = 10;
@@ -1741,7 +1741,7 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     int expansions = 0;
     bool found = false;
     uint32_t goalHit = goalKey;
-    while (!open.empty() && expansions < 80000) {
+    while (!open.empty() && expansions < 200000) {
         uint32_t k = open.top().second;
         open.pop();
         Rec& rec = recs[k];
@@ -1796,7 +1796,7 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     if (end == startKey && !found) { routeFailCount++; return false; }
     for (uint32_t k = end; k != 0xFFFFFFFF; k = recs[k].parent) {
         xdata.route.push_back(addrOf(k));
-        if (xdata.route.size() > 6000) { xdata.route.clear(); routeFailCount++; return false; } // broken chain
+        if (xdata.route.size() > 15000) { xdata.route.clear(); routeFailCount++; return false; } // broken chain
     }
     std::reverse(xdata.route.begin(), xdata.route.end());
     xdata.routeComplete = found;
