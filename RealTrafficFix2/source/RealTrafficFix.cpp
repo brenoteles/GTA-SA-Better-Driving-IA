@@ -159,6 +159,7 @@ public:
     CNodeAddress forcedExit;           // the route's exit at the junction being decided (see ForceRouteExit)
     CVehicle* deadlockIgnore = nullptr; // the vehicle it waits for in a circle of waiting cars: not seen for a while
     unsigned int deadlockUntil = 0;
+    unsigned char noseReverses = 0;     // nose-to-nose standoffs it backed out of
     unsigned int ignoreLightsUntil = 0; // a light that never turns green (or the game holding it for no reason): ignored
     eObstacleType memObstacle = OBSTACLE_NONE;
     float memGap = 0.0f, memLeaderSpeed = 0.0f;
@@ -1075,7 +1076,28 @@ static void BreakDeadlocks() {
         vx.deadlockUntil = now + 4000;
         // Nose to nose (one came the wrong way): the game brakes for the other car too, so it goes round it (the bypass)
         CVehicle* vv = chain[victim];
-        if (n == 2 && CVector2D::Dot(vv->GetForward().To2D(), vx.leaderVeh->GetForward().To2D()) < -0.5f && !vx.bypassUntil) {
+        const bool noseToNose = n == 2 && CVector2D::Dot(vv->GetForward().To2D(), vx.leaderVeh->GetForward().To2D()) < -0.5f;
+        // First back out of it (2.5 s, the nose swinging away from the other one), if nobody is right behind: going round a
+        // long truck turning in a junction never worked, the queue behind waited for minutes
+        bool roomBehind = noseToNose && vx.noseReverses < 2;
+        for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && roomBehind; k++) {
+            CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
+            if (!o || o == vv || o == vx.leaderVeh) continue;
+            CVector2D rel = (o->GetPosition() - vv->GetPosition()).To2D();
+            float lon = CVector2D::Dot(rel, vv->GetForward().To2D());
+            float lat = CVector2D::Cross(vv->GetForward().To2D(), rel);
+            roomBehind = !(lon < 0.0f && lon > -12.0f && std::abs(lat) < 3.0f);
+        }
+        if (roomBehind) {
+            CVector2D rel = (vx.leaderVeh->GetPosition() - vv->GetPosition()).To2D();
+            bool otherOnLeft = CVector2D::Cross(vv->GetForward().To2D(), rel) > 0.0f;
+            vv->m_autoPilot.m_nTempAction = otherOnLeft ? TEMPACT_REVERSE_LEFT : TEMPACT_REVERSE_RIGHT;
+            vv->m_autoPilot.m_nTempActionTime = now + 2500;
+            vx.noseReverses++;
+            vx.deadlockUntil = now + 6000;
+            lg << "  nose to nose: backing out\n";
+        }
+        else if (noseToNose && !vx.bypassUntil) {
             vx.savedStyle = static_cast<unsigned char>(vv->m_autoPilot.m_nCarDrivingStyle);
             vv->m_autoPilot.m_nCarDrivingStyle = static_cast<eCarDrivingStyle>(6);
             vx.bypassUntil = now + 12000;
