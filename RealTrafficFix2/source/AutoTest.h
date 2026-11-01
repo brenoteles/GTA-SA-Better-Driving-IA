@@ -1204,6 +1204,7 @@ void Update() {
         out << Format("bypasses given up (rubbing against a vehicle): %d\n", bypassScrapeCount);
         out << Format("bypasses by changing lanes (2+ lanes): %d; broken-down cars removed out of sight: %d\n", bypassLaneCount, brokenRemovedCount);
         out << Format("circles of waiting cars broken (deadlocks): %d\n", deadlockBreakCount);
+        out << Format("held at a light/by the game 25 s with the road clear, went through (broken light): %d\n", brokenLightCount);
         out << Format("going round through the oncoming lanes refused (two-way roads): %d\n", noOncomingBypassCount);
         out << Format("route exits the game would have refused, taken anyway: %d\n", forcedExitCount);
         out << Format("speed control: gas<->brake switches %.1f per minute of driving (%d in %.0f min)\n",

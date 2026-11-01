@@ -159,6 +159,7 @@ public:
     CNodeAddress forcedExit;           // the route's exit at the junction being decided (see ForceRouteExit)
     CVehicle* deadlockIgnore = nullptr; // the vehicle it waits for in a circle of waiting cars: not seen for a while
     unsigned int deadlockUntil = 0;
+    unsigned int ignoreLightsUntil = 0; // a light that never turns green (or the game holding it for no reason): ignored
     eObstacleType memObstacle = OBSTACLE_NONE;
     float memGap = 0.0f, memLeaderSpeed = 0.0f;
     unsigned int memTime = 0;
@@ -398,7 +399,7 @@ static float cfgJunctionGripFactor = 0.75f;      // x the curve grip in junction
 static bool cfgV2VOvertakes = true;              // overtakes planned with every car's position/speed/intent
 static bool cfgTurnSideGuard = true;             // turning: watch the outside of the turn for vehicles there
 static int turnGuardCount = 0, boxWaitCount = 0, firstComeWaitCount = 0, lowSpeedBrakeCount = 0, bypassScrapeCount = 0;
-static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0;
+static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0, brokenLightCount = 0;
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
 // One list for all junctions: a big intersection is several junction nodes close together (each way across it has its
 // own), the claims of all of them within 30 m count together
@@ -3750,6 +3751,20 @@ public:
                 float stopCap = xdata.leaderSpeed + std::sqrt(2.0f * std::min(decel, 4.0f) * std::max(xdata.gap - minGap, 0.0f));
                 if (stopCap < target) { target = stopCap; holdForLight = true; xdata.limiter = LIMIT_LEADER; }
             }
+            // Stopped 25 s with nothing in front, no cross traffic and no reason of ours, the game still holding the brake: a
+            // light that doesn't turn green for it (Bayside: red for 60-90 s with the road clear, a whole queue behind).
+            // Treated as broken for 8 s: the light-ignoring driving style, crawling through, the cross traffic check on
+            const unsigned int nowMs = CTimer::m_snTimeInMilliseconds;
+            if (!holdForLight && !queued && xdata.obstacle == OBSTACLE_NONE && xdata.stillTime > 25.0f && nowMs >= xdata.ignoreLightsUntil &&
+                xdata.crossSpeed >= 999.0f && !xdata.bypassUntil) {
+                xdata.ignoreLightsUntil = nowMs + 8000;
+                xdata.stillTime = 0.0f;
+                brokenLightCount++;
+            }
+            if (nowMs < xdata.ignoreLightsUntil) {
+                ap.m_nCarDrivingStyle = DRIVINGSTYLE_AVOID_CARS;
+                target = std::min(target, 15.0f / MPS_TO_KMH);
+            }
             if (holdForLight) KeepGameStuckTimersFresh(ap);
             xdata.targetSpeed = target;
             ap.m_nCruiseSpeed = static_cast<char>(std::clamp(target * MPS_TO_CRUISE, holdForLight ? 0.0f : cfgCruiseMinSpeed, 127.0f));
@@ -3799,6 +3814,7 @@ public:
         }
 
         if (bypassing) ap.m_nCarDrivingStyle = static_cast<eCarDrivingStyle>(6);
+        if (CTimer::m_snTimeInMilliseconds < xdata.ignoreLightsUntil) ap.m_nCarDrivingStyle = DRIVINGSTYLE_AVOID_CARS; // see the broken light
 
         // Only in normal behaviour
         if (cfgOnlyInNormal && ap.m_nCarDrivingStyle != DRIVINGSTYLE_STOP_FOR_CARS) return;
