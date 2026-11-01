@@ -1379,12 +1379,12 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 }
 
 // Fast curves (long, wide, usually banked): taken with more of the grip, up to FastCurveGripBoost x for curves good for
-// 120 km/h and more; curves under 70 km/h as before. Fast curves were braked far below what the car could do
-static float cfgFastCurveGripBoost = 1.6f;
-static float cfgHighwayGapFactor = 0.5f;  // following time gap on freeways/fast roads, x the profile's
+// 110 km/h and more; curves under 60 km/h as before. Fast curves were braked far below what the car could do
+static float cfgFastCurveGripBoost = 2.0f;
+static float cfgHighwayGapFactor = 0.3f;  // following time gap on freeways/fast roads, x the profile's
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
-    float t = std::clamp((v - 70.0f / 3.6f) / ((120.0f - 70.0f) / 3.6f), 0.0f, 1.0f);
+    float t = std::clamp((v - 60.0f / 3.6f) / ((110.0f - 60.0f) / 3.6f), 0.0f, 1.0f);
     return v * std::sqrt(1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
 }
 
@@ -2663,7 +2663,10 @@ static void ApplyPedalControl(CVehicle* veh, ExtendedData& xdata, float speed, f
     float forwardSpeed = CVector::Dot(veh->m_vecMoveSpeed, veh->GetForward()) * GAME_SPEED_TO_MPS;
     float target = xdata.targetSpeed;
     if (forwardSpeed < -0.5f || *handbrake) return;         // rolling backwards / maneuvering
-    if (*brake > 0.05f && speed < target + 0.5f) return;    // braking while not too fast = car ahead, red light, train...
+    // Braking while not too fast = car ahead, red light, train... But a light brake for a car we see too is the game's own
+    // (longer) following distance: our gap rules there, or cars kept far behind on freeways
+    if (*brake > 0.05f && speed < target + 0.5f &&
+        (*brake > 0.5f || xdata.obstacle != OBSTACLE_VEHICLE || xdata.gap < 6.0f || speed < 3.0f)) return;
     if (*gas <= 0.01f && speed < 2.0f) return;              // the game is holding the car still
     // Queued behind a stopped/slow vehicle (traffic light, jam): the game creeps up to it, we don't push
     bool queued = (xdata.obstacle == OBSTACLE_VEHICLE || xdata.obstacle == OBSTACLE_PED) && xdata.leaderSpeed < 2.0f &&
@@ -3877,7 +3880,7 @@ public:
             const bool fastRoadGap = xdata.roadType == ROAD_HIGHWAY || xdata.roadType == ROAD_FAST;
             // Getting ready to overtake: 40-60% of the following gap (at least 0.25 s), like a driver closing up before
             // pulling out to pass
-            float tg = fastRoadGap ? std::max(timeGap * cfgHighwayGapFactor, 0.3f) : timeGap;
+            float tg = fastRoadGap ? std::max(timeGap * cfgHighwayGapFactor, 0.25f) : timeGap;
             if (CTimer::m_snTimeInMilliseconds < xdata.overtakePrepUntil && xdata.leaderSpeed > 1.5f)
                 tg = std::max(tg * Lerp(0.6f, 0.4f, xdata.aggression), 0.25f);
             float sStar = minGap + std::max(0.0f, v * tg + (v * dv) / (2.0f * std::sqrt(accel * decel)));
@@ -4679,10 +4682,23 @@ public:
         float len = d.Magnitude();
         if (lanes <= 0 || len < 0.5f) return;
         d *= 1.0f / len;
+        // The game lays its lanes along the link's own direction, not the line between the nodes: on a road that curves
+        // between them the two differ, and lanes measured along the nodes were metres off (on Grove -> Bayside the car read
+        // -10 m across a link at its start; the lane sync then moved it out of its lane: a forced lane change)
+        {
+            CVector2D ld(link->m_nDirX / 100.0f, link->m_nDirY / 100.0f);
+            float ll = ld.Magnitude();
+            if (ll > 0.5f) {
+                ld *= 1.0f / ll;
+                d = CVector2D::Dot(ld, d) < 0.0f ? ld * -1.0f : ld;
+            }
+        }
         const CVector2D r(d.y, -d.x);
         const CVector2D linkPos(link->m_vecPosn.x / 8.0f, link->m_vecPosn.y / 8.0f);
         const float ow = link->OneWayLaneOffset();
         const CVector2D pos = veh->GetPosition().To2D();
+        // Across the road is only a lane near the link's point: away from it the game's path curves towards the next link
+        const bool nearLinkPoint = std::abs(CVector2D::Dot(pos - linkPos, d)) < 10.0f;
         // The game's lane number and where the car really is disagree (the number is carried over from a road with other
         // lanes, a lane that ended...): the game steered straight across to "its" lane, into whoever was there. The lane
         // it's in is its lane; going somewhere else is a lane change (indicator, side check, board)
@@ -4695,8 +4711,8 @@ public:
         // that the car's lane sent it on into whoever was there
         bool mismatch = false;
         if (xdata.laneState != LANE_CHANGING && xdata.limiter != LIMIT_BYPASS && xdata.lineBlend <= 0.0f &&
-            !afterJunction && !beforeJunction && std::abs(xdata.filtYawRate) < 0.1f &&
-            CTimer::m_snTimeInMilliseconds - xdata.newLinkTime < 2000) {
+            !afterJunction && !beforeJunction && std::abs(xdata.filtYawRate) < 0.1f && nearLinkPoint &&
+            CTimer::m_snTimeInMilliseconds - xdata.newLinkTime < 4000) {
             float laneNow = CVector2D::Dot(pos - linkPos, r) / LANE_WIDTH - ow;
             int physical = static_cast<int>(std::floor(laneNow + 0.5f));
             if (physical >= 0 && physical < lanes && std::abs(laneNow - veh->m_autoPilot.m_nNextLane) > 0.7f) {
