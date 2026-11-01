@@ -392,8 +392,28 @@ void Draw() {
     }
 }
 
+// Following distance actually kept: mod-driven vehicles above 30 km/h behind a vehicle going about their speed
+// (within 3 m/s). Time gaps by bin, freeways vs. elsewhere, and what the pedals were doing then
+static const float followBins[] = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 1e9f };
+static int followCount[2][6] = {}, followBraking[2] = {}, followTotal[2] = {};
+static double followGapSum[2] = {}, followGasSum[2] = {};
+static void RecordFollowing(CVehicle* veh, const ExtendedData& x) {
+    float v = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+    if (Now() - x.lastProcessed > 500 || x.obstacle != OBSTACLE_VEHICLE || v < 30.0f / MPS_TO_KMH || std::abs(v - x.leaderSpeed) > 3.0f) return;
+    int road = (x.roadType == ROAD_HIGHWAY || x.roadType == ROAD_FAST) ? 0 : 1;
+    float tg = x.gap / v;
+    int b = 0;
+    while (tg >= followBins[b]) b++;
+    followCount[road][b]++;
+    followTotal[road]++;
+    followGapSum[road] += tg;
+    followGasSum[road] += veh->m_fGasPedal;
+    if (veh->m_fBreakPedal > 0.1f) followBraking[road]++;
+}
+
 static void RecordSample(CVehicle* veh, History& h) {
     ExtendedData& x = vehExData.Get(veh);
+    RecordFollowing(veh, x);
     Sample& s = h.s[h.head];
     s.t = Now();
     s.pos = veh->GetPosition();
@@ -1232,6 +1252,15 @@ void Update() {
         out << Format("routes calculated: %d (failed %d), vehicles that left their route: %d\n", routeSearchCount, routeFailCount, offRouteCount);
         out << Format("  left the route: no plan %d, the game took another exit %d, not a junction %d; junction exits forced %d, "
             "junctions without a plan %d\n", offRouteNoPlan, offRouteRejected, offRouteNotJunction, seqPlanApplied, seqNoPlan);
+        for (int r = 0; r < 2; r++) {
+            if (!followTotal[r]) continue;
+            int n = followTotal[r];
+            out << Format("following a vehicle at about its speed (%s, %d samples): mean time gap %.2f s | <0.5 s %d%%, 0.5-1 %d%%, "
+                "1-1.5 %d%%, 1.5-2 %d%%, 2-3 %d%%, >3 s %d%% | braking %d%%, mean gas %.2f\n", r == 0 ? "freeways" : "other roads", n,
+                followGapSum[r] / n, followCount[r][0] * 100 / n, followCount[r][1] * 100 / n, followCount[r][2] * 100 / n,
+                followCount[r][3] * 100 / n, followCount[r][4] * 100 / n, followCount[r][5] * 100 / n, followBraking[r] * 100 / n,
+                followGasSum[r] / n);
+        }
         out << "mean speed by road class (moving vehicles):\n";
         for (int rc = 0; rc < RC_COUNT; rc++) {
             if (rcTime[rc] > 1.0) out << Format("  %-28s %5.1f km/h (%.0f s)\n", rcNames[rc], rcSpeedSum[rc] / rcTime[rc], rcTime[rc]);

@@ -1431,6 +1431,9 @@ static float GetRollGrip(CVehicle* veh) {
         }
         float height = veh->m_pHandlingData->m_vecCentreOfMass.z - ground;
         if (halfTrack > 0.3f && height > 0.2f) rg = 0.75f * halfTrack / height;
+        // Only tall vehicles (trucks, buses, vans: < 0.65 g). Ordinary cars came out at 0.77-0.86 g and that capped their
+        // fast curves, but GTA's cars don't tip over in curves
+        if (rg >= 0.65f) rg = 1000.0f;
         lg << "Rollover limit model " << veh->m_nModelIndex << ": " << rg << " g (half track " << halfTrack << " m, centre of mass "
            << height << " m above the ground)\n";
     }
@@ -4015,9 +4018,13 @@ public:
         // wants ~0 acceleration, and asking the full desired speed there made the game floor it into the car ahead
         // Also if the one ahead brakes hard (~6 m/s2, it brakes later and harder for curves and lights now): our stopping
         // distance within the gap plus its own (it was "its speed + what stops in the gap", rear-ends when it braked)
+        // Both can brake hard (>= 6 m/s2, 1.8 x its comfortable braking), 0.2 s to react. It assumed the one ahead braking at
+        // 8 m/s2 and us at 3.5: right behind it the cap was 66% of its speed, and keeping its speed needed 0.08 v^2 of gap
+        // (32 m at 72 km/h, 72 m at 108): cars hung far back. At the same speed this allows following close (the IDM sets
+        // the distance); behind a slower or stopped one it still stops in time
         if (xdata.obstacle == OBSTACLE_VEHICLE || xdata.obstacle == OBSTACLE_PED) {
-            const float b = std::min(decel, 4.0f), vL = std::max(xdata.leaderSpeed, 0.0f);
-            float stopCap = std::sqrt(2.0f * b * std::max(xdata.gap - minGap, 0.0f) + vL * vL * b / 8.0f);
+            const float b = std::max(decel * 1.8f, 6.0f), vL = std::max(xdata.leaderSpeed, 0.0f);
+            float stopCap = std::sqrt(vL * vL + 2.0f * b * std::max(xdata.gap - minGap - v * 0.2f, 0.0f));
             if (stopCap < target) {
                 target = stopCap;
                 xdata.limiter = LIMIT_LEADER;
