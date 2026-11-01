@@ -44,11 +44,11 @@ DRIVERS = {'calmo': 'calm', 'seguro': 'safe', 'normal': 'normal', 'rapido': 'fas
 DEFAULT_XLSX = os.path.join(os.path.expanduser('~'), 'Desktop', 'RealTrafficFix_Testes.xlsx')
 
 SCENARIOS = {
-    'Viagem Bayside -> LS Centro (estacionar)': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Bayside -> LS'},
     'Viagem Grove Street -> Bayside': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Grove Street'},
+    'Viagem Bayside -> LS Centro (estacionar)': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Bayside -> LS'},
     'Rodovias (7 trechos)': {'Scenario': '', 'HighwayOnly': '1'},
     'Cidade (11 locais)': {'Scenario': '', 'HighwayOnly': '0'},
-    'Varredura da rota (laser, sem trafego)': {'Scenario': 'scan', 'HighwayOnly': '0', 'Route': 'Bayside -> LS'},
+    'Varredura da rota (laser, sem trafego)': {'Scenario': 'scan', 'HighwayOnly': '0', 'Route': 'Grove Street'},
 }
 
 LIVE_RE = re.compile(r'\[live ([\d.]+) min\] driving collisions (\d+) \(([\d.]+)/min\), spawn (\d+), oscillations (\d+) \| '

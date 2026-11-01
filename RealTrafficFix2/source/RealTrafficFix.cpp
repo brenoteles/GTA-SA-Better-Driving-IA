@@ -281,6 +281,7 @@ public:
     CVector2D bikeRoadDir;
     eLaneState changeAfter = LANE_KEEP;
     float blockedTime = 0.0f;         // s behind a vehicle slower than it wants
+    unsigned int overtakePrepUntil = 0; // held up with a lane to pass in: closes up on the one ahead (slipstream, momentum)
     unsigned int lastBoardDenied = 0;
     unsigned int lastLaneTick = 0;
     // Side sensors (debug)
@@ -3865,7 +3866,12 @@ public:
         float accelWanted = accel * (1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f));
         if (xdata.obstacle != OBSTACLE_NONE) {
             float dv = v - xdata.leaderSpeed;
-            float sStar = minGap + std::max(0.0f, v * timeGap + (v * dv) / (2.0f * std::sqrt(accel * decel)));
+            // Getting ready to overtake: 40-60% of the following gap (at least 0.25 s), like a driver closing up before
+            // pulling out to pass
+            float tg = timeGap;
+            if (CTimer::m_snTimeInMilliseconds < xdata.overtakePrepUntil && xdata.leaderSpeed > 1.5f)
+                tg = std::max(timeGap * Lerp(0.6f, 0.4f, xdata.aggression), 0.25f);
+            float sStar = minGap + std::max(0.0f, v * tg + (v * dv) / (2.0f * std::sqrt(accel * decel)));
             accelWanted -= accel * std::pow(sStar / std::max(xdata.gap, 0.1f), 2.0f);
         }
 
@@ -4366,8 +4372,12 @@ public:
         CVector2D myDir;
         if (!project(pos.To2D(), myAlong, myLaneF, myDir, nullptr)) return;
         const CAutoPilot& ap = veh->m_autoPilot;
-        const int laneA = ap.m_nNextLane;
-        const int laneB = xdata.laneState == LANE_CHANGING ? xdata.changeTarget : laneA;
+        const int laneB = xdata.laneState == LANE_CHANGING ? xdata.changeTarget : ap.m_nNextLane;
+        // Pulling out to overtake, past half way: only the new lane counts (it braked for the car it was passing and lost the
+        // momentum it closed up for)
+        const bool pullingOut = xdata.laneState == LANE_CHANGING && xdata.laneAction == 1 &&
+            std::abs(myLaneF - ap.m_nNextLane) > 0.45f;
+        const int laneA = pullingOut ? laneB : ap.m_nNextLane;
 
         float bestGap = range;
         CVehicle* best = nullptr;
@@ -4824,6 +4834,8 @@ public:
         float tick = std::min((now - xdata.lastLaneTick) / 1000.0f, 0.5f);
         xdata.lastLaneTick = now;
         xdata.blockedTime = blocked ? xdata.blockedTime + tick : 0.0f;
+        // About to overtake: right up behind it (shorter following gap, see the IDM) so it pulls out with momentum
+        if (blocked && lanes >= 2 && !laneChangesDisabled && cfgOvertaking) xdata.overtakePrepUntil = now + 600;
         const float myLaneF = CVector2D::Dot(pos - linkPos, r) / LANE_WIDTH - ow; // where it really is, in lanes
 
         if (passRequested && xdata.laneState != LANE_KEEP) CountPassRefusal(xdata, 5); // signalling, overtaking, moving over
@@ -4940,13 +4952,17 @@ public:
         // Overtake: the vehicle ahead is clearly slower than we want to go (and moving: queues at lights/jams aren't
         // overtaken) and we've been behind it for a while
         // Decided quickly (it waited 5 s behind a slow car before): 0.8-2.5 s by aggression
-        const bool wantsToOvertake = blocked && xdata.blockedTime >= Lerp(2.5f, 0.8f, aggr);
+        const bool wantsToOvertake = blocked && xdata.blockedTime >= Lerp(1.5f, 0.4f, aggr);
         // A lane change takes changeDuration s: not if the next junction comes before it's done (except for the route)
         // The smoothstep's peak lateral speed is 1.5 x lane / duration: from the driver (2.2 - 3.4 m/s) but keeping the
         // path angle natural (tan 7 deg ~ 0.12 of the speed). 3-4 s at freeway speed; slower ones take longer
         const float latSpeed = std::max(std::min(Lerp(2.2f, 3.4f, aggr), speed * 0.12f), 0.8f);
         // At most 3.5 s: a slow car taking 5 s across the lanes of a freeway had someone fast arrive behind it mid-way
         const float changeDuration = std::clamp(1.5f * LANE_WIDTH / latSpeed, 2.2f, 3.5f);
+        // Overtakes: out of the slipstream quickly and decisively, 1.3-2.2 s (peak 3.5-5.5 m/s sideways, a sharper angle)
+        const float overtakeLat = std::max(std::min(Lerp(3.5f, 5.5f, aggr), speed * 0.2f), 1.2f);
+        const float overtakeDuration = std::clamp(1.5f * LANE_WIDTH / overtakeLat, 1.3f, 2.2f);
+        auto durationFor = [&](unsigned char action) { return action == 1 ? overtakeDuration : changeDuration; };
         const bool roomToChange = xdata.requiredDist > speed * changeDuration + 40.0f;
         auto betterThanMine = [&](int lane) {
             return laneInfo[lane].frontGap > mine.frontGap + 15.0f || laneInfo[lane].frontSpeed > mine.frontSpeed + 3.0f;
@@ -4972,7 +4988,7 @@ public:
                 // From ~0.5 s behind it to where it'll be most of the way through the change (a box of the whole manoeuvre
                 // at speed was ~110 m long and blocked everyone around it)
                 float lonStart = lonSelf - halfLength - std::max(5.0f, speed * 0.5f);
-                float lonEnd = lonSelf + halfLength + speed * changeDuration * 0.6f + 5.0f;
+                float lonEnd = lonSelf + halfLength + speed * durationFor(action) * 0.6f + 5.0f;
                 float latCenter = (ow + (myLane + lane) * 0.5f) * LANE_WIDTH;
                 LaneReservation request;
                 request.veh = veh;
@@ -4994,7 +5010,7 @@ public:
             xdata.pendingAction = action;
             xdata.signalStart = now;
             // Indicator on before moving: shorter for overtakes (the others see it, the board already gave it the space)
-            xdata.signalUntil = now + static_cast<unsigned int>(action == 1 ? Lerp(1000.0f, 400.0f, aggr) : Lerp(1500.0f, 500.0f, aggr));
+            xdata.signalUntil = now + static_cast<unsigned int>(action == 1 ? Lerp(500.0f, 150.0f, aggr) : Lerp(1500.0f, 500.0f, aggr));
             SetIndicator(xdata, lane > myLane ? 1 : -1, 6000);
             return true;
         };
@@ -5004,14 +5020,14 @@ public:
             xdata.changeOrigin = myLane;
             xdata.changeFromF = myLaneF;
             xdata.changeStart = now;
-            xdata.changeDuration = changeDuration;
+            xdata.changeDuration = durationFor(action);
             xdata.changeAfter = after;
             xdata.laneState = LANE_CHANGING;
             xdata.lastLaneChange = now;
             CommitLaneSpace(veh);
             xdata.laneAction = action;
             xdata.pendingLane = -1;
-            SetIndicator(xdata, lane > myLane ? 1 : -1, static_cast<unsigned int>(changeDuration * 1000.0f) + 300); // on while moving over
+            SetIndicator(xdata, lane > myLane ? 1 : -1, static_cast<unsigned int>(durationFor(action) * 1000.0f) + 300); // on while moving over
         };
 
         switch (xdata.laneState) {
