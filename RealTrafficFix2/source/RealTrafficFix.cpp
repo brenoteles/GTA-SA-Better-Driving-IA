@@ -1405,10 +1405,37 @@ static bool DrivingStyleObeysLights(eCarDrivingStyle style) {
 // 110 km/h and more; curves under 60 km/h as before. Fast curves were braked far below what the car could do
 static float cfgFastCurveGripBoost = 1.7f;
 static float cfgHighwayGapFactor = 0.3f;  // following time gap on freeways/fast roads, x the profile's
+// Lateral g the vehicle being driven can take before it tips over (see GetRollGrip): the fast-curve boost never goes past it
+static float curRollGrip = 1000.0f;
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
     float t = std::clamp((v - 60.0f / 3.6f) / ((110.0f - 60.0f) / 3.6f), 0.0f, 1.0f);
-    return v * std::sqrt(1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
+    float boosted = grip * (1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
+    return std::sqrt(std::min(boosted, std::max(curRollGrip, grip)) * GRAVITY / curvature);
+}
+
+// Rollover: tall vehicles tip over before their tyres slide (the cement truck rolled in a curve at 133 km/h). Static
+// stability factor: half the track (the wheels' suspension lines) over the height of the centre of mass above the
+// ground (handling), 75% of it. Cars ~1.5 g (no limit in practice), trucks ~0.6 g. Per model
+static std::unordered_map<int, float> rollGrips;
+static float GetRollGrip(CVehicle* veh) {
+    auto it = rollGrips.find(veh->m_nModelIndex);
+    if (it != rollGrips.end()) return it->second;
+    float rg = 1000.0f;
+    CColModel* col = veh->GetColModel();
+    if (col && col->m_pColData && col->m_pColData->m_nNumLines >= 4 && col->m_pColData->m_pLines && veh->m_pHandlingData) {
+        float halfTrack = 0.0f, ground = 1000.0f;
+        for (int i = 0; i < 4; i++) {
+            halfTrack = std::max(halfTrack, std::abs(col->m_pColData->m_pLines[i].m_vecStart.x));
+            ground = std::min(ground, col->m_pColData->m_pLines[i].m_vecEnd.z);
+        }
+        float height = veh->m_pHandlingData->m_vecCentreOfMass.z - ground;
+        if (halfTrack > 0.3f && height > 0.2f) rg = 0.75f * halfTrack / height;
+        lg << "Rollover limit model " << veh->m_nModelIndex << ": " << rg << " g (half track " << halfTrack << " m, centre of mass "
+           << height << " m above the ground)\n";
+    }
+    rollGrips[veh->m_nModelIndex] = rg;
+    return rg;
 }
 
 // Max speed (m/s) through a corner of 'angle' radians whose road segments around it are lenIn and lenOut long
@@ -3744,6 +3771,9 @@ public:
         }
         // Dirt, grass, rain and burst tyres
         grip *= xdata.surfaceFactor * damageGrip;
+        // Not past what tips it over
+        curRollGrip = GetRollGrip(vehicle);
+        grip = std::min(grip, curRollGrip);
         decel *= xdata.surfaceFactor * damageGrip;
         // Curves and the braking before them: a share of what this car can really do (learned per model), not only the
         // profile's fixed g. With 0.4-0.6 g and 2-3 m/s2 cars crawled through curves they can take far faster and
@@ -3756,6 +3786,7 @@ public:
             grip = std::max(grip, limits.grip * use * xdata.surfaceFactor * damageGrip);
             curveDecel = std::max(decel, limits.decel * Lerp(cfgCurveBrakeUseMin, cfgCurveBrakeUseMax, aggr) * xdata.surfaceFactor * damageGrip);
         }
+        grip = std::min(grip, curRollGrip); // the learned grip neither: tall vehicles roll first
 
         // Friction circle: the tyres' grip is shared between turning and braking. While cornering hard there's
         // less left to brake with, so the braking points move earlier
@@ -3945,7 +3976,13 @@ public:
             // IDM+: the lower of the free-road and the following accelerations. Plain IDM subtracts one from the other:
             // behind a car going about the speed it wants, the free-road term is ~0 and it settled far behind (the gap
             // grows as 1/sqrt(1 - (v/v0)^4)); IDM+ settles at the gap it wants
-            accelWanted = accel * std::min(1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f),
+            // Far behind it: free road for as long as there's room to slow to its speed at the gap it wants with 60% of the
+            // comfortable braking (and 5 m spare). IDM's approach term (v * dv) held cars at ~75 km/h 200 m behind one at
+            // 70: they closed up like snails. Within that braking distance IDM+ takes over and brings it down to the gap
+            const float room = xdata.gap - (minGap + v * tg);
+            const bool farBehind = dv <= 0.0f ? room > 0.0f : room > dv * dv / (2.0f * decel * 0.6f) + 5.0f;
+            if (farBehind) accelWanted = accel * (1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f));
+            else accelWanted = accel * std::min(1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f),
                 1.0f - std::pow(sStar / std::max(xdata.gap, 0.1f), 2.0f));
         }
 
