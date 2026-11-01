@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -29,7 +30,10 @@ PROJECT = os.path.join(PROJECT_DIR, 'RealTrafficFix.vcxproj')
 PROJECT_INI = os.path.join(PROJECT_DIR, 'RealTrafficFix.ini')
 BUILT_ASI = os.path.join(PROJECT_DIR, 'bin', 'GTA-SA', 'Release', 'RealTrafficFix.SA.asi')
 MSBUILD = r'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe'
-GAME_DIR = r'C:\Users\death\Games\GTA\GTA San Andreas'
+# The game folder: the GTA_SA_DIR environment variable (the same one the build copies the .asi with)
+GAME_DIR = os.environ.get('GTA_SA_DIR', '')
+if not GAME_DIR or not os.path.isdir(GAME_DIR):
+    sys.exit('Set the GTA_SA_DIR environment variable to the GTA San Andreas folder')
 SCRIPTS = os.path.join(GAME_DIR, 'scripts')
 GAME_INI = os.path.join(SCRIPTS, 'RealTrafficFix.ini')
 DEPLOYED_ASI = os.path.join(SCRIPTS, 'RealTrafficFix.SA.asi')

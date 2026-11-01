@@ -1,32 +1,20 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 15
-VisualStudioVersion = 15.0.28307.645
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RealTrafficFix", "RealTrafficFix\RealTrafficFix.vcxproj", "{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RealTrafficFix", "RealTrafficFix2\RealTrafficFix.vcxproj", "{7A1C3E52-9B4D-4F6E-A2C1-5D8E3F0B7A21}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
-		GTA3 Release|x86 = GTA3 Release|x86
-		GTA3 zDebug|x86 = GTA3 zDebug|x86
-		GTASA Release|x86 = GTASA Release|x86
-		GTASA zDebug|x86 = GTASA zDebug|x86
-		GTAVC Release|x86 = GTAVC Release|x86
-		GTAVC zDebug|x86 = GTAVC zDebug|x86
+		Release GTA-SA|x86 = Release GTA-SA|x86
+		Debug GTA-SA|x86 = Debug GTA-SA|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTA3 Release|x86.ActiveCfg = GTA3 Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTA3 Release|x86.Build.0 = GTA3 Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTA3 zDebug|x86.ActiveCfg = GTA3 zDebug|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTA3 zDebug|x86.Build.0 = GTA3 zDebug|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTASA Release|x86.ActiveCfg = GTASA Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTASA Release|x86.Build.0 = GTASA Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTASA zDebug|x86.ActiveCfg = GTASA zDebug|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTASA zDebug|x86.Build.0 = GTASA zDebug|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTAVC Release|x86.ActiveCfg = GTAVC Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTAVC Release|x86.Build.0 = GTAVC Release|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTAVC zDebug|x86.ActiveCfg = GTAVC zDebug|Win32
-		{B212DDA4-2A8E-45B2-914D-7BEEB31D06B1}.GTAVC zDebug|x86.Build.0 = GTAVC zDebug|Win32
+		{7A1C3E52-9B4D-4F6E-A2C1-5D8E3F0B7A21}.Release GTA-SA|x86.ActiveCfg = Release GTA-SA|Win32
+		{7A1C3E52-9B4D-4F6E-A2C1-5D8E3F0B7A21}.Release GTA-SA|x86.Build.0 = Release GTA-SA|Win32
+		{7A1C3E52-9B4D-4F6E-A2C1-5D8E3F0B7A21}.Debug GTA-SA|x86.ActiveCfg = Debug GTA-SA|Win32
+		{7A1C3E52-9B4D-4F6E-A2C1-5D8E3F0B7A21}.Debug GTA-SA|x86.Build.0 = Debug GTA-SA|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

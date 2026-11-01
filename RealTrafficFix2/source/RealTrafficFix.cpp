@@ -381,15 +381,16 @@ static float cfgAmbientMinDist = 80.0f;      // m from the player
 static float cfgAmbientMaxDist = 220.0f;
 static int cfgAmbientInterval = 100;         // ms between two
 static float cfgAmbientFill = 1.0f;          // (old: share of the game's random car limit, unused)
-static int cfgAmbientTarget = 70;            // cars with a driver within 250 m of the player
-static int ambientNear = 0;
+static int cfgAmbientTarget = 70;            // cars with a driver within 250 m of the player (at most)
+static float cfgAmbientLaneSpacing = 45.0f;  // m of lane per car: the target is also what the roads within 250 m hold
+static int ambientNear = 0, ambientCapacity = 0;
 static bool cfgHandbrakeTurns = true;            // fast/aggressive drivers use the handbrake in tight turns
 static float cfgHandbrakeEntryBoost = 1.0f;     // x the speed into tight junction turns for them
 static float cfgJunctionGripFactor = 0.75f;      // x the curve grip in junction turns
 static bool cfgV2VOvertakes = true;              // overtakes planned with every car's position/speed/intent
 static bool cfgTurnSideGuard = true;             // turning: watch the outside of the turn for vehicles there
 static int turnGuardCount = 0, boxWaitCount = 0, firstComeWaitCount = 0, lowSpeedBrakeCount = 0, bypassScrapeCount = 0;
-static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0;
+static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0;
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
 // One list for all junctions: a big intersection is several junction nodes close together (each way across it has its
 // own), the claims of all of them within 30 m count together
@@ -814,6 +815,23 @@ static bool AmbientSpotFree(const CVector& pos, float radius) {
     return true;
 }
 
+// Room on that road: within 100 m of the spot along it, fewer cars than its lanes hold at one per 25 m, and none of them
+// stopped (a queue: one more car only makes it longer)
+static bool AmbientRoadHasRoom(const CVector& pos, const CVector2D& dir, CCarPathLink* link) {
+    const int lanes = std::max(link->m_nNumLeftLanes + link->m_nNumRightLanes, 1);
+    int count = 0;
+    for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
+        CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
+        if (!v) continue;
+        CVector2D rel = (v->GetPosition() - pos).To2D();
+        float along = CVector2D::Dot(rel, dir), across = std::abs(dir.x * rel.y - dir.y * rel.x);
+        if (std::abs(along) > 100.0f || across > lanes * LANE_WIDTH || std::abs(v->GetPosition().z - pos.z) > 6.0f) continue;
+        if (v->m_pDriver && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 2.0f) return false;
+        count++;
+    }
+    return count < lanes * 200 / 25;
+}
+
 static void UpdateAmbientSpawn() {
     if (!cfgAmbientSpawn) return;
     const unsigned int now = CTimer::m_snTimeInMilliseconds;
@@ -862,6 +880,7 @@ static void UpdateAmbientSpawn() {
     if (now - ambientNodesTime > 2000 || ambientNodes.empty()) {
         ambientNodesTime = now;
         ambientNodes.clear();
+        float laneMetres = 0.0f; // lanes x length of the roads within 250 m (each link counted from both its ends: half)
         int ax = static_cast<int>((center.x + 3000.0f) / 750.0f), ay = static_cast<int>((center.y + 3000.0f) / 750.0f);
         for (int y = ay - 1; y <= ay + 1; y++) {
             for (int x = ax - 1; x <= ax + 1; x++) {
@@ -871,14 +890,28 @@ static void UpdateAmbientSpawn() {
                 for (unsigned int i = 0; i < ThePaths.m_dwNumVehicleNodes[area]; i++) {
                     CNodeAddress addr(static_cast<short>(area), static_cast<short>(i));
                     CPathNode* node = GetNode(addr);
-                    if (!node || node->SwitchedOff || node->WaterNode || node->InteriorNode || node->NumberAdjNodes != 2) continue;
+                    if (!node || node->SwitchedOff || node->WaterNode || node->InteriorNode) continue;
                     float dist = (GetNodePos(node) - center).Magnitude2D();
+                    if (dist < 250.0f) {
+                        for (int n = 0; n < node->NumberAdjNodes; n++) {
+                            CNodeAddress nb = GetAdjacentNode(node, addr, n);
+                            CPathNode* nbNode = GetNode(nb);
+                            CCarPathLink* link = nbNode ? GetLinkBetween(addr, node, nb) : nullptr;
+                            if (!link) continue;
+                            int lanes = LanesToward(link, nb) + LanesToward(link, addr);
+                            laneMetres += 0.5f * lanes * (GetNodePos(nbNode) - GetNodePos(node)).Magnitude2D();
+                        }
+                    }
+                    if (node->NumberAdjNodes != 2) continue;
                     if (dist > cfgAmbientMinDist - 10.0f && dist < cfgAmbientMaxDist + 10.0f) ambientNodes.push_back(addr);
                 }
             }
         }
+        ambientCapacity = static_cast<int>(laneMetres / std::max(cfgAmbientLaneSpacing, 10.0f));
     }
     if (ambientNodes.empty()) return;
+    // No more than the roads around hold (Bayside, a few one-lane roads, got 70 cars and locked up)
+    if (ambientNear >= ambientCapacity) return;
 
     // A few tries at random spots this time
     for (int attempt = 0; attempt < 6; attempt++) {
@@ -913,6 +946,7 @@ static void UpdateAmbientSpawn() {
         // Out of sight, and nobody there
         if (TheCamera.IsSphereVisible(pos, 6.0f)) continue;
         if (!AmbientSpotFree(pos, 30.0f)) continue;
+        if (!AmbientRoadHasRoom(pos, d, link)) continue;
         // Not right next to a junction (cars turn out of it onto the spot)
         if (GetNode(toAddr)->NumberAdjNodes > 2) continue;
         {
@@ -972,6 +1006,22 @@ static void UpdateAmbientSpawn() {
 // Circles of waiting: stopped cars each waiting for the next and the last for the first (side by side squeezed at the
 // Bayside junction, each side sensor on the other: both stopped for good). The one whose "leader" is the least ahead of
 // it (beside or behind: it isn't really in the way) stops seeing it for 4 s and drives out
+// Where a vehicle is across its road, in lanes of its own way (0 = its first lane, below -0.5: in the other way's lanes)
+static float LanePosition(CVehicle* v) {
+    const CAutoPilot& ap = v->m_autoPilot;
+    CPathNode* curr = GetNode(ap.m_currentAddress);
+    CPathNode* next = GetNode(ap.m_startingRouteNode);
+    if (!curr || !next) return 0.0f;
+    CCarPathLink* link = GetLinkBetween(ap.m_currentAddress, curr, ap.m_startingRouteNode);
+    if (!link) return 0.0f;
+    CVector2D d = (GetNodePos(next) - GetNodePos(curr)).To2D();
+    float len = d.Magnitude();
+    if (len < 0.5f) return 0.0f;
+    d *= 1.0f / len;
+    const CVector2D lp(link->m_vecPosn.x / 8.0f, link->m_vecPosn.y / 8.0f);
+    return CVector2D::Dot(v->GetPosition().To2D() - lp, CVector2D(d.y, -d.x)) / LANE_WIDTH - link->OneWayLaneOffset();
+}
+
 static void BreakDeadlocks() {
     if (frameCounter % 15 != 0) return;
     const unsigned int now = CTimer::m_snTimeInMilliseconds;
@@ -1003,6 +1053,10 @@ static void BreakDeadlocks() {
             float ahead = CVector2D::Dot((leader->GetPosition() - chain[k]->GetPosition()).To2D(), chain[k]->GetForward().To2D());
             if (ahead < leastAhead) { leastAhead = ahead; victim = k; }
         }
+        // Nose to nose: the one in the other way's lanes (it came the wrong way) is the one that moves, back to its own
+        // lanes; the other stays where it is (going round it would take it into the oncoming lanes)
+        if (n == 2 && CVector2D::Dot(chain[0]->GetForward().To2D(), chain[1]->GetForward().To2D()) < -0.5f)
+            victim = LanePosition(chain[0]) < LanePosition(chain[1]) ? 0 : 1;
         ExtendedData& vx = vehExData.Get(chain[victim]);
         lg << "Deadlock: " << n << " cars waiting in a circle; veh " << CPools::GetVehicleRef(chain[victim]) << " stops waiting for veh "
             << CPools::GetVehicleRef(vx.leaderVeh) << " (" << leastAhead << " m ahead of it)\n";
@@ -3106,6 +3160,7 @@ public:
         ReadIniFloat(ini, "AmbientSpawnMaxDist", cfgAmbientMaxDist);
         ReadIniFloat(ini, "AmbientSpawnFill", cfgAmbientFill);
         cfgAmbientTarget = ini.ReadInteger("Settings", "AmbientSpawnTarget", cfgAmbientTarget);
+        ReadIniFloat(ini, "AmbientLaneSpacing", cfgAmbientLaneSpacing);
         ReadIniFloat(ini, "AmbientKeepDist", cfgAmbientKeepDist);
         ReadIniFloat(ini, "DespawnOffScreen", cfgDespawnOffScreen);
         ReadIniFloat(ini, "DespawnOnScreen", cfgDespawnOnScreen);
@@ -3853,6 +3908,16 @@ public:
         return ahead->m_pDriver && ahead->m_nStatus != STATUS_WRECKED && ahead->m_fHealth > 0.0f;
     }
 
+    // The road it's on has lanes one way only (going round something can't take it into oncoming traffic)
+    static bool OneWayHere(CVehicle* veh) {
+        const CAutoPilot& ap = veh->m_autoPilot;
+        CPathNode* curr = GetNode(ap.m_currentAddress);
+        CPathNode* next = GetNode(ap.m_startingRouteNode);
+        if (!curr || !next) return false;
+        CCarPathLink* link = GetLinkBetween(ap.m_currentAddress, curr, ap.m_startingRouteNode);
+        return link && LanesToward(link, ap.m_currentAddress) == 0;
+    }
+
     static bool LeaderIsBlocking(CVehicle* me, CVehicle* leader, float queuedTime) {
         if (!leader->m_pDriver || leader->m_nStatus == STATUS_WRECKED) return true; // abandoned / wrecked
         // Waiting behind someone itself: a queue (in a turn the cars stand across our way). Going round it squeezed past
@@ -3978,6 +4043,18 @@ public:
             bypassLaneCount++;
             lg << "Bypass by lane change (veh " << CPools::GetVehicleRef(vehicle) << " around veh " << CPools::GetVehicleRef(leader) << ")\n";
             return true;
+        }
+        // Never through the oncoming lanes: the bike logic squeezes past only on one-way roads. On two-way roads it went
+        // round queues into the cars coming the other way (the Bayside gridlock). A dead car there is removed out of sight
+        if (!OneWayHere(vehicle)) {
+            if (dead && leader->m_nCreatedBy == RANDOM_VEHICLE && !leader->GetIsOnScreen() &&
+                std::find(spawnRemovals.begin(), spawnRemovals.end(), leader) == spawnRemovals.end()) {
+                spawnRemovals.push_back(leader);
+                brokenRemovedCount++;
+            }
+            noOncomingBypassCount++;
+            xdata.noBypassUntil = now + 5000;
+            return false;
         }
         // Otherwise only with room beside it to go around (the side sensors, one side or the other)
         if (!dead && !SideClear(vehicle, xdata, -1, 0.0f) && !SideClear(vehicle, xdata, 1, 0.0f)) return false;

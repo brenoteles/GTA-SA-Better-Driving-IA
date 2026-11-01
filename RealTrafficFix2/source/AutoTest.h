@@ -962,9 +962,9 @@ void Update() {
                 if (!v->m_pDriver) noDriver250++;
             }
             out << Format("  [pulse] vehicles within 250 m: %d, %d of them without a driver; bad spawns removed %d\n", all250, noDriver250, spawnRemovedCount);
-            out << Format("  [pulse %.2f min] test car %.0f km/h target %.0f (%s) road %s, %d AI vehicles within 120m (%d moving), driven %.2f km | random cars %d (game limit %u), within 250 m %d, ambient created %d\n",
+            out << Format("  [pulse %.2f min] test car %.0f km/h target %.0f (%s) road %s, %d AI vehicles within 120m (%d moving), driven %.2f km | random cars %d (game limit %u), within 250 m %d (roads hold %d), ambient created %d\n",
                 Minutes(), speed * MPS_TO_KMH, x.targetSpeed * MPS_TO_KMH, limiterNames[x.limiter], roadNames[x.roadType], around, moving,
-                distanceDriven / 1000.0f, CCarCtrl::NumRandomCars, CCarCtrl::MaxNumberOfCarsInUse, ambientNear, ambientSpawnCount);
+                distanceDriven / 1000.0f, CCarCtrl::NumRandomCars, CCarCtrl::MaxNumberOfCarsInUse, ambientNear, ambientCapacity, ambientSpawnCount);
             // Running totals, to follow the test live and stop it early
             int spawnCollisions = typeCounts["just spawned (< 3 s)"] + typeCounts["test car spawn"] + typeCounts["hit parked/empty"];
             int drivingCollisions = collisionCount - spawnCollisions;
@@ -1105,6 +1105,7 @@ void Update() {
         out << Format("bypasses given up (rubbing against a vehicle): %d\n", bypassScrapeCount);
         out << Format("bypasses by changing lanes (2+ lanes): %d; broken-down cars removed out of sight: %d\n", bypassLaneCount, brokenRemovedCount);
         out << Format("circles of waiting cars broken (deadlocks): %d\n", deadlockBreakCount);
+        out << Format("going round through the oncoming lanes refused (two-way roads): %d\n", noOncomingBypassCount);
         out << Format("exits the game refuses: %d learned this run, %d known\n", refusedLearned, (int)refusedExits.size());
         out << Format("ambient cars created around the player out of sight: %d\n", ambientSpawnCount);
         out << Format("lane data corrections (routefixes) loaded %d, applied %d times\n", (int)routeFixes.size(), routeFixesApplied);
