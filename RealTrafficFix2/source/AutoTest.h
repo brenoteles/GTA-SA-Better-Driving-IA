@@ -1227,6 +1227,9 @@ void Update() {
         out << Format("bypasses given up (rubbing against a vehicle): %d\n", bypassScrapeCount);
         out << Format("bypasses by changing lanes (2+ lanes): %d; broken-down cars removed out of sight: %d\n", bypassLaneCount, brokenRemovedCount);
         out << Format("circles of waiting cars broken (deadlocks): %d\n", deadlockBreakCount);
+        out << Format("actuated lights: %d junctions; greens ended for nobody arriving %d, at the max green %d\n",
+            (int)junctionSignals.size(), signalGapOutCount, signalMaxOutCount);
+        out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("held at a light/by the game 25 s with the road clear, went through (broken light): %d\n", brokenLightCount);
         out << Format("going round through the oncoming lanes refused (two-way roads): %d\n", noOncomingBypassCount);

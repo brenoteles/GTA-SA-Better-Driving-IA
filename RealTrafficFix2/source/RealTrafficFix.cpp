@@ -1123,11 +1123,27 @@ static void RemoveBrokenDown() {
     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
         CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
         if (!v || v->m_nCreatedBy != RANDOM_VEHICLE || (v->m_pDriver && v->m_pDriver->IsPlayer())) continue;
-        bool broken = (v->m_fHealth < 250.0f || v->m_nStatus == STATUS_WRECKED) && v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f;
+        // Also left without a driver in the road (the driver ran off after a crash): it was driving (it has a route node,
+        // parked cars don't). Cars kept hitting one at 45 km/h
+        bool abandoned = !v->m_pDriver && !v->m_autoPilot.m_currentAddress.IsEmpty() && GetNode(v->m_autoPilot.m_currentAddress);
+        bool broken = (v->m_fHealth < 250.0f || v->m_nStatus == STATUS_WRECKED || abandoned) &&
+            v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f;
         if (!broken) { brokenSince.erase(v); continue; }
         auto it = brokenSince.find(v);
         if (it == brokenSince.end()) { brokenSince[v] = now; continue; }
-        if (now - it->second < 20000 || v->GetIsOnScreen() || (v->GetPosition() - TheCamera.GetPosition()).Magnitude() < 40.0f) continue;
+        bool outOfSight = !v->GetIsOnScreen() && (v->GetPosition() - TheCamera.GetPosition()).Magnitude() >= 40.0f;
+        // Holding a queue for 45 s (someone stopped right behind it): removed even in sight. An abandoned car on the freeway
+        // held the test car for minutes, in front of the camera
+        bool holdingQueue = false;
+        if (!outOfSight && now - it->second >= 45000) {
+            for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && !holdingQueue; k++) {
+                CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
+                if (!o || o == v || !o->m_pDriver || o->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS > 0.5f) continue;
+                CVector2D rel = (o->GetPosition() - v->GetPosition()).To2D();
+                holdingQueue = rel.Magnitude() < 15.0f && CVector2D::Dot(rel, o->GetForward().To2D()) < 0.0f; // it faces us
+            }
+        }
+        if (now - it->second < 20000 || (!outOfSight && !holdingQueue)) continue;
         brokenSince.erase(it);
         spawnRemovals.push_back(v); // removed next frame with the bad spawns
         brokenRemovedCount++;
@@ -1390,15 +1406,178 @@ static CCarPathLink* LinkFromAddress(const CCarPathLinkAddress& address) {
     return &ThePaths.m_pNaviNodes[area][id];
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Actuated traffic lights (like SUMO's actuated programs). The game switches every light on the map with one clock;
+// here every junction with lights runs its own two-phase program: green for its cycle-1 roads, yellow, all red, green
+// for the cycle-2 roads, yellow, all red. A green lasts SignalMinGreen..SignalMaxGreen s: it ends early when nobody is
+// arriving on it any more (no car within SignalGap s of the stop line) and someone waits on the other roads; with nobody
+// waiting there it stays green. The cars (the game's own checks and the mod's) and the poles (what's shown) all follow it
+static bool cfgActuatedLights = true;
+static float cfgSignalMinGreen = 7.0f, cfgSignalMaxGreen = 30.0f, cfgSignalYellow = 3.0f, cfgSignalAllRed = 1.5f, cfgSignalGap = 3.0f;
+struct JunctionSignal {
+    unsigned char phase = 0;            // 0 green 1, 1 yellow 1, 2 all red, 3 green 2, 4 yellow 2, 5 all red
+    unsigned int phaseStart = 0, lastUpdate = 0;
+    int demand[3] = {};                 // cars arriving on cycle 1/2 roads within 60 m
+    bool arriving[3] = {};              // one of them within the gap time of the stop line
+};
+static std::unordered_map<uint32_t, JunctionSignal> junctionSignals;
+static int signalGapOutCount = 0, signalMaxOutCount = 0, signalRestCount = 0;
+static uint32_t SignalKey(const CNodeAddress& a) { return (static_cast<uint32_t>(a.Region) << 16) | a.Index; }
+
+static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsigned int now) {
+    if (now - sig.lastUpdate < 250) return;
+    sig.lastUpdate = now;
+    CPathNode* jn = GetNode(junction);
+    if (!jn) return;
+    const CVector jp = GetNodePos(jn);
+    sig.demand[1] = sig.demand[2] = 0;
+    sig.arriving[1] = sig.arriving[2] = false;
+    for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
+        CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
+        if (!v || !v->m_pDriver) continue;
+        float dist = (jp - v->GetPosition()).Magnitude2D();
+        if (dist > 60.0f || std::abs(jp.z - v->GetPosition().z) > 6.0f) continue;
+        const CAutoPilot& ap = v->m_autoPilot;
+        if (!(ap.m_startingRouteNode == junction)) continue;
+        CPathNode* cur = GetNode(ap.m_currentAddress);
+        CCarPathLink* link = cur ? GetLinkBetween(ap.m_currentAddress, cur, ap.m_startingRouteNode) : nullptr;
+        if (!link || !link->m_nTrafficLightState) continue;
+        int c = link->m_nTrafficLightState;
+        sig.demand[c]++;
+        float speed = v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+        if (speed > 1.0f && dist < 10.0f + speed * cfgSignalGap) sig.arriving[c] = true;
+    }
+    const float elapsed = (now - sig.phaseStart) / 1000.0f;
+    const int sub = sig.phase % 3;
+    if (sub == 0) {
+        const int green = sig.phase < 3 ? 1 : 2, other = 3 - green;
+        if (elapsed >= cfgSignalMinGreen && sig.demand[other] > 0 && (!sig.arriving[green] || elapsed >= cfgSignalMaxGreen)) {
+            if (elapsed >= cfgSignalMaxGreen) signalMaxOutCount++;
+            else signalGapOutCount++;
+            sig.phase++;
+            sig.phaseStart = now;
+        }
+        else if (elapsed >= cfgSignalMaxGreen && sig.demand[other] == 0 && now - sig.phaseStart < 250 + static_cast<unsigned>(cfgSignalMaxGreen * 1000))
+            signalRestCount++;
+    }
+    else if ((sub == 1 && elapsed >= cfgSignalYellow) || (sub == 2 && elapsed >= cfgSignalAllRed)) {
+        sig.phase = (sig.phase + 1) % 6;
+        sig.phaseStart = now;
+    }
+}
+
+static eLightColor SignalColor(const CNodeAddress& junction, int cycle) {
+    const unsigned int now = CTimer::m_snTimeInMilliseconds;
+    auto it = junctionSignals.find(SignalKey(junction));
+    if (it == junctionSignals.end()) {
+        JunctionSignal sig;
+        sig.phase = (SignalKey(junction) & 1) ? 3 : 0; // neighbours not all switching together
+        sig.phaseStart = now;
+        it = junctionSignals.emplace(SignalKey(junction), sig).first;
+    }
+    UpdateSignal(it->second, junction, now);
+    const int green = it->second.phase < 3 ? 1 : 2, sub = it->second.phase % 3;
+    if (cycle != green) return LIGHT_RED;
+    return sub == 0 ? LIGHT_GREEN : (sub == 1 ? LIGHT_YELLOW : LIGHT_RED);
+}
+
+static unsigned char GlobalLightForCars(int cycle) {
+    return cycle == 1 ? plugin::CallAndReturn<unsigned char, 0x49D2D0>()   // CTrafficLights::LightForCars1
+                      : plugin::CallAndReturn<unsigned char, 0x49D310>();  // CTrafficLights::LightForCars2
+}
+
+// The game's checks (ShouldCarStopForLight and two more, all with the vehicle in esi and the link in edi): the light of
+// the junction the link's light belongs to
+static unsigned char __cdecl SignalForVehicleLink(int cycle, CVehicle* veh, CCarPathLink* link) {
+    if (!cfgActuatedLights || !veh || !link) return GlobalLightForCars(cycle);
+    CNodeAddress junction;
+    if (link->m_bTrafficLightDirection) junction = link->m_address;
+    else {
+        // The other end of the link: of the vehicle's nodes, the junction that isn't the link's own node, nearest to it
+        const CAutoPilot& ap = veh->m_autoPilot;
+        const CVector2D lp(link->m_vecPosn.x / 8.0f, link->m_vecPosn.y / 8.0f);
+        float best = 60.0f;
+        for (const CNodeAddress& c : { ap.m_startingRouteNode, ap.m_currentAddress, ap.field_8 }) {
+            CPathNode* n = GetNode(c);
+            if (!n || c == link->m_address || n->NumberAdjNodes <= 2) continue;
+            float d = (GetNodePos(n).To2D() - lp).Magnitude();
+            if (d < best) { best = d; junction = c; }
+        }
+    }
+    if (junction.IsEmpty()) return GlobalLightForCars(cycle);
+    return static_cast<unsigned char>(SignalColor(junction, cycle));
+}
+static void __declspec(naked) SignalVehicle1() { __asm { push edi
+                                                          push esi
+                                                          push 1
+                                                          call SignalForVehicleLink
+                                                          add esp, 12
+                                                          ret } }
+static void __declspec(naked) SignalVehicle2() { __asm { push edi
+                                                          push esi
+                                                          push 2
+                                                          call SignalForVehicleLink
+                                                          add esp, 12
+                                                          ret } }
+
+// The poles (CTrafficLights::DisplayActualLight, the light in esi): the junction they stand at, by its cycle (the pole's
+// facing: north-south 1, west-east 2). Junctions with lights found once, the pole's junction remembered
+static std::vector<CNodeAddress> signalJunctions;
+static std::unordered_map<CEntity*, CNodeAddress> poleJunction;
+static unsigned char __cdecl SignalForPole(int cycle, CEntity* pole) {
+    auto original = [cycle]() {
+        return cycle == 1 ? plugin::CallAndReturn<unsigned char, 0x49D350>() : plugin::CallAndReturn<unsigned char, 0x49D3A0>();
+    };
+    if (!cfgActuatedLights || !pole) return original();
+    if (signalJunctions.empty()) {
+        for (int a = 0; a < NUM_PATH_MAP_AREAS; a++) {
+            if (!ThePaths.m_pPathNodes[a]) continue;
+            for (unsigned int i = 0; i < ThePaths.m_dwNumVehicleNodes[a]; i++) {
+                CNodeAddress addr(static_cast<short>(a), static_cast<short>(i));
+                CPathNode* n = GetNode(addr);
+                if (!n || n->NumberAdjNodes <= 2) continue;
+                for (int k = 0; k < n->NumberAdjNodes; k++) {
+                    CCarPathLink* l = GetLinkBetween(addr, n, GetAdjacentNode(n, addr, k));
+                    if (l && l->m_nTrafficLightState) { signalJunctions.push_back(addr); break; }
+                }
+            }
+        }
+    }
+    auto it = poleJunction.find(pole);
+    if (it == poleJunction.end()) {
+        CNodeAddress best;
+        float bestD = 35.0f;
+        const CVector2D pp = pole->GetPosition().To2D();
+        for (const CNodeAddress& j : signalJunctions) {
+            CPathNode* n = GetNode(j);
+            if (!n) continue;
+            float d = (GetNodePos(n).To2D() - pp).Magnitude();
+            if (d < bestD) { bestD = d; best = j; }
+        }
+        it = poleJunction.emplace(pole, best).first;
+    }
+    if (it->second.IsEmpty()) return original();
+    return static_cast<unsigned char>(SignalColor(it->second, cycle));
+}
+static void __declspec(naked) SignalPole1() { __asm { push esi
+                                                       push 1
+                                                       call SignalForPole
+                                                       add esp, 8
+                                                       ret } }
+static void __declspec(naked) SignalPole2() { __asm { push esi
+                                                       push 2
+                                                       call SignalForPole
+                                                       add esp, 8
+                                                       ret } }
+
 // Traffic light that a vehicle going towards node 'towards' sees on this link (same test as
-// CTrafficLights::ShouldCarStopForLight @ 0x49D610)
+// CTrafficLights::ShouldCarStopForLight @ 0x49D610); the junction is the one it's going towards
 static eLightColor GetLinkLightColor(const CCarPathLink* link, const CNodeAddress& towards) {
     if (!link->m_nTrafficLightState) return LIGHT_NONE;
     bool appliesToUs = link->m_bTrafficLightDirection ? (link->m_address == towards) : (link->m_address != towards);
     if (!appliesToUs) return LIGHT_NONE;
-    unsigned char color = link->m_nTrafficLightState == 1 ?
-        plugin::CallAndReturn<unsigned char, 0x49D2D0>() :  // CTrafficLights::LightForCars1
-        plugin::CallAndReturn<unsigned char, 0x49D310>();   // CTrafficLights::LightForCars2
+    if (cfgActuatedLights) return SignalColor(towards, link->m_nTrafficLightState);
+    unsigned char color = GlobalLightForCars(link->m_nTrafficLightState);
     return color <= LIGHT_RED ? static_cast<eLightColor>(color) : LIGHT_RED;
 }
 
@@ -2684,6 +2863,46 @@ static float GetRacingLineSteer(CVehicle* veh, const ExtendedData& xdata, float 
     return SteerTowards(veh, target);
 }
 
+// Smooth lanes (like SUMO's lane shapes): the centre of the car's lane at each road link's point (where the game's lane
+// geometry is exact), joined by a centripetal Catmull-Rom spline sampled every metre; the car steers to the point of it
+// lookDist ahead (pure pursuit). The game steers along straight pieces between its nodes: corners of a few metres at
+// every node, wobbling along curves. Only on the road, away from junctions (turns stay with the game)
+static bool cfgSmoothLanes = true;
+static int smoothLaneFrames = 0;
+static float GetSmoothLaneSteer(CVehicle* veh, const ExtendedData& xdata, float speed, float laneF) {
+    if (xdata.pathCount < 4) return NAN;
+    CVector2D pts[MAX_LOOKAHEAD_NODES + 2];
+    int n = 0;
+    for (int seg = 1; seg + 1 < xdata.pathCount && n < MAX_LOOKAHEAD_NODES; seg++) {
+        if (!xdata.pathLinkOk[seg]) break;
+        CVector2D d = xdata.path[seg + 1].To2D() - xdata.path[seg].To2D();
+        float len = d.Magnitude();
+        if (len < 0.5f) break;
+        d *= 1.0f / len;
+        pts[n++] = xdata.pathLinkPos[seg] + CVector2D(d.y, -d.x) * ((xdata.pathLaneOffset[seg] + laneF) * LANE_WIDTH);
+    }
+    if (n < 3) return NAN;
+    const CVector2D pos = veh->GetPosition().To2D();
+    const float lookDist = std::clamp(speed * 0.55f + 4.0f, 7.0f, 24.0f);
+    // Walk the spline: every metre, from the first piece the car is at or past the start of
+    auto at = [&](int i, float t) {
+        CVector2D p0 = pts[std::max(i - 1, 0)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[std::min(i + 2, n - 1)];
+        float t2 = t * t, t3 = t2 * t;
+        return (p1 * 2.0f + (p2 - p0) * t + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * t2 + (p1 * 3.0f - p0 - p2 * 3.0f + p3) * t3) * 0.5f;
+    };
+    const CVector2D fwd = veh->GetForward().To2D();
+    for (int i = 0; i + 1 < n; i++) {
+        float segLen = (pts[i + 1] - pts[i]).Magnitude();
+        int steps = std::max(static_cast<int>(segLen), 1);
+        for (int k = 0; k <= steps; k++) {
+            CVector2D q = at(i, static_cast<float>(k) / steps);
+            CVector2D rel = q - pos;
+            if (CVector2D::Dot(rel, fwd) > 0.0f && rel.Magnitude() >= lookDist) return SteerTowards(veh, q);
+        }
+    }
+    return NAN;
+}
+
 // Lane change: the lane position goes from where it was to the target lane along a smooth S (smoothstep) in
 // changeDuration s, and the vehicle is steered to the point of that path lookDist ahead. The point follows the road
 // ahead (the route's segments, each with its own lanes), so in a curve it stays on the road. The game's own steering
@@ -2954,6 +3173,19 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     if (xdata.lineBlend > 0.0f) {
         float lineSteer = GetRacingLineSteer(veh, xdata, speed);
         *steer += (lineSteer - *steer) * xdata.lineBlend;
+    }
+
+    // Keeping its lane on the road: the smooth lane (not near junctions, not going round something, not on the racing line)
+    if (cfgSmoothLanes && xdata.laneState != LANE_CHANGING && !xdata.bypassUntil && xdata.lineBlend <= 0.0f && speed > 5.0f &&
+        veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE && xdata.distToJunctionAhead > std::max(25.0f, speed * 1.5f)) {
+        CPathNode* cur = GetNode(veh->m_autoPilot.m_currentAddress);
+        bool awayFromLastJunction = !cur || cur->NumberAdjNodes <= 2 ||
+            (GetNodePos(cur).To2D() - veh->GetPosition().To2D()).Magnitude() > 20.0f;
+        float smooth = awayFromLastJunction ? GetSmoothLaneSteer(veh, xdata, speed, static_cast<float>(veh->m_autoPilot.m_nNextLane)) : NAN;
+        if (std::isfinite(smooth) && std::abs(smooth - *steer) < 0.35f) {
+            *steer = smooth;
+            smoothLaneFrames++;
+        }
     }
 
     if (xdata.laneState == LANE_CHANGING) {
@@ -3387,6 +3619,13 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "SmoothLanes", cfgSmoothLanes);
+        ReadIniBool(ini, "ActuatedLights", cfgActuatedLights);
+        ReadIniFloat(ini, "SignalMinGreen", cfgSignalMinGreen);
+        ReadIniFloat(ini, "SignalMaxGreen", cfgSignalMaxGreen);
+        ReadIniFloat(ini, "SignalYellow", cfgSignalYellow);
+        ReadIniFloat(ini, "SignalAllRed", cfgSignalAllRed);
+        ReadIniFloat(ini, "SignalGap", cfgSignalGap);
         ReadIniBool(ini, "UseUnusedRoads", cfgUseUnusedRoads);
         ReadIniFloat(ini, "FastCurveGripBoost", cfgFastCurveGripBoost);
         ReadIniFloat(ini, "HighwayGapFactor", cfgHighwayGapFactor);
@@ -3515,6 +3754,22 @@ public:
         }
         if (cfgRoutePlanning) {
             patch::RedirectCall(0x42E039, InitSequenceHook, true);
+            if (cfgActuatedLights) {
+                struct { uintptr_t at, target; void* hook; } sites[] = {
+                    { 0x49D6D4, 0x49D2D0, SignalVehicle1 }, { 0x49D6EC, 0x49D310, SignalVehicle2 },
+                    { 0x49D84A, 0x49D2D0, SignalVehicle1 }, { 0x49D862, 0x49D310, SignalVehicle2 },
+                    { 0x49D9CD, 0x49D2D0, SignalVehicle1 }, { 0x49D9E3, 0x49D310, SignalVehicle2 },
+                    { 0x49DB5F, 0x49D350, SignalPole1 }, { 0x49DB6D, 0x49D3A0, SignalPole2 } };
+                int patched = 0;
+                for (auto& site : sites) {
+                    if (*reinterpret_cast<unsigned char*>(site.at) == 0xE8 &&
+                        site.at + 5 + *reinterpret_cast<int*>(site.at + 1) == site.target) {
+                        patch::RedirectCall(site.at, site.hook, true);
+                        patched++;
+                    }
+                }
+                lg << "Actuated traffic lights: " << patched << " of 8 call sites patched\n";
+            }
             // The exit checks: only patched where the game's code is what we expect (call 0x42DAB0)
             if (*reinterpret_cast<unsigned char*>(0x42E18B) == 0xE8 && 0x42E190 + *reinterpret_cast<int*>(0x42E18C) == 0x42DAB0)
                 patch::RedirectCall(0x42E18B, ExitCheckHook, true);
