@@ -40,7 +40,8 @@ DEPLOYED_ASI = os.path.join(SCRIPTS, 'RealTrafficFix.SA.asi')
 AUTOTEST_INI = os.path.join(SCRIPTS, 'RealTrafficFix.autotest.ini')
 MIXSETS_INI = os.path.join(GAME_DIR, 'modloader', 'MixSets', 'MixSets.ini')
 # Driver profile of the test car (AutoTest TripProfile)
-DRIVERS = {'calmo': 'calm', 'seguro': 'safe', 'normal': 'normal', 'rapido': 'fast', 'agressivo': 'aggressive', 'fuga': 'fleeing'}
+DRIVERS = {'calmo': 'calm', 'seguro': 'safe', 'normal': 'normal', 'rapido': 'fast', 'agressivo': 'aggressive', 'fuga': 'fleeing',
+           'drifter': 'drifter'}
 DEFAULT_XLSX = os.path.join(os.path.expanduser('~'), 'Desktop', 'RealTrafficFix_Testes.xlsx')
 
 SCENARIOS = {

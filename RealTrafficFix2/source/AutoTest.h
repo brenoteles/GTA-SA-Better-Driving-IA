@@ -344,7 +344,7 @@ void Init(const std::string& moduleDir) {
         static const struct { const char* key; eDriverProfile profile; const char* label; } drivers[] = {
             { "calm", PROFILE_CALM, "CALM" }, { "safe", PROFILE_SAFE, "SAFE" }, { "normal", PROFILE_NORMAL, "NORMAL" },
             { "fast", PROFILE_FAST, "FAST" }, { "aggressive", PROFILE_AGGRESSIVE, "AGGRESSIVE" },
-            { "fleeing", PROFILE_FLEEING, "FLEEING" } };
+            { "fleeing", PROFILE_FLEEING, "FLEEING" }, { "drifter", PROFILE_DRIFTER, "DRIFTER" } };
         std::string want = ini.ReadString("AutoTest", "TripProfile", "normal");
         for (const auto& d : drivers) if (want == d.key) { tripCars[0].profile = d.profile; tripCars[0].label = d.label; }
     }
