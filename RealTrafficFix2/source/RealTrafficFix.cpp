@@ -2546,10 +2546,33 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
     }
 }
 
+// Distance between the front and rear axles: from the wheels' suspension lines of the collision model (the 0.6 x body
+// length guess was metres off on trucks and buses, long overhangs: the turn radius from the steering came out too large,
+// the cement truck went into junction turns too fast and couldn't make them), per model
+static std::unordered_map<int, float> wheelBases;
+static float GetWheelBase(CVehicle* veh, const CVector& modelMin, const CVector& modelMax) {
+    auto it = wheelBases.find(veh->m_nModelIndex);
+    if (it != wheelBases.end()) return it->second;
+    float wb = std::max((modelMax.y - modelMin.y) * 0.6f, 1.0f);
+    CColModel* col = veh->GetColModel();
+    if (col && col->m_pColData && col->m_pColData->m_nNumLines >= 4 && col->m_pColData->m_pLines) {
+        float front = -1000.0f, rear = 1000.0f;
+        for (int i = 0; i < 4; i++) {
+            float y = col->m_pColData->m_pLines[i].m_vecStart.y;
+            front = std::max(front, y);
+            rear = std::min(rear, y);
+        }
+        if (front - rear > 1.0f && front - rear < 20.0f) wb = front - rear;
+    }
+    lg << "Wheelbase model " << veh->m_nModelIndex << ": " << wb << " m (body length guess " << (modelMax.y - modelMin.y) * 0.6f << " m)\n";
+    wheelBases[veh->m_nModelIndex] = wb;
+    return wb;
+}
+
 // Max speed (m/s) for the turn the vehicle is making right now. Curvature is the largest of what the AI
 // asks with the steering wheel (bicycle model) and what the car is really doing (yaw rate / speed)
 static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& modelMin, const CVector& modelMax, float speed, float grip) {
-    float wheelBase = std::max((modelMax.y - modelMin.y) * 0.6f, 1.0f);
+    float wheelBase = GetWheelBase(veh, modelMin, modelMax);
     // Small steering corrections (lane keeping, lane changes) aren't a turn: at speed 3 degrees of steering read as a
     // 30 m radius and held traffic at ~45 km/h on freeways. The steering only counts from ~8 degrees (a real turn starting)
     float steerAngle = std::max(std::abs(veh->m_fSteerAngle) - 0.14f, 0.0f);
@@ -2583,7 +2606,7 @@ static float SteerTowards(CVehicle* veh, const CVector2D& target) {
 
     CVector modelMin, modelMax;
     GetEntityDimensions(veh, modelMin, modelMax);
-    float wheelBase = std::max((modelMax.y - modelMin.y) * 0.6f, 1.0f);
+    float wheelBase = GetWheelBase(veh, modelMin, modelMax);
     float steer = std::atan(2.0f * wheelBase * std::sin(alpha) / dist);
     float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh); // CCarCtrl::FindMaxSteerAngle
     return std::clamp(steer, -maxSteer, maxSteer);
