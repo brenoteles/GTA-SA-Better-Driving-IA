@@ -1229,6 +1229,7 @@ void Update() {
         out << Format("circles of waiting cars broken (deadlocks): %d\n", deadlockBreakCount);
         out << Format("actuated lights: %d junctions; greens ended for nobody arriving %d, at the max green %d\n",
             (int)junctionSignals.size(), signalGapOutCount, signalMaxOutCount);
+        out << Format("actuated lights: switched by the safety valve (a road red too long with someone waiting) %d\n", signalForcedCount);
         out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("held at a light/by the game 25 s with the road clear, went through (broken light): %d\n", brokenLightCount);

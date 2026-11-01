@@ -1419,7 +1419,9 @@ struct JunctionSignal {
     unsigned int phaseStart = 0, lastUpdate = 0;
     int demand[3] = {};                 // cars arriving on cycle 1/2 roads within 60 m
     bool arriving[3] = {};              // one of them within the gap time of the stop line
+    unsigned int lastGreen[3] = {};     // when each cycle last had green
 };
+static int signalForcedCount = 0;
 static std::unordered_map<uint32_t, JunctionSignal> junctionSignals;
 static int signalGapOutCount = 0, signalMaxOutCount = 0, signalRestCount = 0;
 static uint32_t SignalKey(const CNodeAddress& a) { return (static_cast<uint32_t>(a.Region) << 16) | a.Index; }
@@ -1451,6 +1453,20 @@ static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsi
     const int sub = sig.phase % 3;
     if (sub == 0) {
         const int green = sig.phase < 3 ? 1 : 2, other = 3 - green;
+        sig.lastGreen[green] = now;
+        if (!sig.lastGreen[other]) sig.lastGreen[other] = now;
+        // Safety valve: someone waiting on the other roads with no green for MaxGreen + 15 s: switch now. A queue sat 90 s
+        // at a red that should never last more than ~35 s
+        if (sig.demand[other] > 0 && now - sig.lastGreen[other] > static_cast<unsigned>((cfgSignalMaxGreen + 15.0f) * 1000.0f)) {
+            signalForcedCount++;
+            if (signalForcedCount <= 30)
+                lg << "Signal forced: junction " << junction.Region << ":" << junction.Index << " cycle " << other << " red "
+                   << (now - sig.lastGreen[other]) / 1000 << " s, demand " << sig.demand[1] << "/" << sig.demand[2]
+                   << ", green " << green << " for " << elapsed << " s, arriving " << sig.arriving[green] << "\n";
+            sig.phase++;
+            sig.phaseStart = now;
+            return;
+        }
         if (elapsed >= cfgSignalMinGreen && sig.demand[other] > 0 && (!sig.arriving[green] || elapsed >= cfgSignalMaxGreen)) {
             if (elapsed >= cfgSignalMaxGreen) signalMaxOutCount++;
             else signalGapOutCount++;
