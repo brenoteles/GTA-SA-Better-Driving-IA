@@ -1,0 +1,4 @@
+# Real Traffic Fix: lane data corrections from a road scan (tools\route_scan.py)
+# nodeA nodeB lanes         = lanes towards node B on the road link A->B (area:index)
+# nodeA nodeB shift dx dy   = move the link position (m) so its lanes sit on the road
+22:497 22:504 shift 2.42 -0.29   # lanes stick out -2.0 m and back +2.9 m: moved +2.4 m in line

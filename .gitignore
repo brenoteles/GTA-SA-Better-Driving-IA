@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.asi
+*.dll
+*.exe
+.vs/
+*.vcxproj.user
+
+# Python
+__pycache__/
+*.pyc
