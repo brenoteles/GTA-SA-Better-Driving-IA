@@ -171,6 +171,16 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <h3>Proposta 1 no jogo: líder pela rota</h3>
         <p>O carro atingido pelo sensor é projetado na rota planejada e só vira líder se a carroceria dele cruza o caminho que vamos fazer. Primeiro teste: chegou em 7,19 min a 89 km/h de média, o melhor até agora. O Gemini revisou o código e achou 7 pontos: 5 entraram (projeção além da ponta do segmento, alcance de 20 m, sem ponto cego no meio da troca de faixa, largura de veículo em ângulo, margem maior para carro parado). O de devolver carros na contramão aos raios foi revertido, porque o log mostrou os raios freando para carro na contramão a 11 m de lado; o último estava errado.</p>
       </li>
+      <li>
+        <div class="meta"><span class="mono">64ba393</span><span class="tag t-claude">Claude</span></div>
+        <h3>Contadores de por que a rota não julga</h3>
+        <p>A rota só julgou ~3% dos veículos atingidos pelos raios. O resumo do teste agora separa o motivo: sem rota à frente, outro carro fora da rede de ruas, nós fora da rota, ele em outra via, ele atrás, ele atravessado.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">085846</span><span class="tag t-claude">Claude</span><span class="tag t-user">decisão do usuário</span></div>
+        <h3>Teste da versão revisada: jogo travou</h3>
+        <p>O jogo congelou a 291 m de Bayside, depois de 10,47 km; na última leitura o Cadrona saltou de 13 para 135 km/h em 10 s, sinal de física explodindo. O tráfego teve 11,8 colisões/min (39 apertos em cruzamento, 27 toques laterais). O usuário considerou azar e manteve a versão revisada; os contadores de motivo ficaram sem resumo porque o teste não terminou.</p>
+      </li>
     </ol>
   </section>
 
@@ -185,6 +195,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">082034</td><td><span class="pill bad">falhou</span></td><td class="num">0,40 km</td><td class="num">5</td><td>Gridlock em Grove: 60 carros em 120 m, 3 andando</td></tr>
           <tr><td class="mono">082622</td><td><span class="pill warn">interrompido</span></td><td class="num">10,40 km</td><td class="num">2</td><td>Crashout a 80% de gás bateu a 290 m de Bayside</td></tr>
           <tr><td class="mono">085011</td><td><span class="pill good">chegou</span></td><td class="num">10,63 km</td><td class="num">1</td><td>Líder pela rota: 7,19 min, 89 km/h de média, 1,25 colisões/min no tráfego (antes 1,9 a 4). Rota e raios discordaram 309 vezes; a rota só julgou ~3% dos casos</td></tr>
+          <tr><td class="mono">085846</td><td><span class="pill warn">travou</span></td><td class="num">10,47 km</td><td class="num">20</td><td>Versão revisada pelo Gemini; jogo congelou a 291 m do fim, 11,8 colisões/min no tráfego. Tratado como azar</td></tr>
         </tbody>
       </table>
     </div>
@@ -257,7 +268,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <article class="plate">
         <div class="rank">2</div>
         <div class="plate-body">
-          <div class="plate-head"><h3>Troca de faixa pela lista de veículos</h3><span class="status">planejada</span></div>
+          <div class="plate-head"><h3>Troca de faixa pela lista de veículos</h3><span class="status doing">em andamento</span></div>
           <dl>
             <dt>Ideia</dt><dd>Em vez de três raios, procurar na faixa de destino o carro à frente e o de trás (de 30 m atrás a 25 m à frente) e só trocar se os dois intervalos tiverem tempo até colisão acima de 2,5 s e a frenagem imposta ao carro de trás (pelo IDM+) ficar abaixo de 2 m/s², no estilo MOBIL. Durante a troca, reservar espaço nas duas faixas e abortar se alguém entrar no envelope.</dd>
             <dt>Do CARLA</dt><dd>Localização olhando faixa de origem e destino; distância mínima de troca.</dd>
@@ -337,9 +348,9 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Entender por que a rota não julga 97% dos veículos atingidos (contadores por motivo já no teste) e ampliar a cobertura.</li>
-      <li>Repetir o teste com a versão revisada pelo Gemini e comparar com o 085011.</li>
-      <li>Seguir para as propostas 2 e 3.</li>
+      <li>Proposta 2 em andamento: troca de faixa pela lista de veículos.</li>
+      <li>No próximo teste, ler os contadores de por que a rota não julga e ampliar a cobertura.</li>
+      <li>Depois, proposta 3.</li>
     </ol>
   </section>
 
