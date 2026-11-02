@@ -116,13 +116,13 @@ footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule)
   <section id="resumo">
     <h2>Resumo</h2>
     <div class="summary">
-      <div class="stat"><b>27</b><span>itens feitos</span></div>
-      <div class="stat"><b>4</b><span>em teste no jogo</span></div>
-      <div class="stat"><b>8</b><span>a fazer</span></div>
+      <div class="stat"><b>28</b><span>itens feitos</span></div>
+      <div class="stat"><b>5</b><span>em teste no jogo</span></div>
+      <div class="stat"><b>6</b><span>a fazer</span></div>
       <div class="stat"><b>3</b><span>bloqueados ou descartados</span></div>
     </div>
-    <div class="bar" role="img" aria-label="27 feitos, 4 em teste, 8 a fazer, 3 bloqueados de 42 itens">
-      <i style="width:64.3%;background:var(--done)"></i><i style="width:9.5%;background:var(--test)"></i><i style="width:19%;background:var(--todo)"></i><i style="width:7.2%;background:var(--blocked)"></i>
+    <div class="bar" role="img" aria-label="28 feitos, 5 em teste, 6 a fazer, 3 bloqueados de 42 itens">
+      <i style="width:66.7%;background:var(--done)"></i><i style="width:11.9%;background:var(--test)"></i><i style="width:14.3%;background:var(--todo)"></i><i style="width:7.2%;background:var(--blocked)"></i>
     </div>
     <div class="legend">
       <span class="st done">feito</span><span class="st test">em teste</span><span class="st todo">a fazer</span><span class="st blocked">bloqueado</span><span class="st drop">descartado</span>
@@ -136,8 +136,8 @@ footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule)
       <div class="group-head"><h3>Bloqueando os testes</h3><span class="src">prioridade</span></div>
       <ul class="check">
         <li class="done"><span class="box">&#10003;</span><div class="item"><strong>Jogo trava na descida de Bayside, ~290 m do fim</strong><span class="res">Causa achada com o Gemini lendo c&oacute;digo e logs: nos 3 testes o tr&aacute;fego se amontoa em Bayside (pen&iacute;nsula na borda do mapa) e carros com destino inalcan&ccedil;&aacute;vel (12% dos n&oacute;s) refaziam a busca de rota a cada 300 ms, 200.000 passos de A* cada, sem nunca trocar de destino: o jogo ca&iacute;a a poucos quadros por segundo, sem parar de vez (por isso o vigia n&atilde;o registrava). Corrigido: novo destino ao fim da rota mesmo incompleta, busca limitada a 30.000 passos, 2 buscas por quadro; o tempo do mod por quadro agora vai para o log.</span><span class="meta">079aca6 · 4a2543a · an&aacute;lise do Gemini · teste 145526: o Sandking chegou, nenhum quadro lento dirigindo</span></div><span class="st done">resolvido</span></li>
-        <li class="todo"><span class="box"></span><div class="item"><strong>Limite de volante (F) n&atilde;o atuou</strong><span class="res">No teste 145526 contou 0 quadros limitados. Ou o volante nunca passou do limite, ou o c&oacute;digo n&atilde;o chega l&aacute;. Conferir no c&oacute;digo antes do pr&oacute;ximo teste longo.</span></div><span class="st todo">a fazer</span></li>
-        <li class="todo"><span class="box"></span><div class="item"><strong>Velocidade de curva limitada pelo volante: 565.637 vezes</strong><span class="res">N&uacute;mero alto demais no teste 145526; pode estar freando curvas que o carro faria. Conferir no c&oacute;digo.</span></div><span class="st todo">a fazer</span></li>
+        <li class="test"><span class="box"></span><div class="item"><strong>Limite de volante (F) n&atilde;o atuou</strong><span class="res">No teste 145526 contou 0 quadros limitados, mas o volante pulou 0,07 rad em 100 ms a 120 km/h (o dobro do limite). Causa, confirmada pelo Gemini e no execut&aacute;vel: a isen&ccedil;&atilde;o "acabou de bater" lia o carimbo de colis&atilde;o do jogo, que as rodas renovam a todo quadro s&oacute; por tocar a rua. Agora conta como batida s&oacute; um registro de dano acima de 10, e o log diz por que o limite n&atilde;o atuou.</span><span class="meta">6597289 · revis&atilde;o do Gemini</span></div><span class="st test">em teste</span></li>
+        <li class="done"><span class="box">&#10003;</span><div class="item"><strong>Velocidade de curva limitada pelo volante: 565.637 vezes</strong><span class="res">N&atilde;o &eacute; erro: o n&uacute;mero conta cada ponto do caminho de cada carro a cada varredura, n&atilde;o curvas. Simulando os 36 modelos aprendidos, o volante s&oacute; limita a Picador (subester&ccedil;o alto, ex.: curva de 80 m a 104 em vez de 117 km/h) e caminh&otilde;es em curvas de 8 m. Para o Sandking nunca limita. R&oacute;tulo do log corrigido.</span><span class="meta">6597289</span></div><span class="st done">explicado</span></li>
         <li class="blocked"><span class="box"></span><div class="item"><strong>Postes de sem&aacute;foro no ch&atilde;o</strong><span class="res">Mesmo no meio-fio medido, ainda apareceram no meio da rua. Por decis&atilde;o do usu&aacute;rio ficam flutuando (5,5 m acima) at&eacute; segunda ordem; a posi&ccedil;&atilde;o no meio-fio fica guardada para quando voltarem ao ch&atilde;o.</span></div><span class="st blocked">flutuando</span></li>
       </ul>
     </div>
