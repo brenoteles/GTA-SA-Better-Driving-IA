@@ -302,6 +302,17 @@ class App:
         self.root.destroy()
 
     # ---------------------------------------------------------------- test run
+    def keep_game_focused(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'focus_game.py')
+        for _ in range(80):
+            time.sleep(3)
+            try:
+                if self.log_path and os.path.exists(self.log_path) and 'starting at' in open(self.log_path, encoding='utf-8', errors='replace').read():
+                    return
+            except OSError:
+                pass
+            subprocess.run([sys.executable.replace('pythonw', 'python'), script], capture_output=True)
+
     def handle_fla_window(self, fla_ini):
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fla_window.py')
         for _ in range(90):
@@ -392,6 +403,9 @@ class App:
             fla_ini = os.path.join(GAME_DIR, 'fastman92limitAdjuster_GTASA.ini')
             if os.path.exists(fla_ini):
                 threading.Thread(target=self.handle_fla_window, args=(fla_ini,), daemon=True).start()
+            # The game only loads while its window has the focus (with the terminal in front it sat on a flickering
+            # black screen): brought to the front until the test starts (tools/focus_game.py)
+            threading.Thread(target=self.keep_game_focused, daemon=True).start()
             self.follow_log()
             elapsed = (time.time() - start) / 60.0
             self.save_results(tag, options, config, asi_info, elapsed)
