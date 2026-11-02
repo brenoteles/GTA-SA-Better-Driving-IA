@@ -579,6 +579,33 @@ static bool playerAutoDrive = false;
 static CPed* playerPed = nullptr;
 static int checkBumps = -1; // -1 = not checked yet
 static unsigned int frameCounter = 0;
+
+// Watchdog: the game froze twice in tests with nothing in the log. The mod marks what it's doing (stage, vehicle pool
+// index); a thread checks every second that frames still come, and after 5 s without one writes where it stopped to
+// RealTrafficFix.watchdog.txt (also when the game is just paused: then the stage reads "game")
+static volatile const char* wdStage = "start";
+static volatile int wdVeh = -1;
+static volatile unsigned int wdBeat = 0;
+static std::string wdPath;
+static inline void WdStage(const char* stage, int veh = -1) { wdStage = stage; wdVeh = veh; }
+static DWORD WINAPI WatchdogThread(LPVOID) {
+    unsigned int last = 0;
+    int still = 0;
+    for (;;) {
+        Sleep(1000);
+        const unsigned int beat = wdBeat;
+        if (beat != last) { last = beat; still = 0; continue; }
+        if (last == 0 || ++still != 5) continue;
+        FILE* f = nullptr;
+        if (fopen_s(&f, wdPath.c_str(), "a") == 0 && f) {
+            SYSTEMTIME t;
+            GetLocalTime(&t);
+            fprintf(f, "%02d:%02d:%02d no frame for 5 s: stage '%s', vehicle pool index %d, frame %u\n", t.wHour, t.wMinute,
+                t.wSecond, const_cast<const char*>(wdStage), static_cast<int>(wdVeh), frameCounter);
+            fclose(f);
+        }
+    }
+}
 static int debugVehiclesProcessed = 0;
 static int debugRacers = 0;
 static std::fstream lg;
@@ -3270,6 +3297,7 @@ static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, flo
 }
 
 static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake, bool* handbrake) {
+    WdStage("FollowPathHook (game AI)", CPools::ms_pVehiclePool->GetIndex(veh));
     CVehicle* prev = followPathVehicle;
     followPathVehicle = veh;
     plugin::Call<0x434900, CVehicle*, float*, float*, float*, bool*>(veh, steer, gas, brake, handbrake);
@@ -3993,6 +4021,8 @@ public:
         }
 
         if (cfgRouteFixes) LoadRouteFixes(dir + "RealTrafficFix.routefixes.txt");
+        wdPath = dir + "RealTrafficFix.watchdog.txt";
+        CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
         learnedFile = dir + "RealTrafficFix.limits.txt"; // v2 measurement (the old .learned.txt values were inflated);
         if (cfgAdaptiveLimits) LoadLearnedLimits();
 
@@ -4001,8 +4031,12 @@ public:
         Events::processScriptsEvent.after += [] {
             playerPed = FindPlayerPed();
             frameCounter++;
+            wdBeat++;
+            WdStage("BreakDeadlocks");
             BreakDeadlocks();
+            WdStage("RemoveBrokenDown");
             RemoveBrokenDown();
+            WdStage("RemoveBadSpawns");
             RemoveBadSpawns();
             // MixSets writes its own out-of-sight despawn distance (0.6 x VehDespawnOffScr) after us: set ours again once
             // every mod has loaded. Only the opcode is checked ("mov dword ptr [esp+34h], imm32")
@@ -4031,8 +4065,11 @@ public:
             // it, it thins the random cars out. Room for the ambient traffic
             if (cfgAmbientSpawn && CCarCtrl::MaxNumberOfCarsInUse < static_cast<unsigned int>(cfgAmbientTarget + 30))
                 CCarCtrl::MaxNumberOfCarsInUse = cfgAmbientTarget + 30;
+            WdStage("UpdateAmbientSpawn");
             UpdateAmbientSpawn();
+            WdStage("ApplyRouteFixes");
             if (cfgRouteFixes && frameCounter % 120 == 1) ApplyRouteFixes(); // ~2 s, and right after the road data loads
+            WdStage("UpdatePassMeasures");
             UpdatePassMeasures();
             if (frameCounter % 3000 == 0) SaveLearnedLimits(); // ~1 min
 
@@ -4067,11 +4104,15 @@ public:
             routesThisFrame = 0;
             for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
                 if (CVehicle* vehicle = CPools::ms_pVehiclePool->GetAt(i)) {
+                    WdStage("ProcessVehicle", i);
                     ProcessVehicle(vehicle, i);
                 }
             }
+            WdStage("DrawIndicators");
             DrawIndicators();
+            WdStage("AutoTest::Update");
             AutoTest::Update();
+            WdStage("game");
         };
 
         Events::drawingEvent += DrawDebug;
@@ -4454,12 +4495,14 @@ public:
 
         // Sensors, staggered between vehicles and less often far from the camera
         if (sensorTick) {
+            WdStage("UpdateObstacles", poolIndex);
             UpdateObstacles(vehicle, xdata, modelMin, modelMax, isBike, racer, speed, timeGap, decel);
             refreshRoute(speed);
             FindPathLeader(vehicle, xdata, modelMax.y, std::clamp(speed * timeGap + speed * speed / (2.0f * decel) + 15.0f, 30.0f, 160.0f));
             PredictConflict(vehicle, xdata, speed, std::max(modelMax.x, -modelMin.x));
             UpdateBumps(vehicle, xdata, modelMin, modelMax, isBike, speed);
             // Lane changes: not for bikes (they weave), vehicles on a call, or big ones the game keeps in the right lane
+            WdStage("UpdateLanes", poolIndex);
             UpdateLanes(vehicle, xdata, modelMax.y, speed, desired, isBike || onEmergencyCall || (ap.m_nCarCtrlFlags & 0x10));
             if (isBike) UpdateBikeWeaving(vehicle, xdata, speed);
             if (xdata.turnSide != 0 && xdata.turnDist < std::max(40.0f, speed * 4.0f)) SetIndicator(xdata, xdata.turnSide, 400);

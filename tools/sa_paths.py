@@ -54,7 +54,7 @@ class Node:
 
     @property
     def speed(self):            # 0 slow, 1 normal, 2 freeway (the game's speed class)
-        return (self.flags >> 16) & 0x3
+        return (self.flags >> 12) & 0x3
 
 
 class Navi:
