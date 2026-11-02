@@ -191,6 +191,16 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <h3>Caminhão nascendo dentro da terra na descida de Bayside</h3>
         <p>O teste parou a 291 m do fim, no mesmo ponto em que o jogo tinha travado: fila parada em (-2765, 2355). O spawner criava o veículo nivelado na altura do chão sob o centro e só depois o virava para a direção da via, sem inclinar; na descida íngreme a ponta de cima de um caminhão ficava dentro do morro. Agora o veículo é assentado nas rodas acompanhando o chão, e se ainda ficar enterrado numa ponta não é criado.</p>
       </li>
+      <li>
+        <div class="meta"><span class="mono">092740</span><span class="tag t-claude">Claude</span></div>
+        <h3>Teste completo das propostas 1 e 2: menor taxa de colisões até agora</h3>
+        <p>Chegou em 7,45 min a 86 km/h, com 0,67 colisões/min no tráfego e só 1 toque lateral. Passou pela descida de Bayside; um spawn enterrado foi recusado. A lista de veículos barrou 1551 trocas de faixa que os raios liberariam, e 12 pela frenagem imposta ao carro de trás.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">dc3388e</span><span class="tag t-claude">Claude</span></div>
+        <h3>Bug: nosso carro “fora da própria rota” 96% das vezes</h3>
+        <p>Os contadores mostraram que o líder pela rota quase nunca julgava porque o próprio carro não era projetado na rota (70.973 casos). Provável causa: a rota começa no nó atual e o carro muitas vezes ainda está antes dele. A projeção agora inclui o trecho anterior, e os casos que restarem vão para o log com a geometria.</p>
+      </li>
     </ol>
   </section>
 
@@ -207,6 +217,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">085011</td><td><span class="pill good">chegou</span></td><td class="num">10,63 km</td><td class="num">1</td><td>Líder pela rota: 7,19 min, 89 km/h de média, 1,25 colisões/min no tráfego (antes 1,9 a 4). Rota e raios discordaram 309 vezes; a rota só julgou ~3% dos casos</td></tr>
           <tr><td class="mono">085846</td><td><span class="pill warn">travou</span></td><td class="num">10,47 km</td><td class="num">20</td><td>Versão revisada pelo Gemini; jogo congelou a 291 m do fim, 11,8 colisões/min no tráfego. Tratado como azar</td></tr>
           <tr><td class="mono">091623</td><td><span class="pill warn">parado</span></td><td class="num">10,49 km</td><td class="num">2</td><td>Proposta 2; caminhão nasceu dentro do morro na descida de Bayside e a fila travou a 291 m do fim. 2,9 colisões/min</td></tr>
+          <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
         </tbody>
       </table>
     </div>
@@ -359,8 +370,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Proposta 2 no jogo; falta um teste completo (o último parou pelo caminhão enterrado) para ler os contadores.</li>
-      <li>No próximo teste, ler os contadores de por que a rota não julga e ampliar a cobertura.</li>
+      <li>Testar a correção da projeção: a rota deve passar a julgar a maioria dos carros atingidos.</li>
       <li>Depois, proposta 3.</li>
     </ol>
   </section>
