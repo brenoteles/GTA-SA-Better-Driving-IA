@@ -251,6 +251,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
           <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
           <tr><td class="mono">120816</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Proposta 3 e openpilot A e C: 8,26 min, 77 km/h, 2,18 colisões/min</td></tr>
+          <tr><td class="mono">125544</td><td><span class="pill warn">chegou</span></td><td class="num">10,68 km</td><td class="num">11</td><td>79 faixas novas e FLA: 10,14 min, 11,54 colisões/min; engavetamento no cruzamento (2872, −1661) logo na largada, longe das faixas novas</td></tr>
           <tr><td class="mono">123526</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Carros dentro do asfalto e postes no meio-fio: 7,74 min, 82 km/h, 2,20 colisões/min, só 3 fortes</td></tr>
           <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
         </tbody>
@@ -561,9 +562,10 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <tr><td>Velocidade média</td><td class="num">10,13 m/s</td><td class="num">10,21 m/s</td></tr>
         <tr><td>Teleportes</td><td class="num">456</td><td class="num">463 (ruído)</td></tr>
       </tbody></table></div>
-    <p>Ganho pequeno e medido, sem criar engarrafamento novo. As faixas foram gravadas nos arquivos de rota (<code>tools/apply_lanes.py</code>); o validador dá exatamente os mesmos erros antes e depois (todos já existiam). Os arquivos anteriores ficaram guardados. Instalado no jogo; o teste está rodando.</p>
+    <p>Ganho pequeno e medido, sem criar engarrafamento novo. As faixas foram gravadas nos arquivos de rota (<code>tools/apply_lanes.py</code>); o validador dá exatamente os mesmos erros antes e depois (todos já existiam). Os arquivos anteriores ficaram guardados.</p>
+    <p><b>Teste no jogo (125544):</b> chegou, mas em 10,14 min, com 11,54 colisões/min e 3 min parado. As faixas novas não explicam: só 2 das 117 colisões foram a menos de 60 m de uma delas, e o ponto parado fica a 193 m da mais próxima. 81 colisões caíram no mesmo quadrado de 100 m em volta do cruzamento (2872, −1661), a leste de Grove, logo na largada: o mesmo do gridlock do teste 082034. Um engavetamento ali trava a região; acontece em parte dos testes e vira o próximo alvo.</p>
     <h3>4. fastman92 só com a depuração de rotas</h3>
-    <p>Instalado na pasta do jogo sem sobrescrever nada. O jogo já tem um <code>zlib1.dll</code> diferente (de 2021, usado por outro mod); o do FLA (2020) não foi copiado. Na primeira execução o FLA abre uma janela própria e o jogo espera ela fechar; ela mostra o código que a desliga. Depois disso vem o ini, onde só a depuração de rotas será ligada.</p>
+    <p>Instalado na pasta do jogo sem sobrescrever nada. O jogo já tem um <code>zlib1.dll</code> diferente (de 2021, usado por outro mod); o do FLA (2020) não foi copiado e o FLA carregou com o existente. Na primeira execução ele gerou o ini com todos os limites comentados (não mexe em nada que o Open Limit Adjuster já mexe). No ini: depuração de rotas ligada, limite de coronas em 10.000 (cada nó vira uma corona) e o tratador de crash do FLA desligado, como o próprio leiame recomenda (o jogo já tem o CrashInfo). Vale a partir da próxima abertura. A janela do FLA ainda aparece em toda abertura: falta o código de desligar, que só aparece nela.</p>
   </section>
 
   <section id="fla">
