@@ -4800,7 +4800,9 @@ public:
     {
         float best = 20.0f; // 4 lanes of 5.4 m and a median: lanes far from the node line
         bool found = false;
-        for (int seg = 1; seg + 1 < xdata.pathCount; seg++) {
+        // From the piece before the current node (previous -> current): the car is often still on it, the route data
+        // counts from the current node (negative 'along' there)
+        for (int seg = 0; seg + 1 < xdata.pathCount; seg++) {
             if (!xdata.pathLinkOk[seg]) continue;
             if (links && xdata.pathLink[seg] != links[0] && xdata.pathLink[seg] != links[1]) continue;
             CVector2D a = xdata.path[seg].To2D(), d = xdata.path[seg + 1].To2D() - a;
@@ -4817,7 +4819,7 @@ public:
             CVector2D dir = d * (1.0f / len);
             best = dist;
             found = true;
-            along = cum[seg] + t * len;
+            along = seg == 0 ? (t - 1.0f) * len : cum[seg] + t * len;
             laneF = CVector2D::Dot(p - xdata.pathLinkPos[seg], CVector2D(dir.y, -dir.x)) / LANE_WIDTH - xdata.pathLaneOffset[seg];
             dirOut = dir;
         }
@@ -4851,7 +4853,19 @@ public:
         for (int i = 2; i < n; i++) cum[i] = cum[i - 1] + (xdata.path[i] - xdata.path[i - 1]).Magnitude2D();
         float myAlong, myLaneF, oAlong, oLaneF;
         CVector2D myDir, oDir;
-        if (!ProjectOnRoute(xdata, cum, veh->GetPosition().To2D(), nullptr, myAlong, myLaneF, myDir)) { routeUnknownWhy[2]++; return ROUTE_UNKNOWN; }
+        if (!ProjectOnRoute(xdata, cum, veh->GetPosition().To2D(), nullptr, myAlong, myLaneF, myDir)) {
+            routeUnknownWhy[2]++;
+            static int offRouteLogged = 0;
+            if (offRouteLogged++ < 25) {
+                const CVector2D p = veh->GetPosition().To2D();
+                lg << "Route leader: veh " << CPools::GetVehicleRef(veh) << " not on its own route: pathCount " << n << ", links ok "
+                   << xdata.pathLinkOk[0] << xdata.pathLinkOk[1] << (n > 3 ? xdata.pathLinkOk[2] : 9) << ", dist to path[0] "
+                   << (xdata.path[0].To2D() - p).Magnitude() << " [1] " << (xdata.path[1].To2D() - p).Magnitude() << " [2] "
+                   << (xdata.path[2].To2D() - p).Magnitude() << ", seg 1 len " << (xdata.path[2] - xdata.path[1]).Magnitude2D()
+                   << ", processed " << CTimer::m_snTimeInMilliseconds - xdata.lastProcessed << " ms ago\n";
+            }
+            return ROUTE_UNKNOWN;
+        }
         if (!ProjectOnRoute(xdata, cum, other->GetPosition().To2D(), links, oAlong, oLaneF, oDir)) { routeUnknownWhy[3]++; return ROUTE_UNKNOWN; }
         // Across the road (crashed, turning across): the rays'. Coming the other way it's judged too: in its own lanes not
         // ours to brake for (the rays braked for oncoming cars 11 m to the side in curves), in our path an obstacle
