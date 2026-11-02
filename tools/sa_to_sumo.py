@@ -10,7 +10,11 @@ nodes), lights of one junction joined and actuated, freeway ramps guessed (no st
 except at lights. Roads outside the strongly connected main network and parking spots are kept in
 the network but open to emergency vehicles only, so random trips never start, end or route there.
 
-usage: python sa_to_sumo.py <data/Paths> <override folder or -> <out dir>
+Lane overrides (lane_additions.py csv: area,navi,left,right) change the lanes of those links, to compare a road change
+against the base with the same trips; SUMO_KEEP_NODES=1 keeps every GTA segment (no merging), so edge ids stay the
+same between the two networks and one route file runs on both.
+
+usage: python sa_to_sumo.py <data/Paths> <override folder or -> <out dir> [lane overrides.csv]
 writes out/gta.nod.xml, out/gta.edg.xml and runs netconvert -> out/gta.net.xml
 """
 import math
@@ -41,11 +45,21 @@ def merged_paths(base, override):
     return tmp
 
 
-def main(base, override, out):
+def main(base, override, out, lanes_csv=None):
     os.makedirs(out, exist_ok=True)
     net = Network(load_all(merged_paths(base, override)))
     node = net.node
     roads = {k for k, n in node.items() if not n.boats}
+    if lanes_csv:
+        import csv
+        changed = 0
+        navis = {(a, v.id): v for a, ar in net.areas.items() for v in ar.navi}
+        for r in csv.DictReader(open(lanes_csv)):
+            v = navis.get((int(r['area']), int(r['navi'])))
+            if v:
+                v.flags = (v.flags & ~(0x3F << 8)) | (int(r['left']) << 8) | (int(r['right']) << 11)
+                changed += 1
+        print('lane overrides applied:', changed)
     from network_check import scc
     succ = {k: [b for b, nv in net.adj[k] if b in roads and nv and net.lanes_toward(k, b, nv) > 0] for k in roads}
     comp = scc(list(roads), succ)
@@ -91,13 +105,17 @@ def main(base, override, out):
     import sumo
     netconvert = os.path.join(sumo.SUMO_HOME, 'bin', 'netconvert')
     cmd = [netconvert, '-n', os.path.join(out, 'gta.nod.xml'), '-e', os.path.join(out, 'gta.edg.xml'),
-           '-o', os.path.join(out, 'gta.net.xml'), '--geometry.remove', '--no-turnarounds.tls',
+           '-o', os.path.join(out, 'gta.net.xml'), '--no-turnarounds.tls',
            '--junctions.join', '--junctions.join-dist', '18', '--tls.join', '--tls.join-dist', '25',
            '--tls.default-type', 'actuated', '--ramps.guess', '--default.junctions.keep-clear', 'false',
            '--tls.guess-signals', 'false', '--ignore-errors', '--no-warnings', '--offset.disable-normalization']
+    if os.environ.get('SUMO_KEEP_NODES') != '1':
+        cmd.append('--geometry.remove')
+    else:
+        cmd.remove('--ramps.guess')   # it adds ramp edges named by the lane counts: the two networks' edges would differ
     r = subprocess.run(cmd, capture_output=True, text=True)
     print(r.stdout[-1500:], r.stderr[-1500:])
 
 
 if __name__ == '__main__':
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None)
