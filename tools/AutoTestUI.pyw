@@ -302,6 +302,18 @@ class App:
         self.root.destroy()
 
     # ---------------------------------------------------------------- test run
+    def handle_fla_window(self, fla_ini):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fla_window.py')
+        for _ in range(90):
+            time.sleep(1)
+            out = subprocess.run([sys.executable.replace('pythonw', 'python'), script, '--click', '--ini', fla_ini],
+                                 capture_output=True, text=True).stdout
+            if 'clicking' in out:
+                code = re.search(r'disable code: (\S+)', out)
+                self.log('fastman92: janela fechada' + (f', codigo {code.group(1)} salvo no ini' if code else
+                                                        ' (codigo nao encontrado no texto da janela)'))
+                return
+
     def start(self):
         if self.running:
             return
@@ -370,6 +382,11 @@ class App:
             self.q.put(('status', f'Rodando ({self.scenario.get()}) - teste {tag}'))
             start = time.time()
             self.proc = subprocess.Popen([os.path.join(GAME_DIR, 'gta_sa.exe')], cwd=GAME_DIR)
+            # The fastman92 limit adjuster's start window holds the game until its button is pressed: read its disable code
+            # into the FLA ini (it won't come back) and press it (tools/fla_window.py), for up to 90 s
+            fla_ini = os.path.join(GAME_DIR, 'fastman92limitAdjuster_GTASA.ini')
+            if os.path.exists(fla_ini):
+                threading.Thread(target=self.handle_fla_window, args=(fla_ini,), daemon=True).start()
             self.follow_log()
             elapsed = (time.time() - start) / 60.0
             self.save_results(tag, options, config, asi_info, elapsed)
