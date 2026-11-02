@@ -42,17 +42,15 @@ def focus():
     user32.AttachThreadInput(me, fg_thread, True)
     user32.keybd_event(VK_MENU, 0, 0, 0)
     user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-    user32.ShowWindow(hwnd, SW_RESTORE)
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
     user32.BringWindowToTop(hwnd)
     ok = user32.SetForegroundWindow(hwnd)
     user32.AttachThreadInput(me, fg_thread, False)
     if user32.GetForegroundWindow() != hwnd:
         # Refused (someone typing in another window): the shell's own switch, then minimise and restore it
         user32.SwitchToThisWindow(hwnd, True)
-    if user32.GetForegroundWindow() != hwnd:
-        user32.ShowWindow(hwnd, 6)          # SW_MINIMIZE
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetForegroundWindow(hwnd)
+    # (No minimise/restore: GTA opens its pause menu on it, and the test UI calling this every 3 s kept it there)
     print('focused' if user32.GetForegroundWindow() == hwnd else 'focus refused (%d)' % ok)
     return user32.GetForegroundWindow() == hwnd
 

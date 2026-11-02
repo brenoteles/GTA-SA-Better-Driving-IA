@@ -493,6 +493,14 @@ static void UpdateOrbitShots(unsigned int now) {
 // would. The test stood still on it until someone came and clicked Resume
 static int menuResumes = 0;
 void Menu(CMenuManager* menu) {
+    // What the menu is when it's up (to see why it isn't closed): every 5 s
+    static unsigned int lastNote = 0;
+    if (menu && GetTickCount() - lastNote > 5000) {
+        lastNote = GetTickCount();
+        out << "  (menu: active " << (int)menu->m_bMenuActive << ", page " << (int)menu->m_nCurrentMenuPage << ", test state "
+            << (int)state << ", test on " << (int)enabled << ")" << "\n";
+        out.flush();
+    }
     if (!enabled || state == DONE || !menu || !menu->m_bMenuActive || menu->m_nCurrentMenuPage != MENUPAGE_PAUSE_MENU) return;
     static unsigned int lastResume = 0;
     const unsigned int now = GetTickCount();
