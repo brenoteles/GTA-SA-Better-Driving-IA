@@ -1,0 +1,342 @@
+<title>Sensores do Real Traffic Fix</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: caderno de laboratorio de uma coluna; cada proposta e uma "placa" com faixa de status; linha do tempo com marcos */
+:root {
+  --bg: #f3f4f6;
+  --panel: #ffffff;
+  --fg: #1b2129;
+  --muted: #5b6573;
+  --rule: #d5d9e0;
+  --asphalt: #2a313b;
+  --signal: #c98a00;
+  --signal-soft: #fbefd0;
+  --claude: #b55a36;
+  --claude-soft: #f6e3da;
+  --gemini: #2f62c9;
+  --gemini-soft: #dfe8fa;
+  --carla: #3d7d5a;
+  --carla-soft: #dcefe3;
+  --bad: #b3261e;
+  --good: #2e7d32;
+  --lane: #ffffff;
+  --road: #4a525e;
+  --f-display: "Barlow Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "Source Sans 3", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161c; --panel: #1a2029; --fg: #e4e8ee; --muted: #9aa4b2; --rule: #2d3541; --asphalt: #0d1116;
+    --signal: #f0b429; --signal-soft: #3a2f12; --claude: #e08a64; --claude-soft: #3a241b; --gemini: #7ea6f2; --gemini-soft: #1c2a45;
+    --carla: #77c39a; --carla-soft: #17322a; --bad: #f28b82; --good: #81c995; --lane: #e4e8ee; --road: #3a424e; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12161c; --panel: #1a2029; --fg: #e4e8ee; --muted: #9aa4b2; --rule: #2d3541; --asphalt: #0d1116;
+  --signal: #f0b429; --signal-soft: #3a2f12; --claude: #e08a64; --claude-soft: #3a241b; --gemini: #7ea6f2; --gemini-soft: #1c2a45;
+  --carla: #77c39a; --carla-soft: #17322a; --bad: #f28b82; --good: #81c995; --lane: #e4e8ee; --road: #3a424e; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16px; line-height: 1.55; }
+.wrap { max-width: 920px; margin: 0 auto; padding-block: 32px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 48px; }
+header { display: grid; gap: 10px; border-bottom: 6px solid var(--signal); padding-bottom: 20px; }
+.eyebrow { font-family: var(--f-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; line-height: 1.05; }
+h1 { font-size: clamp(40px, 7vw, 64px); font-weight: 700; letter-spacing: .01em; }
+h2 { font-size: 32px; font-weight: 600; }
+h3 { font-size: 22px; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.lede { font-size: 18px; color: var(--muted); }
+.who { display: flex; flex-wrap: wrap; gap: 8px; }
+.tag { font-family: var(--f-mono); font-size: 12px; padding: 2px 8px; border-radius: 3px; white-space: nowrap; }
+.t-claude { background: var(--claude-soft); color: var(--claude); }
+.t-gemini { background: var(--gemini-soft); color: var(--gemini); }
+.t-carla { background: var(--carla-soft); color: var(--carla); }
+.t-user { background: var(--signal-soft); color: var(--signal); }
+section { display: grid; gap: 18px; }
+.mono { font-family: var(--f-mono); font-size: 13px; }
+code { font-family: var(--f-mono); font-size: .88em; background: var(--panel); border: 1px solid var(--rule); padding: 0 4px; border-radius: 3px; }
+
+/* Timeline */
+.timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; border-left: 2px solid var(--rule); }
+.timeline li { position: relative; padding: 0 0 22px 22px; display: grid; gap: 4px; min-width: 0; }
+.timeline li::before { content: ""; position: absolute; left: -7px; top: 6px; width: 12px; height: 12px; border-radius: 50%; background: var(--panel); border: 2px solid var(--signal); }
+.timeline .meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* Test runs table */
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); }
+table { border-collapse: collapse; width: 100%; min-width: 620px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--f-mono); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-family: var(--f-mono); }
+.pill { display: inline-block; font-family: var(--f-mono); font-size: 12px; padding: 1px 7px; border-radius: 10px; border: 1px solid currentColor; }
+.bad { color: var(--bad); } .good { color: var(--good); } .warn { color: var(--signal); }
+
+/* Sensor list */
+.sensors { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.sensor { background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.sensor .fail { font-size: 14px; color: var(--bad); }
+
+/* Diagram */
+figure { margin: 0; display: grid; gap: 8px; }
+.diagram { background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 12px; overflow-x: auto; }
+.diagram svg { width: 100%; min-width: 560px; height: auto; display: block; }
+figcaption { font-size: 14px; color: var(--muted); max-width: 72ch; }
+
+/* Proposals as road-sign plates */
+.plates { display: grid; gap: 16px; }
+.plate { background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; display: grid; grid-template-columns: 64px 1fr; min-width: 0; }
+.rank { background: var(--asphalt); color: var(--signal); font-family: var(--f-display); font-size: 40px; font-weight: 700; display: grid; place-items: center; border-radius: 3px 0 0 3px; }
+.plate-body { padding: 14px 18px 16px; display: grid; gap: 8px; min-width: 0; }
+.plate-head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; justify-content: space-between; }
+dl { margin: 0; display: grid; grid-template-columns: 110px 1fr; gap: 4px 14px; font-size: 15px; }
+dt { font-family: var(--f-mono); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding-top: 3px; }
+dd { margin: 0; min-width: 0; }
+.status { font-family: var(--f-mono); font-size: 12px; padding: 2px 8px; border-radius: 3px; border: 1px solid var(--rule); color: var(--muted); }
+.status.doing { color: var(--signal); border-color: var(--signal); }
+.status.partial { color: var(--carla); border-color: var(--carla); }
+
+/* CARLA constants */
+.consts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.const { border-top: 3px solid var(--carla); background: var(--panel); padding: 10px 12px; display: grid; gap: 2px; }
+.const b { font-family: var(--f-mono); font-size: 18px; font-weight: 600; }
+.const span { font-size: 13px; color: var(--muted); }
+footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule); padding-top: 16px; }
+a { color: var(--gemini); }
+a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+@media (max-width: 520px) {
+  .plate { grid-template-columns: 1fr; }
+  .rank { border-radius: 3px 3px 0 0; font-size: 28px; padding: 4px 0; }
+  dl { grid-template-columns: 1fr; gap: 0 0; }
+  dd { margin-bottom: 8px; }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Real Traffic Fix · GTA San Andreas 1.0 US · atualizado 02/11/2026</span>
+    <h1>Sensores do Real Traffic Fix</h1>
+    <p class="lede">O que o Claude e o Gemini estão fazendo para os carros da IA enxergarem melhor o trânsito, com o CARLA como referência. O teste padrão é o Cadrona (handling editado, aceleração muito alta) com piloto rápido, de Grove Street até Bayside.</p>
+    <div class="who">
+      <span class="tag t-claude">Claude: código, testes no jogo, leitura dos logs</span>
+      <span class="tag t-gemini">Gemini 4 Argon: revisão de código e análise (via Antigravity)</span>
+      <span class="tag t-carla">CARLA: referência de projeto</span>
+    </div>
+  </header>
+
+  <section id="progresso">
+    <h2>Avanços</h2>
+    <ol class="timeline">
+      <li>
+        <div class="meta"><span class="mono">f614836</span><span class="tag t-claude">Claude</span></div>
+        <h3>Semáforo atuado conta quem espera pela posição</h3>
+        <p>O carro parado 90 s antes de Bayside esperava um verde que nunca vinha: o cruzamento só contava carros cujo próximo nó era ele. Agora conta pela posição do carro nas vias com semáforo.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">27fd8b7</span><span class="tag t-gemini">Gemini</span><span class="tag t-claude">Claude</span></div>
+        <h3>Revisão do Gemini nos semáforos: 2 de 4 achados confirmados</h3>
+        <p>Carros nas faixas externas perto da linha de retenção ficavam fora do cone de 37° e não contavam; vias com o semáforo um nó antes do cruzamento eram ignoradas. As duas correções entraram (projeção ao longo da via, busca do semáforo até 3 nós).</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">27fd8b7</span><span class="tag t-claude">Claude</span><span class="tag t-user">relato do usuário</span></div>
+        <h3>Controle com aceleração altíssima</h3>
+        <p>A 175 km/h numa curva o Cadrona escorregou e, nesse instante, o mod soltava o carro: o jogo dava 100% de gás com ele 50° de lado. Os auxílios agora seguem ativos no escorregamento, o controle de tração corta até 95% em curva e troca de faixa, o controle de estabilidade age a partir de ~5°, e o raio da curva vem do caminho real quando o carro escorrega.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">f2dec7e</span><span class="tag t-claude">Claude</span><span class="tag t-user">pedido do usuário</span></div>
+        <h3>Modo crashout e fotos de 6 ângulos</h3>
+        <p>Parado tempo demais, o piloto empurra para sair, mesmo batendo; a cada duas tentativas dá ré antes. O AutoTest fotografa o carro de teste de 6 ângulos quando ele fica 40 s parado.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">análise</span><span class="tag t-gemini">Gemini</span></div>
+        <h3>Gridlock de Grove: líder órfão</h3>
+        <p>O Gemini leu as cadeias de espera e apontou o primeiro carro parado sem ninguém à frente (veh#2563), que o detector de deadlock nunca pega por não haver ciclo. O crashout liberou esse mesmo carro no teste seguinte.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">453944e</span><span class="tag t-claude">Claude</span></div>
+        <h3>Crashout devagar, fila espera mais</h3>
+        <p>Com 80% de gás o Cadrona foi de 0 a 20 km/h em 0,3 s e bateu num carro dando ré. O empurrão agora vai até ~9 km/h, e carros na fila esperam 40 s para o da frente sair primeiro.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">em andamento</span><span class="tag t-gemini">Gemini</span><span class="tag t-claude">Claude</span><span class="tag t-carla">CARLA</span></div>
+        <h3>Estudo dos sensores com base no CARLA</h3>
+        <p>Proposta de trocar os raios por uma lista de veículos projetada na rota, envelopes ao longo do caminho e negociação de conflito em cruzamentos. Detalhes abaixo.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section id="testes">
+    <h2>Testes no jogo</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Teste</th><th>Resultado</th><th class="num">Percorrido</th><th class="num">Colisões do carro</th><th>O que aconteceu</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">191902</td><td><span class="pill bad">falhou</span></td><td class="num">7,42 km</td><td class="num">2</td><td>Parado 90 s num vermelho a 1,78 km do fim</td></tr>
+          <tr><td class="mono">081411</td><td><span class="pill bad">falhou</span></td><td class="num">4,08 km</td><td class="num">4</td><td>Rodou a 175 km/h numa curva da rodovia, atingido a 149 km/h</td></tr>
+          <tr><td class="mono">082034</td><td><span class="pill bad">falhou</span></td><td class="num">0,40 km</td><td class="num">5</td><td>Gridlock em Grove: 60 carros em 120 m, 3 andando</td></tr>
+          <tr><td class="mono">082622</td><td><span class="pill warn">interrompido</span></td><td class="num">10,40 km</td><td class="num">2</td><td>Melhor até agora; crashout a 80% de gás bateu a 290 m de Bayside</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="sensores">
+    <h2>Como os carros enxergam hoje</h2>
+    <p>Cada carro dispara raios contra a colisão do mundo (<code>CWorld::ProcessLineOfSight</code>). O primeiro veículo atingido vira o líder. Funciona bem em reta; o problema está em curvas, cruzamentos e trocas de faixa.</p>
+    <div class="sensors">
+      <div class="sensor"><h3>Raios para frente</h3><p>Pedaços de 25 m seguindo o terreno, desviados pelo ângulo do volante, mais dois raios laterais que abrem com a velocidade.</p><p class="fail">Em curva o raio sai reto e acerta o carro da faixa vizinha; um carro parado a 37 m numa curva foi perdido.</p></div>
+      <div class="sensor"><h3>Filtro de outra faixa</h3><p>Ignora um carro paralelo, a menos de 40 m, na mesma velocidade, afastado de lado. A curvatura vem do yaw rate.</p><p class="fail">Heurística: estimar a curva pelo giro do carro erra metros a 40 m.</p></div>
+      <div class="sensor"><h3>SideClear</h3><p>Três raios para o lado na troca de faixa: frente, meio e trás.</p><p class="fail">Um carro entre dois raios passa sem ser visto: toques laterais nas trocas.</p></div>
+      <div class="sensor"><h3>Proteção de cruzamento</h3><p>Olha o tráfego cruzando e limita a velocidade de entrada; regra da caixa para veículos longos.</p><p class="fail">Colisões "low-speed squeeze" e "virando num carro parado".</p></div>
+    </div>
+    <figure>
+      <div class="diagram" role="img" aria-label="Comparação: raio reto acertando o carro da faixa vizinha numa curva, contra um corredor que segue a faixa">
+        <svg viewBox="0 0 640 240" xmlns="http://www.w3.org/2000/svg">
+          <path d="M20 220 Q 330 220 620 40" fill="none" stroke="var(--road)" stroke-width="64" stroke-linecap="butt"/>
+          <path d="M20 220 Q 330 220 620 40" fill="none" stroke="var(--lane)" stroke-width="2" stroke-dasharray="12 10"/>
+          <path d="M70 235 Q 340 236 610 60" fill="none" stroke="var(--gemini)" stroke-width="18" stroke-opacity=".35"/>
+          <line x1="96" y1="236" x2="470" y2="205" stroke="var(--bad)" stroke-width="2.5"/>
+          <rect x="62" y="226" width="34" height="18" rx="3" fill="var(--signal)"/>
+          <rect x="455" y="190" width="34" height="18" rx="3" fill="var(--muted)" transform="rotate(-18 472 199)"/>
+          <rect x="520" y="140" width="34" height="18" rx="3" fill="var(--fg)" transform="rotate(-33 537 149)"/>
+          <text x="64" y="218" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--fg)">nosso carro</text>
+          <text x="300" y="196" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--bad)">raio: acerta a faixa vizinha</text>
+          <text x="404" y="168" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">faixa vizinha</text>
+          <text x="470" y="110" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--fg)">líder real</text>
+          <text x="150" y="20" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--gemini)">corredor na rota (proposta 1): segue a faixa</text>
+          <line x1="300" y1="26" x2="360" y2="218" stroke="var(--gemini)" stroke-width="1" stroke-dasharray="3 3"/>
+        </svg>
+      </div>
+      <figcaption>Na curva, o raio do volante sai reto e encontra primeiro o carro da faixa vizinha. Um corredor construído sobre a rota planejada acompanha a faixa e acha o líder certo.</figcaption>
+    </figure>
+  </section>
+
+  <section id="carla">
+    <h2>O que o CARLA faz diferente</h2>
+    <p>O Traffic Manager do CARLA não usa raios para achar outros veículos. Ele mantém um registro de todos os carros (posição e velocidade num cache por frame) e roda, para cada um, em ordem: localização (um buffer de pontos do caminho à frente, maior quanto mais rápido), colisão, semáforo, planejador de movimento com PID e luzes.</p>
+    <p>No estágio de colisão, a caixa do carro é esticada ao longo do caminho futuro, formando um polígono que acompanha a faixa (a "fronteira geodésica"). Há perigo quando o polígono de um carro toca o de outro; a negociação decide quem cede por quem está mais perto do caminho do outro e pelo ângulo de aproximação. Um "lock" mantém o mesmo líder entre frames.</p>
+    <div class="consts">
+      <div class="const"><b>2,5 + (0,36·v)²</b><span>extensão da caixa (m), v em m/s: 9 m a 36 km/h, 46 m a 72 km/h</span></div>
+      <div class="const"><b>20 + 2,65·v</b><span>raio de busca de candidatos (m)</span></div>
+      <div class="const"><b>4 m</b><span>diferença de altura máxima entre candidatos</span></div>
+      <div class="const"><b>10°</b><span>nova quina no polígono quando a rota vira mais que isso</span></div>
+      <div class="const"><b>15 + 2·v</b><span>horizonte do buffer de caminho (m); 4·v em alta velocidade</span></div>
+      <div class="const"><b>20 m</b><span>distância mínima para troca de faixa</span></div>
+    </div>
+    <p class="mono">Fontes: <a href="https://carla.readthedocs.io/en/latest/adv_traffic_manager/">Traffic Manager</a>, <a href="https://github.com/carla-simulator/carla/blob/master/LibCarla/source/carla/trafficmanager/CollisionStage.cpp">CollisionStage.cpp</a>, <a href="https://github.com/carla-simulator/carla/blob/master/LibCarla/source/carla/trafficmanager/Constants.h">Constants.h</a>, <a href="https://carla.readthedocs.io/en/latest/ref_sensors/">sensores</a>.</p>
+  </section>
+
+  <section id="propostas">
+    <h2>Propostas, por impacto e custo</h2>
+    <p>Ordem combinada do Gemini e do Claude. Nenhuma foi implementada ainda; os raios continuam para prédios e objetos.</p>
+    <div class="plates">
+      <article class="plate">
+        <div class="rank">1</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Líder pela rota, não pelo raio</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Registro dos ~100 carros num grid espacial. Os candidatos dos próximos 60 m são projetados na rota planejada em coordenadas de Frenet (distância ao longo da rota e desvio lateral). O líder é o mais próximo à frente cujo desvio cabe na nossa faixa.</dd>
+            <dt>Do CARLA</dt><dd>Registro de veículos, buffer de caminho da localização, mapa em memória.</dd>
+            <dt>Resolve</dt><dd>Carro da faixa vizinha como líder em curva; carro parado perdido em curva.</dd>
+            <dt>Custo</dt><dd>Algumas dezenas de produtos escalares por carro; menos que os raios de hoje.</dd>
+            <dt>Risco</dt><dd>Pedestres e objetos não estão no registro: um raio curto continua para eles.</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #1</span><span class="tag t-claude">Claude</span></div>
+        </div>
+      </article>
+      <article class="plate">
+        <div class="rank">2</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Troca de faixa pela lista de veículos</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Em vez de três raios, procurar na faixa de destino o carro à frente e o de trás (de 30 m atrás a 25 m à frente) e só trocar se os dois intervalos tiverem tempo até colisão acima de 2,5 s e a frenagem imposta ao carro de trás (pelo IDM+) ficar abaixo de 2 m/s², no estilo MOBIL. Durante a troca, reservar espaço nas duas faixas e abortar se alguém entrar no envelope.</dd>
+            <dt>Do CARLA</dt><dd>Localização olhando faixa de origem e destino; distância mínima de troca.</dd>
+            <dt>Resolve</dt><dd>Carros entre os raios do SideClear: toques laterais nas ultrapassagens.</dd>
+            <dt>Risco</dt><dd>Moto fora da faixa pode escapar da projeção.</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #5</span><span class="tag t-claude">Claude</span></div>
+        </div>
+      </article>
+      <article class="plate">
+        <div class="rank">3</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Não entrar sem espaço de saída</h3><span class="status partial">parcial</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Antes da linha de retenção, mesmo no verde, olhar os primeiros 20 m depois do cruzamento na nossa saída. Se o último carro ali está quase parado e não cabe o nosso comprimento mais 2,5 m, parar na linha como se houvesse um líder.</dd>
+            <dt>Do CARLA</dt><dd>Estágio de semáforo e colisão na entrada do cruzamento.</dd>
+            <dt>Resolve</dt><dd>Bloqueio da caixa e gridlocks como o de Grove.</dd>
+            <dt>Hoje</dt><dd>Já existe a regra da caixa para veículos acima de 7 m; falta para todos e usando a lista de veículos.</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #3</span></div>
+        </div>
+      </article>
+      <article class="plate">
+        <div class="rank">4</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Envelope ao longo do caminho</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Uma sequência de caixas orientadas, do tamanho real do carro, ao longo da rota (comprimento 2,5 + (0,36·v)² como no CARLA). Testar sobreposição com as caixas atuais e previstas (1,2 s) dos vizinhos. O ponto de contato vira o gap do IDM+.</dd>
+            <dt>Do CARLA</dt><dd>Fronteira geodésica do estágio de colisão.</dd>
+            <dt>Resolve</dt><dd>Raios finos passando entre quinas: "low-speed squeeze" e virar num carro parado.</dd>
+            <dt>Risco</dt><dd>Margem lateral grande demais trava conversões em rua estreita com carro estacionado na esquina.</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #2</span><span class="tag t-carla">CARLA</span></div>
+        </div>
+      </article>
+      <article class="plate">
+        <div class="rank">5</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Quem passa primeiro no ponto de conflito</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Para carros no mesmo cruzamento, achar onde as rotas se cruzam e quando cada um ocupa esse ponto. Se os intervalos ficam a menos de 1,5 s, um só vence: quem já se comprometeu, depois reto antes de direita antes de esquerda, depois quem chega antes. O outro para 2 m antes.</dd>
+            <dt>Do CARLA</dt><dd><code>NegotiateCollision</code>: prioridade por distância ao caminho do outro e por ângulo.</dd>
+            <dt>Resolve</dt><dd>Hesitação mútua e avanço simultâneo nos cruzamentos.</dd>
+            <dt>Risco</dt><dd>Se o vencedor travar no ponto, quem cedeu precisa de um tempo limite (o crashout cobre).</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #4</span><span class="tag t-carla">CARLA</span></div>
+        </div>
+      </article>
+      <article class="plate" id="p6">
+        <div class="rank">6</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Trava de líder entre frames</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Quando um perigo é confirmado, guardar o líder e a distância e só soltar quando ele sai do envelope, como o "collision lock" do CARLA. Hoje há uma memória de um líder por pouco tempo.</dd>
+            <dt>Do CARLA</dt><dd>Collision locks do estágio de colisão.</dd>
+            <dt>Resolve</dt><dd>Líder que some por um frame e o carro acelera para dentro dele.</dd>
+          </dl>
+          <div class="who"><span class="tag t-claude">Claude</span><span class="tag t-carla">CARLA</span></div>
+        </div>
+      </article>
+      <article class="plate">
+        <div class="rank">7</div>
+        <div class="plate-body">
+          <div class="plate-head"><h3>Sensores em turnos</h3><span class="status">planejada</span></div>
+          <dl>
+            <dt>Ideia</dt><dd>Dividir os carros em 4 grupos: cada grupo faz a busca completa (líder, cruzamento, troca de faixa) a cada 4 frames; nos outros, só atualiza a distância ao líder guardado e o IDM+. Libera CPU para as propostas 1, 2 e 4.</dd>
+            <dt>Do CARLA</dt><dd>ALSM, o gerenciador do ciclo de vida e do estado dos agentes.</dd>
+            <dt>Resolve</dt><dd>Custo por frame com ~100 carros. O Gemini também sugeriu afrouxar a margem lateral de carros presos; o crashout já cobre esse caso.</dd>
+            <dt>Risco</dt><dd>Até 3 frames (~50 ms) para notar alguém entrando na faixa; invalidar o grupo quando a reserva de faixa muda.</dd>
+          </dl>
+          <div class="who"><span class="tag t-gemini">Gemini #6</span></div>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section id="proximos">
+    <h2>Próximos passos</h2>
+    <ol>
+      <li>Implementar a proposta 1 atrás de uma opção no ini, rodando lado a lado com os raios e registrando quando os dois discordam.</li>
+      <li>Pedir ao Gemini a revisão do código novo antes do teste.</li>
+      <li>Teste do Cadrona de Grove a Bayside; comparar colisões por minuto e casos de líder errado com os testes acima.</li>
+      <li>Seguir para as propostas 2 e 3.</li>
+    </ol>
+  </section>
+
+  <footer>Repositório: <a href="https://github.com/brenoteles/GTA-SA-Better-Driving-IA">brenoteles/GTA-SA-Better-Driving-IA</a>. Este arquivo fica em <code>docs/sensores.html</code> e é atualizado a cada avanço.</footer>
+</div>
