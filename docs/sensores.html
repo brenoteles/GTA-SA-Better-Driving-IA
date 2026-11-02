@@ -194,7 +194,22 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <li>
         <div class="meta"><span class="mono">b688d04</span><span class="tag t-claude">Claude</span></div>
         <h3>Jogo congelando: vigia no mod</h3>
-        <p>O jogo congelou duas vezes (testes 085846 e 100429) sem nada no log. O mod agora marca a etapa que está rodando e, se passarem 5 s sem frame, grava onde parou em <code>RealTrafficFix.watchdog.txt</code>.</p>
+        <p>O jogo congelou duas vezes (testes 085846 e 100429) sem nada no log. O mod agora marca a etapa que está rodando e, se passarem 5 s sem frame, grava onde parou em <code>RealTrafficFix.watchdog.txt</code>. Nos três testes seguintes não houve congelamento.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">c47a2ea</span><span class="tag t-user">relato do usuário</span><span class="tag t-claude">Claude</span></div>
+        <h3>Postes viraram obstáculo: erguidos 5,5 m</h3>
+        <p>Os postes novos apareceram no jogo, mas muitos no meio da rua. Solução temporária: todos 5,5 m acima da via, com a base acima de qualquer veículo e o semáforo flutuando sobre o cruzamento. A posição definitiva fica para depois.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">57aecf7</span><span class="tag t-user">relato do usuário</span><span class="tag t-claude">Claude</span></div>
+        <h3>IA tirando o pé por causa do carro ao lado</h3>
+        <p>A proteção do lado de fora da curva, feita para curvas de cruzamento, disparava em qualquer curva suave de rodovia: com um carro na faixa da esquerda, gás em 15% e freio em 35%, e a ultrapassagem não acontecia. Agora só vale em curva de raio menor que 45 m ou em baixa velocidade, e só freia se o outro estiver a menos de 0,6 m. No teste seguinte as colisões caíram de 3,65 para 2,40/min, com 34 ultrapassagens iniciadas e 13 completas.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">A/B</span><span class="tag t-claude">Claude</span></div>
+        <h3>Líder pela rota: teste A/B</h3>
+        <p>Com a projeção corrigida a rota passou a julgar ~38 mil casos, e as colisões subiram em três testes seguidos. Mesmo código, só trocando quem decide: rota 2,40 colisões/min e 5 do carro de teste; raios 3,66/min e 8. A alta era variação entre rodadas; a rota fica.</p>
       </li>
       <li>
         <div class="meta"><span class="mono">092740</span><span class="tag t-claude">Claude</span></div>
@@ -222,6 +237,9 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">085011</td><td><span class="pill good">chegou</span></td><td class="num">10,63 km</td><td class="num">1</td><td>Líder pela rota: 7,19 min, 89 km/h de média, 1,25 colisões/min no tráfego (antes 1,9 a 4). Rota e raios discordaram 309 vezes; a rota só julgou ~3% dos casos</td></tr>
           <tr><td class="mono">085846</td><td><span class="pill warn">travou</span></td><td class="num">10,47 km</td><td class="num">20</td><td>Versão revisada pelo Gemini; jogo congelou a 291 m do fim, 11,8 colisões/min no tráfego. Tratado como azar</td></tr>
           <tr><td class="mono">091623</td><td><span class="pill warn">parado</span></td><td class="num">10,49 km</td><td class="num">2</td><td>Proposta 2; caminhão nasceu dentro do morro na descida de Bayside e a fila travou a 291 m do fim. 2,9 colisões/min</td></tr>
+          <tr><td class="mono">113705</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">2</td><td>Postes erguidos, projeção corrigida: 7,67 min, 83 km/h, 3,65 colisões/min, sem congelar</td></tr>
+          <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
+          <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
           <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
         </tbody>
       </table>
@@ -276,12 +294,12 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 
   <section id="propostas">
     <h2>Propostas, por impacto e custo</h2>
-    <p>Ordem combinada do Gemini e do Claude. Nenhuma foi implementada ainda; os raios continuam para prédios e objetos.</p>
+    <p>Ordem combinada do Gemini e do Claude. As propostas 1 e 2 já estão no jogo; os raios continuam para prédios e objetos.</p>
     <div class="plates">
       <article class="plate">
         <div class="rank">1</div>
         <div class="plate-body">
-          <div class="plate-head"><h3>Líder pela rota, não pelo raio</h3><span class="status doing">no jogo, em ajuste</span></div>
+          <div class="plate-head"><h3>Líder pela rota, não pelo raio</h3><span class="status partial">no jogo, validada no A/B</span></div>
           <dl>
             <dt>Ideia</dt><dd>Registro dos ~100 carros num grid espacial. Os candidatos dos próximos 60 m são projetados na rota planejada em coordenadas de Frenet (distância ao longo da rota e desvio lateral). O líder é o mais próximo à frente cujo desvio cabe na nossa faixa.</dd>
             <dt>Do CARLA</dt><dd>Registro de veículos, buffer de caminho da localização, mapa em memória.</dd>
@@ -460,14 +478,13 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <li>A regra de posição (canto direito, além da borda da rua transversal + 3 m, 1 m fora da pista) caiu a menos de 8 m de um poste original em 1.385 casos. Esses ficaram só com o original.</li>
       <li>Foram criados <b>2.560 postes</b> com o modelo da cidade (MTraffic1 em LS, CJ_TRAFFIC_LIGHT4/5 em SF e LV), em pé (o jogo não acende poste inclinado) e nunca em cima de outra rua.</li>
       <li>Instalados como mod do modloader: o IPL e um <code>gta.dat</code> com uma linha a mais. Sem essa linha o modloader ignora o IPL.</li>
-      <li>Falta conferir no jogo a altura e a direção dos postes novos.</li>
+      <li>No jogo os postes apareceram, mas muitos no meio da rua: a borda da pista calculada pelos dados das faixas não bate com a rua desenhada. Por enquanto estão erguidos 5,5 m, flutuando sobre o cruzamento; a posição definitiva fica para depois.</li>
     </ul>
   </section>
 
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Teste no jogo com os postes novos e o vigia de congelamento.</li>
       <li>Ver na rodada corrigida do SUMO onde ainda há espera e propor mudanças de via (ligar armadilhas, faixas em encontros de rampa), medindo cada uma contra a base.</li>
       <li>Depois, proposta 3.</li>
     </ol>
