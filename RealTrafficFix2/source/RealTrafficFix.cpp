@@ -222,6 +222,11 @@ public:
     float accelLimit = 0.0f;      // m/s2, 0 = no limit
     float closeUpTarget = -1.0f;  // m/s, creeping up to a stopped vehicle in a queue (< 0: not)
     float measAccel = 0.0f;       // m/s2 along the forward, smoothed
+    // The leader's acceleration (openpilot radard): its speed along ours, differentiated and smoothed
+    CVehicle* accLeader = nullptr;
+    float accLeaderSpeed = 0.0f, leaderAccel = 0.0f;
+    unsigned int accLeaderTime = 0;
+    unsigned char fcwTicks = 0;
     float prevFwdSpeed = 0.0f;
     unsigned int prevFwdFrame = 0;
     float gasTrim = 0.0f;         // gas above the cruise gas that gives accelLimit
@@ -406,6 +411,11 @@ static float cfgJunctionGripFactor = 0.75f;      // x the curve grip in junction
 static bool cfgV2VOvertakes = true;              // overtakes planned with every car's position/speed/intent
 static bool cfgTurnSideGuard = true;             // turning: watch the outside of the turn for vehicles there
 static int turnGuardCount = 0, boxWaitCount = 0, firstComeWaitCount = 0, lowSpeedBrakeCount = 0, bypassScrapeCount = 0;
+// From openpilot: the leader's acceleration (radard's aLeadK, extrapolated with aLeadTau) in the following and a forward
+// collision warning; the acceleration ceiling falling with speed (A_CRUISE_MAX)
+static bool cfgLeadAccel = true;
+static bool cfgAccelBySpeed = true;
+static int fcwCount = 0, boxWaitRouteCount = 0;
 static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0, brokenLightCount = 0;
 // Crashout: a driver stopped too long (a jam that never clears, wedged after a crash) goes for it, hitting what's in the way
 static bool cfgCrashout = true;
@@ -2840,6 +2850,30 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
                         veh->GetColModel()->m_boundBox.m_vecMin.y : 5.0f, 4.0f);
                     const float exitStart = std::max(6.0f, exitLanes * LANE_WIDTH * 0.5f + 3.0f);
                     bool boxBlocked = false;
+                    // Along the route past the junction too, piece by piece (the straight line from the junction missed a
+                    // queue round a bend or past a short first piece). Proposal 3 (CARLA's junction entrance check)
+                    const float need = exitStart + carLen * (carLen > 7.0f ? 1.5f : 1.0f) + 8.0f;
+                    for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && !boxBlocked; k++) {
+                        CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
+                        if (!o || o == veh || std::abs(o->GetPosition().z - xdata.path[j].z) > 4.0f) continue;
+                        if (o->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS > 3.0f) continue;
+                        const CVector2D op = o->GetPosition().To2D();
+                        if ((op - junctionPos).MagnitudeSqr() > (need + 10.0f) * (need + 10.0f)) continue;
+                        float along = 0.0f;
+                        for (int q = j; q + 1 < count && along < need; q++) {
+                            CVector2D a = xdata.path[q].To2D(), d = xdata.path[q + 1].To2D() - a;
+                            const float len = d.Magnitude();
+                            if (len < 0.5f || !xdata.pathLinkOk[q]) break;
+                            d *= 1.0f / len;
+                            const float t = CVector2D::Dot(op - a, d);
+                            if (t >= 0.0f && t <= len && along + t >= exitStart && along + t <= need) {
+                                const float lf = CVector2D::Dot(op - xdata.pathLinkPos[q], CVector2D(d.y, -d.x)) / LANE_WIDTH - xdata.pathLaneOffset[q];
+                                const int lanesQ = LanesToward(xdata.pathLink[q], addrs[q + 1]);
+                                if (q > j && lf > -0.6f && lf < lanesQ - 0.4f) { boxBlocked = true; boxWaitRouteCount++; break; }
+                            }
+                            along += len;
+                        }
+                    }
                     for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && !boxBlocked; k++) {
                         CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
                         if (!o || o == veh || std::abs(o->GetPosition().z - xdata.path[j].z) > 4.0f) continue;
@@ -3831,6 +3865,8 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "LeadAccel", cfgLeadAccel);
+        ReadIniBool(ini, "AccelBySpeed", cfgAccelBySpeed);
         ReadIniBool(ini, "ListLaneChange", cfgListLaneChange);
         ReadIniFloat(ini, "LaneChangeMaxBackDecel", cfgLaneChangeMaxBackDecel);
         ReadIniInt(ini, "RouteLeader", cfgRouteLeader);
@@ -4268,6 +4304,17 @@ public:
                 if (xdata.accelLimit > 0.0f) xdata.accelLimit = std::max(xdata.accelLimit * cfgOvertakeAccelMult, cfgOvertakeMinAccel);
             }
         }
+        // The ceiling falls with speed (openpilot's A_CRUISE_MAX): x1 up to 12 m/s, 0.75 at 25, 0.5 at 35, 0.35 at 45. The
+        // edited Cadrona went past 150 km/h in seconds, faster than the sensors could react. Overtaking above 22 m/s: at
+        // most 1.6 x that (3.5 m/s2), never flat out
+        if (cfgAccelBySpeed && speedNow > 12.0f) {
+            const float f = speedNow < 25.0f ? Lerp(1.0f, 0.75f, (speedNow - 12.0f) / 13.0f) :
+                (speedNow < 35.0f ? Lerp(0.75f, 0.5f, (speedNow - 25.0f) / 10.0f) : Lerp(0.5f, 0.35f, std::min((speedNow - 35.0f) / 10.0f, 1.0f)));
+            const float base = std::min(prof.accel, FULL_THROTTLE_ACCEL) * roadAccel;
+            if (overtaking && speedNow > 22.0f) xdata.accelLimit = std::min(1.6f * base * f, 3.5f);
+            else if (!overtaking) xdata.accelLimit = (xdata.accelLimit > 0.0f ? xdata.accelLimit : base) * f;
+            accel = std::min(accel, std::max(base * f * (overtaking ? 1.6f : 1.0f), 0.5f));
+        }
         bool damageLimited = xdata.damageFactor < 1.0f;
         if (damageLimited) desiredLimiter = LIMIT_DAMAGE;
         desired *= xdata.damageFactor;
@@ -4516,11 +4563,34 @@ public:
             xdata.gap = std::max(xdata.gap - (speed - xdata.leaderSpeed) * dt, 0.1f);
         }
 
+        // The leader's acceleration (openpilot radard): its speed differentiated over time, smoothed; reset when the leader
+        // changes, physics spikes (crashes) ignored. Braking projected ~1 s ahead with openpilot's decay (tau 1.5 s:
+        // a * tau * (1 - e^(-1/tau)) = 0.73 a): we react to a hard brake before the speed difference shows it
+        float leaderSpeedEff = xdata.leaderSpeed;
+        if (cfgLeadAccel && xdata.obstacle == OBSTACLE_VEHICLE && xdata.leaderVeh) {
+            const unsigned int nowMs = CTimer::m_snTimeInMilliseconds;
+            if (xdata.leaderVeh != xdata.accLeader || nowMs - xdata.accLeaderTime > 500) {
+                xdata.accLeader = xdata.leaderVeh;
+                xdata.leaderAccel = 0.0f;
+                xdata.fcwTicks = 0;
+            }
+            else if (nowMs - xdata.accLeaderTime >= 50) {
+                const float a = (xdata.leaderSpeed - xdata.accLeaderSpeed) / ((nowMs - xdata.accLeaderTime) / 1000.0f);
+                if (std::abs(a) < 12.0f) xdata.leaderAccel += (a - xdata.leaderAccel) * 0.25f;
+            }
+            if (nowMs - xdata.accLeaderTime >= 50 || xdata.accLeader != xdata.leaderVeh) {
+                xdata.accLeaderSpeed = xdata.leaderSpeed;
+                xdata.accLeaderTime = nowMs;
+            }
+            if (xdata.leaderAccel < -0.5f) leaderSpeedEff = std::max(xdata.leaderSpeed + xdata.leaderAccel * 0.73f, 0.0f);
+        }
+        else xdata.accLeader = nullptr;
+
         // Intelligent Driver Model: acceleration wanted for the free road plus the interaction with the obstacle ahead
         float v = speed;
         float accelWanted = accel * (1.0f - std::pow(std::min(v / desired, 2.0f), 4.0f));
         if (xdata.obstacle != OBSTACLE_NONE) {
-            float dv = v - xdata.leaderSpeed;
+            float dv = v - leaderSpeedEff;
             // Freeways and fast roads: closer (HighwayGapFactor of the time gap, at least 0.3 s), as on real freeways
             const bool fastRoadGap = xdata.roadType == ROAD_HIGHWAY || xdata.roadType == ROAD_FAST;
             // Getting ready to overtake: 40-60% of the following gap (at least 0.25 s), like a driver closing up before
@@ -4576,10 +4646,21 @@ public:
         // (32 m at 72 km/h, 72 m at 108): cars hung far back. At the same speed this allows following close (the IDM sets
         // the distance); towards a stopped one it's as before (assuming 6 m/s2 there, cars rear-ended queues at lights)
         if (xdata.obstacle == OBSTACLE_VEHICLE || xdata.obstacle == OBSTACLE_PED) {
-            const float b = std::min(decel * 1.2f, 4.5f), vL = std::max(xdata.leaderSpeed, 0.0f);
+            const float b = std::min(decel * 1.2f, 4.5f), vL = std::max(leaderSpeedEff, 0.0f);
             float stopCap = std::sqrt(vL * vL + 2.0f * b * std::max(xdata.gap - minGap - v * 0.2f, 0.0f));
             if (stopCap < target) {
                 target = stopCap;
+                xdata.limiter = LIMIT_LEADER;
+            }
+            // Forward collision warning (openpilot: crash_cnt > 2, "radar is glitchy"): the leader braking over 3 m/s2 and
+            // less than 1.8 s to reach it, seen on 2 readings in a row: down to its projected speed right away
+            const float closing = v - std::max(xdata.leaderSpeed, 0.0f);
+            const bool fcwNow = cfgLeadAccel && xdata.obstacle == OBSTACLE_VEHICLE && xdata.leaderAccel < -3.0f && closing > 0.5f &&
+                xdata.gap / closing < 1.8f;
+            xdata.fcwTicks = fcwNow ? static_cast<unsigned char>(std::min(xdata.fcwTicks + 1, 10)) : 0;
+            if (xdata.fcwTicks >= 2) {
+                if (xdata.fcwTicks == 2) fcwCount++;
+                target = std::min(target, std::max(vL - 1.0f, 0.0f));
                 xdata.limiter = LIMIT_LEADER;
             }
         }

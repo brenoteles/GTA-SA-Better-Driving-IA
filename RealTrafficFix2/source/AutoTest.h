@@ -1275,7 +1275,8 @@ void Update() {
         out << Format("cars created where they'd be hit and couldn't go with the traffic, removed: %d\n", spawnRemovedCount);
         out << Format("handbrake turns: %d\n", handbrakeTurnCount);
         out << Format("turns tightened for a vehicle on the outside: %d\n", turnGuardCount);
-        out << Format("waited before a junction (the road beyond it full): %d\n", boxWaitCount);
+        out << Format("waited before a junction (the road beyond it full): %d (found along the route past the first piece: %d)\n", boxWaitCount, boxWaitRouteCount);
+        out << Format("forward collision warnings (leader braking > 3 m/s2, < 1.8 s to it, openpilot): %d\n", fcwCount);
         out << Format("waited their turn at a junction without lights (first come, first served): %d\n", firstComeWaitCount);
         out << Format("low-speed full brakes behind a vehicle: %d\n", lowSpeedBrakeCount);
         out << Format("bypasses given up (rubbing against a vehicle): %d\n", bypassScrapeCount);
