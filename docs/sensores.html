@@ -493,10 +493,66 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     </ul>
   </section>
 
+  <section id="largura">
+    <h2>Medindo a pista de verdade, sem dirigir</h2>
+    <p>O SUMO apontou gargalos em San Fierro e o Gemini propôs mais faixas. Os dados de rua não dizem se o asfalto comporta isso: o campo de largura é 0 em 48.734 dos trechos de 2 faixas. Rodar o mapa inteiro de carro para medir levaria horas e só veria as ruas por onde passasse.</p>
+    <h3>O método</h3>
+    <ol>
+      <li>As colisões do mapa estão nos arquivos <code>.col</code> dentro do <code>gta3.img</code>: cada triângulo tem um material (asfalto, calçada, grama…), com os IDs na ordem do <code>data/surfinfo.dat</code>.</li>
+      <li>Cada peça de colisão vai para o mundo pela posição e rotação das instâncias dos IPL (os de texto e os binários do <code>gta3.img</code>), casando o nome do modelo pelos IDE.</li>
+      <li>Para cada trecho de rua, uma linha atravessando a pista a cada 0,5 m, até 25 m de cada lado: em cada ponto, a superfície mais alta perto da altura da rua e o seu material.</li>
+      <li>A pista é a faixa contínua de superfície de rua em volta do centro, na mesma altura (um degrau de mais de 0,5 m é mureta ou a borda do viaduto), tolerando falhas de até 1 m.</li>
+    </ol>
+    <p>Tudo fora do jogo, com <code>tools/sa_col.py</code> e <code>tools/road_width.py</code>: a região de San Fierro (377 trechos) sai em 1 segundo.</p>
+    <h3>O que apareceu no caminho</h3>
+    <ul>
+      <li>Na primeira rodada só 32% dos trechos tinham asfalto sob o centro. O perfil de materiais atravessando as ruas mostrou o motivo: San Fierro constrói as ruas com o material 0 (DEFAULT) e as calçadas com PAVEMENT. Com o 0 contado como rua, 99% dos trechos foram medidos.</li>
+      <li>As duas convenções de rotação dos IPL deram o mesmo resultado na região: as peças de rua de SF são quase todas alinhadas aos eixos. A convenção certa ainda precisa ser confirmada numa região com ruas diagonais.</li>
+    </ul>
+    <h3>San Fierro: o que cabe</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Trecho</th><th>Faixas nos dados</th><th class="num">Asfalto medido</th><th>Conclusão</th></tr></thead>
+      <tbody>
+        <tr><td>Avenida em x = −1899 (y 616 a 744)</td><td>1 + 1</td><td class="num">15 m entre calçadas</td><td><span class="pill bad">não cabe</span> 2 + 2 exigiria 21,6 m (faixa do jogo: 5,4 m)</td></tr>
+        <tr><td>Rua em y = 731</td><td>1 + 1</td><td class="num">15 m</td><td><span class="pill bad">não cabe</span> mesmo caso</td></tr>
+        <tr><td>Fim da rampa da ponte (−1827, 402)</td><td>1, mão única</td><td class="num">14 m</td><td><span class="pill good">cabem 2</span> 10,8 m</td></tr>
+        <tr><td>Deck da Garver Bridge e rampa</td><td>2 por sentido</td><td class="num">até 41 m</td><td><span class="pill warn">indefinido</span> os dois sentidos são uma laje só; falta detectar as muretas</td></tr>
+      </tbody></table></div>
+    <p>Ou seja: a proposta do Gemini de dobrar as faixas das avenidas de SF poria carros na calçada. O que dá para fazer é a segunda faixa no fim da rampa.</p>
+    <h3>O mapa inteiro em 13 segundos</h3>
+    <div class="consts">
+      <div class="const"><b>24.603</b><span>trechos medidos, de 29.808 (83%), com 1,24 milhão de triângulos de colisão</span></div>
+      <div class="const"><b>3.821</b><span>trechos com asfalto para mais uma faixa de 5,4 m (2.879 de mão única), com as duas bordas encontradas</span></div>
+      <div class="const"><b>1.792</b><span>trechos com mais faixa nos dados que asfalto: quase todos ruas 1+1 com menos de 9,8 m</span></div>
+    </div>
+    <ul>
+      <li><b>Convenção de rotação resolvida pelos dados:</b> com o quaternion do IPL conjugado, 70% dos trechos acharam rua embaixo; sem conjugar, 64%. Fica o conjugado.</li>
+      <li><b>Estradas de terra:</b> no interior a rua é DIRTTRACK (27) e DIRT (26); passaram a contar como pista.</li>
+      <li><b>Rotas de barco</b> (altura 0, sobre a água) estavam sendo medidas e foram tiradas; o que sobra sem superfície fica em boa parte nos aeroportos.</li>
+      <li><b>Ruas estreitas demais para os dados:</b> nos 1.792 trechos o jogo manda a IA andar com o centro da faixa a 2,7 m do meio, além do meio-fio. Pode ser parte da invasão de calçada relatada antes; a correção é o mod puxar a faixa para dentro do asfalto medido.</li>
+    </ul>
+    <p>Ela também resolve os postes: eles caíram no meio da rua porque a borda foi calculada pelas faixas dos dados. Com a borda real do asfalto, cada poste pode ir logo depois do meio-fio.</p>
+    <div class="who"><span class="tag t-claude">Claude: leitor de colisões, medição, análise</span><span class="tag t-gemini">Gemini: pedido de conferência do formato COL e da rotação dos IPL (a primeira tentativa foi bloqueada por permissão; acesso ampliado)</span><span class="tag t-user">ideia do usuário: não dirigir o mapa inteiro</span></div>
+  </section>
+
+  <section id="fla">
+    <h2>fastman92 limit adjuster</h2>
+    <p>Ferramenta trazida pelo usuário (v6.5). Foi extraída numa pasta separada e lida antes de qualquer instalação.</p>
+    <ul>
+      <li><b>Formato de rotas FLA4:</b> o endereço de ligação passa de 10 bits (até 1.024 por área, o limite que impediu adensar os nós) para 16 bits de ligação e 16 de área, com coordenadas de 32 bits. Com o patch ligado, os nós passam de 28 para 44 bytes, as ligações de 14 para 24 e o endereço de 2 para 4. O mod lê essas estruturas diretamente em dezenas de lugares, então adotar o formato exige adaptar o mod: é um projeto à parte.</li>
+      <li><b>Conflito:</b> o jogo já tem o Open Limit Adjuster aumentando os pools (veículos 400, objetos 10.000, prédios 100.000…). Dois ajustadores mexendo no mesmo limite é receita de crash, então o FLA só vale pelo que o outro não faz.</li>
+      <li><b>Depuração de rotas:</b> o FLA desenha os nós de rua no jogo. Útil para conferir no olho os semáforos, as faixas e a largura medida; será instalado só com isso ligado.</li>
+    </ul>
+  </section>
+
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Medir a largura real do asfalto no jogo (raios atravessando cada trecho, lendo o tipo de superfície) para saber onde cabe mais faixa; só então aplicar as mudanças de faixa de SF e medir no SUMO.</li>
+      <li>Nas 1.792 ruas estreitas: o mod puxa a faixa para dentro do asfalto medido (carros fora da calçada).</li>
+      <li>Faixas extras: testar primeiro no SUMO as 2.879 de mão única com espaço, depois no jogo.</li>
+      <li>Segunda faixa no fim da rampa da Garver Bridge e medir no SUMO contra a base.</li>
+      <li>Postes na borda real do asfalto, saindo do modo flutuante.</li>
+      <li>Instalar o fastman92 só com a depuração de rotas e conferir no jogo.</li>
       <li>Ligar as armadilhas (aeroportos, Doherty) onde o asfalto existe.</li>
       <li>openpilot D, E e F: aceleração planejada com limite de jerk, estados de para e anda, volante sem chicotada.</li>
     </ol>
