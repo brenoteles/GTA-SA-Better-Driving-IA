@@ -1442,12 +1442,28 @@ static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsi
         for (int k = 0; k < jn->NumberAdjNodes; k++) {
             CNodeAddress nb = GetAdjacentNode(jn, junction, k);
             CPathNode* nn = GetNode(nb);
-            CCarPathLink* link = nn ? GetLinkBetween(junction, jn, nb) : nullptr;
-            if (!link || !link->m_nTrafficLightState) continue;
+            if (!nn) { sig.legsKnown = false; continue; } // not streamed in yet: look again later
             CVector2D d = GetNodePos(nn).To2D() - jp.To2D();
             float len = d.Magnitude();
-            if (len > 0.5f) sig.legs.push_back({ d * (1.0f / len), link->m_nTrafficLightState });
+            if (len < 0.5f) continue;
+            // The road's light: on the link at the junction, or a node or two up the road (the game's own lights often sit
+            // there; those roads never counted as waiting)
+            CNodeAddress prevA = junction, curA = nb;
+            CPathNode* prevN = jn;
+            CPathNode* curN = nn;
+            int cycle = 0;
+            for (int step = 0; step < 3 && curN; step++) {
+                CCarPathLink* link = GetLinkBetween(prevA, prevN, curA);
+                if (link && link->m_nTrafficLightState) { cycle = link->m_nTrafficLightState; break; }
+                if (curN->NumberAdjNodes != 2) break;
+                CNodeAddress nextA = GetAdjacentNode(curN, curA, 0);
+                if (nextA == prevA) nextA = GetAdjacentNode(curN, curA, 1);
+                prevA = curA; prevN = curN;
+                curA = nextA; curN = GetNode(curA);
+            }
+            if (cycle) sig.legs.push_back({ d * (1.0f / len), cycle });
         }
+        if (!sig.legsKnown) sig.legs.clear();
     }
     // Who's waiting/arriving: by where it is (the road it's on, the one whose direction from the junction is closest to
     // it) and that it's heading for the junction. By the cars' next node, the ones queued further back or with the light a
@@ -1460,11 +1476,16 @@ static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsi
         if (dist > 60.0f || dist < 3.0f || std::abs(jp.z - v->GetPosition().z) > 6.0f) continue;
         CVector2D out = rel * (1.0f / dist);
         if (CVector2D::Dot(v->GetForward().To2D(), out) > -0.5f) continue; // not heading for the junction
+        // On a road: along it from the junction and within ~3 lanes of its centre line, heading the opposite way to the
+        // road's direction out (an angle cone missed cars in the outer lanes close to the stop line)
         int c = 0;
-        float bestDot = 0.8f; // within ~37 degrees of a road
+        float bestAcross = 12.0f;
         for (const auto& leg : sig.legs) {
-            float dd = CVector2D::Dot(leg.first, out);
-            if (dd > bestDot) { bestDot = dd; c = leg.second; }
+            float along = CVector2D::Dot(leg.first, rel), across = std::abs(CVector2D::Cross(leg.first, rel));
+            if (along > 1.0f && across < bestAcross && CVector2D::Dot(v->GetForward().To2D(), leg.first) < -0.7f) {
+                bestAcross = across;
+                c = leg.second;
+            }
         }
         if (!c) continue;
         sig.demand[c]++;
@@ -2840,6 +2861,16 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
     // tyres turn the car far less than the wheels point (slip angle) and small corrections read as tight turns (0.2 rad at
     // 120 km/h = a 50 m radius, capped at ~60 km/h in a curve good for far more). There the real turn (yaw rate) counts
     steerCurvature *= std::clamp((20.0f - speed) / 10.0f, 0.0f, 1.0f);
+    // Sliding (wheelspin swinging the tail, counter-steering): the body rotates and the wheels point far from where the
+    // car really goes. The curve it's on is the path's: lateral acceleration / speed^2 of the velocity (filtLat). Body yaw
+    // and steering read as a tight turn there and braked the car mid-curve
+    const float slip = GetSlipAngle(veh);
+    if (slip > 0.07f && speed >= 8.0f && xdata.prevSampleFrame + 1 >= frameCounter) {
+        float pathCurvature = xdata.filtLat / (speed * speed);
+        float w = std::clamp((slip - 0.07f) / 0.1f, 0.0f, 1.0f); // all the path's from ~10 degrees
+        yawCurvature += (pathCurvature - yawCurvature) * w;
+        steerCurvature *= 1.0f - w;
+    }
     float curvature = std::max(steerCurvature, yawCurvature);
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
     return std::max(CurveSpeedFor(grip, curvature), 5.0f);
@@ -3143,7 +3174,7 @@ static void ApplyWheelspin(CVehicle* veh, ExtendedData& xdata, float speed, floa
 }
 
 // ABS, traction control and stability control on the pedals
-static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, float* gas, float* brake) {
+static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, float steer, float* gas, float* brake) {
     if (WheelspinStraight(veh, xdata)) return; // the wheelspin driver's straights: spinning on purpose
     eWheelState wheels[4];
     int numWheels = GetWheelStates(veh, wheels);
@@ -3166,7 +3197,11 @@ static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, flo
         for (int i = 0; i < numWheels; i++) spinCount += wheels[i] == WHEEL_STATE_SPINNING;
         const float step = std::min(CTimer::ms_fTimeStep, 3.0f);
         const bool hillStart = speed < 5.0f && veh->GetForward().z > 0.08f;
-        if (spinCount > 0 && *gas > 0.2f && !hillStart) xdata.tcCut = std::min(xdata.tcCut + (0.06f + 0.04f * spinCount) * step, 0.8f);
+        // Steering (a lane change, a curve): the tyres need their grip to turn, spinning they push the car straight on or
+        // swing the tail. Very powerful cars (an edited Cadrona) still spun with 20% gas and ran wide in overtakes
+        const bool turning = std::abs(steer) > 0.06f || xdata.laneState == LANE_CHANGING;
+        const float rate = (0.06f + 0.04f * spinCount) * (turning ? 2.0f : 1.0f), maxCut = turning ? 0.95f : 0.8f;
+        if (spinCount > 0 && *gas > 0.2f && !hillStart) xdata.tcCut = std::min(xdata.tcCut + rate * step, maxCut);
         else xdata.tcCut = std::max(xdata.tcCut - 0.04f * step, 0.0f);
         if (xdata.tcCut > 0.0f && *gas > 0.0f) {
             *gas *= 1.0f - xdata.tcCut;
@@ -3176,6 +3211,15 @@ static void ApplyDriverAids(CVehicle* veh, ExtendedData& xdata, float speed, flo
     if (cfgStabilityControl && speed > 10.0f && *gas > 0.3f && GetSlipAngle(veh) > 0.25f) { // sliding > 14 degrees
         *gas = 0.3f;
         xdata.aidFlags |= AID_ESC;
+    }
+    // The tail stepping out under power: sliding past ~5 degrees with wheels spinning, the gas comes off in proportion (at
+    // 14 degrees it was already a spin for a car with that much power)
+    else if (cfgStabilityControl && speed > 6.0f && *gas > 0.1f && spinning) {
+        float slip = GetSlipAngle(veh);
+        if (slip > 0.09f) {
+            *gas *= std::clamp(1.0f - (slip - 0.09f) / 0.12f, 0.1f, 1.0f);
+            xdata.aidFlags |= AID_ESC;
+        }
     }
 }
 
@@ -3222,6 +3266,18 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
             xdata.dbgGas = *gas;
         }
         else xdata.accelLimiting = false;
+        // Sliding at speed the mod stops driving it for a moment (a temp action, a reverse gear flick), and there the
+        // game gave full gas to a car 50 degrees sideways at 140 km/h: it spun on the freeway. Counter-steer, traction
+        // and stability control stay on whenever it's still moving forwards
+        const float movingSpeed = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+        if (movingSpeed > 8.0f && CVector::Dot(veh->m_vecMoveSpeed, veh->GetForward()) > 0.0f && !*handbrake &&
+            veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
+            xdata.aidFlags = 0;
+            ApplyCounterSteer(veh, xdata, movingSpeed, steer);
+            ApplyDriverAids(veh, xdata, movingSpeed, *steer, gas, brake);
+            xdata.dbgGas = *gas;
+            xdata.dbgBrake = *brake;
+        }
         return;
     }
     float speed = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
@@ -3389,7 +3445,7 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     if (!handbrakeTurn) ApplyCounterSteer(veh, xdata, speed, steer);
     ApplyPedalControl(veh, xdata, speed, gas, brake, handbrake);
     ApplyAccelLimit(veh, xdata, speed, gas, brake);
-    ApplyDriverAids(veh, xdata, speed, gas, brake);
+    ApplyDriverAids(veh, xdata, speed, *steer, gas, brake);
     ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
     if (handbrakeTurn) {
