@@ -251,6 +251,8 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
           <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
           <tr><td class="mono">120816</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Proposta 3 e openpilot A e C: 8,26 min, 77 km/h, 2,18 colisões/min</td></tr>
+          <tr><td class="mono">141752</td><td><span class="pill warn">travou</span></td><td class="num">10,40 km</td><td class="num">6</td><td>Sandking com o modelo de curva e o limite de volante; travou a 295 m do fim, na descida de Bayside</td></tr>
+          <tr><td class="mono">134343</td><td><span class="pill bad">caiu</span></td><td class="num">2,97 km</td><td class="num">9</td><td>Primeiro teste com o Sandking: saiu da alça de um trevo e caiu sob o viaduto</td></tr>
           <tr><td class="mono">133337</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Semáforos agrupados com a revisão: 8,72 min, 2,18 colisões/min, largada limpa</td></tr>
           <tr><td class="mono">131948</td><td><span class="pill good">chegou</span></td><td class="num">10,58 km</td><td class="num">1</td><td>Semáforos agrupados, primeira versão: 7,57 min, 4,62 colisões/min</td></tr>
           <tr><td class="mono">125544</td><td><span class="pill warn">chegou</span></td><td class="num">10,68 km</td><td class="num">11</td><td>79 faixas novas e FLA: 10,14 min, 11,54 colisões/min; engavetamento no cruzamento (2872, −1661) logo na largada, longe das faixas novas</td></tr>
@@ -584,6 +586,32 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       </tbody></table></div>
     <p>Próximo ponto que se repete: a descida de Bayside (−2800, 2300), com 8 colisões no último teste.</p>
     <div class="who"><span class="tag t-claude">Claude: diagnóstico e código</span><span class="tag t-gemini">Gemini: revisão</span><span class="tag t-user">ideia original: SUMO</span></div>
+  </section>
+
+  <section id="curva-real">
+    <h2>Raio de curva medido em tempo real</h2>
+    <p>Teste com o Sandking (novo carro padrão): ele saiu da alça de um trevo de rodovia e caiu no buraco embaixo do viaduto. O mod calculava a curva só pela geometria (entre-eixos e ângulo do volante, como se o pneu fosse exatamente para onde a roda aponta), e o reforço de aderência de 2,2× nas curvas rápidas não conferia se o volante conseguia fazer aquela curva.</p>
+    <h3>O que foi feito</h3>
+    <ol>
+      <li><b>Medição no jogo, por modelo:</b> a cada frame, o raio real (velocidade ÷ giro) contra o ângulo do volante, só com volante e giro estáveis por 0,3 s, 4 rodas no chão e sem derrapar. Aprende o entre-eixos efetivo (abaixo de 43 km/h) e o gradiente de subesterço (acima). Fica em <code>RealTrafficFix.steer.txt</code>.</li>
+      <li><b>Uso:</b> velocidade de curva nunca acima do que o volante consegue fazer (inclusive o limite de esterco que o jogo impõe em velocidade), limitador de giro e mira de pontos com a curva real.</li>
+      <li><b>Rastro quando o carro sai da rua:</b> os últimos 15 s a cada 100 ms (velocidade, alvo, limitador, volante, raio medido × previsto, deriva, g lateral, distância da rota) vão para o log.</li>
+    </ol>
+    <h3>O que a medição mostrou</h3>
+    <ul>
+      <li><b>O volante vai aos trancos na rodovia:</b> a cada ~1 s salta de 0 para 0,03 rad em 100 ms e volta. É o jogo virando de nó em nó da estrada. Na física do GTA isso já joga o carro de lado a 0,5 g a 108 km/h; um tranco de 0,052 rad deu 1,46 g. Para um SUV alto, é o que desestabiliza.</li>
+      <li><b>O Sandking vira como a geometria diz:</b> entre-eixos efetivo 3,18 m (91 amostras), subesterço praticamente zero (0,0002). A primeira versão do aprendizado tinha medido 0,003 de subesterço porque pegava amostras no meio dos trancos; passou a aprender só em regime estável e o valor errado foi descartado.</li>
+      <li><b>Correção (ideia F do openpilot):</b> acima de 36 km/h o volante muda no máximo 2 rad/s, apertando até 0,25 rad/s a 126 km/h; fora disso em derrapagem, freio de mão, freada forte e logo depois de batida.</li>
+    </ul>
+    <h3>Testes e lançador</h3>
+    <ul>
+      <li><b>Jogo congelando:</b> o vigia pegou duas vezes o mesmo ponto (<code>FollowPathHook</code>, dentro da checagem de semáforo do jogo). Era um laço no agrupamento de semáforos: onde dois nós ficam no mesmo lugar, os 35 m nunca somavam. Agora para em 40 passos. O congelamento das 14:08, que atribuí à troca de pasta no modloader, era esse mesmo.</li>
+      <li><b>Jogo não carregava:</b> o GTA só carrega com a janela em foco. O lançador traz a janela para a frente, agora dentro do próprio processo (sem janelas de cmd piscando) e parando assim que o jogo tem o foco uma vez.</li>
+      <li><b>Menu de pausa:</b> um recurso de minimizar e restaurar a janela, que eu tinha posto, fazia o jogo abrir o menu de pausa a cada 3 s. Foi tirado; o mod também fecha o menu de pausa sozinho durante um teste.</li>
+      <li><b>fastman92:</b> a depuração de rotas foi desligada de novo (não era a causa, mas pesa e não serve nos testes).</li>
+    </ul>
+    <h3>Teste 141752 (Sandking)</h3>
+    <p>Andou 10,40 km com 6 colisões do carro e travou a 295 m de Bayside, na mesma descida em que dois testes anteriores pararam (291 m). Desta vez o vigia não registrou nada, então a lógica do jogo seguia rodando: é outra coisa, ainda não investigada. Três saídas da rota registradas (2,27, 3,26 e 4,91 min), nenhuma com queda.</p>
   </section>
 
   <section id="fla">
