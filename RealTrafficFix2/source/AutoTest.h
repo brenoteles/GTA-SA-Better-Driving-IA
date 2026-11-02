@@ -1299,6 +1299,7 @@ void Update() {
         out << Format("speed control: gas<->brake switches %.1f per minute of driving (%d in %.0f min)\n",
             pedalSeconds > 1.0f ? pedalSwitchCount / (pedalSeconds / 60.0f) : 0.0f, pedalSwitchCount, pedalSeconds / 60.0f);
         out << Format("ambient cars created around the player out of sight: %d\n", ambientSpawnCount);
+        out << Format("ambient cars that would have been created into the ground (not created): %d\n", buriedSpawnCount);
         out << Format("lane data corrections (routefixes) loaded %d, applied %d times\n", (int)routeFixes.size(), routeFixesApplied);
         if (scanMode) out << Format("road scan: %d lines across the road in scan.txt\n", scanSamples);
         out << "asked for the way but didn't move over:";

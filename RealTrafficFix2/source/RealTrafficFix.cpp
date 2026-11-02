@@ -516,6 +516,7 @@ static const char* passRefusalNames[8] = { "no lane on the right", "junction/lig
     "doesn't change lanes (big vehicle/bike)" };
 static int rejoinRouteCount = 0;
 static int ambientSpawnCount = 0;
+static int buriedSpawnCount = 0; // ambient cars still into the ground after being put on their wheels: deleted
 static float cfgRejoinRouteFactor = 0.6f;        // cost of the old route's roads when planning again after leaving it
 static std::vector<CVehicle*> spawnRemovals;
 // Does asking for the way work? Speed of the one that asked, when it asked / when the way was given, and 8 s later
@@ -1011,6 +1012,28 @@ static void UpdateAmbientSpawn() {
         CVehicle* veh = CPools::GetVehicle(handle);
         if (!veh) return;
         Command<COMMAND_SET_CAR_HEADING>(handle, CGeneral::GetATanOfXY(d.x, d.y) * 57.2957795f - 90.0f);
+        // On its wheels, pitched with the road: created level and only then turned along the road, on the steep descent
+        // into Bayside a truck came out with its uphill end inside the hill and the queue behind it never moved
+        if (veh->m_nVehicleSubClass == VEHICLE_BIKE) static_cast<CBike*>(veh)->PlaceOnRoadProperly();
+        else static_cast<CAutomobile*>(veh)->PlaceOnRoadProperly();
+        {
+            // Still into the ground at either end (a bend or a crest under a long body): not created
+            CVector mn, mx;
+            GetEntityDimensions(veh, mn, mx);
+            bool buried = false;
+            for (float y : { mn.y + 0.3f, mx.y - 0.3f }) {
+                CVector end = GetWorldCoordWithOffset(veh, { 0.0f, y, mn.z });
+                bool found = false;
+                float gz = FindGroundZ({ end.x, end.y, end.z + 2.5f }, &found);
+                if (found && end.z < gz - 0.35f) buried = true;
+            }
+            if (buried) {
+                Command<COMMAND_DELETE_CAR>(handle);
+                buriedSpawnCount++;
+                ambientLastSpawn = now;
+                return;
+            }
+        }
         Command<COMMAND_CREATE_RANDOM_CHAR_AS_DRIVER>(handle, &driver);
         // No driver (no ped model loaded for it): an empty car parked in the lane, cars ran into them. Not created then
         if (!veh->m_pDriver) {

@@ -181,6 +181,16 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <h3>Teste da versão revisada: jogo travou</h3>
         <p>O jogo congelou a 291 m de Bayside, depois de 10,47 km; na última leitura o Cadrona saltou de 13 para 135 km/h em 10 s, sinal de física explodindo. O tráfego teve 11,8 colisões/min (39 apertos em cruzamento, 27 toques laterais). O usuário considerou azar e manteve a versão revisada; os contadores de motivo ficaram sem resumo porque o teste não terminou.</p>
       </li>
+      <li>
+        <div class="meta"><span class="mono">41da87f</span><span class="tag t-claude">Claude</span><span class="tag t-gemini">Gemini</span><span class="tag t-carla">CARLA</span></div>
+        <h3>Proposta 2: troca de faixa pela lista de veículos</h3>
+        <p>Além dos 3 raios laterais, a troca verifica toda carroceria na faixa de destino (seguindo a curva, largura real de carro em ângulo); carro entre duas faixas conta nas duas; e a troca é recusada se o carro de trás precisar frear mais que 2 m/s² (critério de segurança do MOBIL).</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">091623</span><span class="tag t-user">relato do usuário</span><span class="tag t-claude">Claude</span></div>
+        <h3>Caminhão nascendo dentro da terra na descida de Bayside</h3>
+        <p>O teste parou a 291 m do fim, no mesmo ponto em que o jogo tinha travado: fila parada em (-2765, 2355). O spawner criava o veículo nivelado na altura do chão sob o centro e só depois o virava para a direção da via, sem inclinar; na descida íngreme a ponta de cima de um caminhão ficava dentro do morro. Agora o veículo é assentado nas rodas acompanhando o chão, e se ainda ficar enterrado numa ponta não é criado.</p>
+      </li>
     </ol>
   </section>
 
@@ -196,6 +206,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">082622</td><td><span class="pill warn">interrompido</span></td><td class="num">10,40 km</td><td class="num">2</td><td>Crashout a 80% de gás bateu a 290 m de Bayside</td></tr>
           <tr><td class="mono">085011</td><td><span class="pill good">chegou</span></td><td class="num">10,63 km</td><td class="num">1</td><td>Líder pela rota: 7,19 min, 89 km/h de média, 1,25 colisões/min no tráfego (antes 1,9 a 4). Rota e raios discordaram 309 vezes; a rota só julgou ~3% dos casos</td></tr>
           <tr><td class="mono">085846</td><td><span class="pill warn">travou</span></td><td class="num">10,47 km</td><td class="num">20</td><td>Versão revisada pelo Gemini; jogo congelou a 291 m do fim, 11,8 colisões/min no tráfego. Tratado como azar</td></tr>
+          <tr><td class="mono">091623</td><td><span class="pill warn">parado</span></td><td class="num">10,49 km</td><td class="num">2</td><td>Proposta 2; caminhão nasceu dentro do morro na descida de Bayside e a fila travou a 291 m do fim. 2,9 colisões/min</td></tr>
         </tbody>
       </table>
     </div>
@@ -268,7 +279,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <article class="plate">
         <div class="rank">2</div>
         <div class="plate-body">
-          <div class="plate-head"><h3>Troca de faixa pela lista de veículos</h3><span class="status doing">em andamento</span></div>
+          <div class="plate-head"><h3>Troca de faixa pela lista de veículos</h3><span class="status doing">no jogo, em teste</span></div>
           <dl>
             <dt>Ideia</dt><dd>Em vez de três raios, procurar na faixa de destino o carro à frente e o de trás (de 30 m atrás a 25 m à frente) e só trocar se os dois intervalos tiverem tempo até colisão acima de 2,5 s e a frenagem imposta ao carro de trás (pelo IDM+) ficar abaixo de 2 m/s², no estilo MOBIL. Durante a troca, reservar espaço nas duas faixas e abortar se alguém entrar no envelope.</dd>
             <dt>Do CARLA</dt><dd>Localização olhando faixa de origem e destino; distância mínima de troca.</dd>
@@ -348,7 +359,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Proposta 2 em andamento: troca de faixa pela lista de veículos.</li>
+      <li>Proposta 2 no jogo; falta um teste completo (o último parou pelo caminhão enterrado) para ler os contadores.</li>
       <li>No próximo teste, ler os contadores de por que a rota não julga e ampliar a cobertura.</li>
       <li>Depois, proposta 3.</li>
     </ol>
