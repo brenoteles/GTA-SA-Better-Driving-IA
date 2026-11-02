@@ -212,6 +212,16 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <p>Com a projeção corrigida a rota passou a julgar ~38 mil casos, e as colisões subiram em três testes seguidos. Mesmo código, só trocando quem decide: rota 2,40 colisões/min e 5 do carro de teste; raios 3,66/min e 8. A alta era variação entre rodadas; a rota fica.</p>
       </li>
       <li>
+        <div class="meta"><span class="mono">e431546</span><span class="tag t-claude">Claude</span><span class="tag t-gemini">Gemini</span><span class="tag t-carla">CARLA</span></div>
+        <h3>Proposta 3 e openpilot A e C no jogo</h3>
+        <p>A regra de não bloquear o cruzamento já existia, mas olhava só uma reta até o próximo nó; agora segue a rota depois do cruzamento, trecho a trecho. Do openpilot: a aceleração do líder entra no IDM e no limite de parada (frenagem projetada com o decaimento de 1,5 s), o alerta de colisão freia quando o líder freia mais de 3 m/s² a menos de 1,8 s, e a aceleração máxima cai com a velocidade. Teste: 2,18 colisões/min, o menor das últimas rodadas, 60 alertas de colisão, 141 esperas antes de cruzamento cheio.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">SUMO</span><span class="tag t-gemini">Gemini</span><span class="tag t-claude">Claude</span></div>
+        <h3>Gargalos de San Fierro: achado real, proposta não aplicável ainda</h3>
+        <p>Na rodada corrigida os piores pontos estão em SF, em volta da saída da Garver Bridge. O Gemini mostrou que a rampa de saída tem 1 faixa e recebe 75% do tráfego da ponte, e que as avenidas em volta têm 1 faixa por sentido entre semáforos próximos. Duas ressalvas da conferência: nas cadeias de nós que ele propôs, 15 pares consecutivos não têm ligação (parte foi inventada), e o campo de largura dos dados é 0 em quase toda rua, então não dá para saber se o asfalto comporta mais uma faixa. Aumentar faixas sem isso poria carros na calçada; nada foi aplicado.</p>
+      </li>
+      <li>
         <div class="meta"><span class="mono">092740</span><span class="tag t-claude">Claude</span></div>
         <h3>Teste completo das propostas 1 e 2: menor taxa de colisões até agora</h3>
         <p>Chegou em 7,45 min a 86 km/h, com 0,67 colisões/min no tráfego e só 1 toque lateral. Passou pela descida de Bayside; um spawn enterrado foi recusado. A lista de veículos barrou 1551 trocas de faixa que os raios liberariam, e 12 pela frenagem imposta ao carro de trás.</p>
@@ -240,6 +250,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">113705</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">2</td><td>Postes erguidos, projeção corrigida: 7,67 min, 83 km/h, 3,65 colisões/min, sem congelar</td></tr>
           <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
           <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
+          <tr><td class="mono">120816</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Proposta 3 e openpilot A e C: 8,26 min, 77 km/h, 2,18 colisões/min</td></tr>
           <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
         </tbody>
       </table>
@@ -326,7 +337,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <article class="plate">
         <div class="rank">3</div>
         <div class="plate-body">
-          <div class="plate-head"><h3>Não entrar sem espaço de saída</h3><span class="status partial">parcial</span></div>
+          <div class="plate-head"><h3>Não entrar sem espaço de saída</h3><span class="status doing">no jogo, em teste</span></div>
           <dl>
             <dt>Ideia</dt><dd>Antes da linha de retenção, mesmo no verde, olhar os primeiros 20 m depois do cruzamento na nossa saída. Se o último carro ali está quase parado e não cabe o nosso comprimento mais 2,5 m, parar na linha como se houvesse um líder.</dd>
             <dt>Do CARLA</dt><dd>Estágio de semáforo e colisão na entrada do cruzamento.</dd>
@@ -404,7 +415,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     <p>O mod já tem equivalentes de algumas: o planejador pega o menor limite de velocidade, a memória do líder segura por alguns instantes como o filtro assimétrico do <code>radard</code>, e a troca de faixa tem máquina de estados com tempo limite. As propostas abaixo são as que faltam, levantadas pelo Gemini lendo o código do mod.</p>
     <div class="plates">
       <article class="plate"><div class="rank">A</div><div class="plate-body">
-        <div class="plate-head"><h3>Aceleração do líder e alerta de colisão</h3><span class="status">proposta</span></div>
+        <div class="plate-head"><h3>Aceleração do líder e alerta de colisão</h3><span class="status doing">no jogo, em teste</span></div>
         <dl><dt>Do openpilot</dt><dd><code>radard</code>: filtro de Kalman com velocidade e aceleração do líder, decaimento <code>aLeadTau</code>.</dd>
         <dt>Hoje</dt><dd>O IDM+ e o <code>stopCap</code> usam só a velocidade do líder naquele instante.</dd>
         <dt>Ideia</dt><dd>Usar a aceleração medida do líder (o mod já mede <code>measAccel</code> dos carros que dirige) e projetá-la com decaimento. Se ele freia mais de 3 m/s² com tempo até colisão abaixo de 1,8 s, frear já.</dd>
@@ -418,7 +429,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <dt>Resolve</dt><dd>O Cadrona editado perdendo a traseira em curva e troca de faixa, antes de patinar.</dd></dl>
         <div class="who"><span class="tag t-gemini">Gemini #2</span></div></div></article>
       <article class="plate"><div class="rank">C</div><div class="plate-body">
-        <div class="plate-head"><h3>Aceleração máxima cai com a velocidade</h3><span class="status">proposta</span></div>
+        <div class="plate-head"><h3>Aceleração máxima cai com a velocidade</h3><span class="status doing">no jogo, em teste</span></div>
         <dl><dt>Do openpilot</dt><dd>Teto de aceleração do cruzeiro por velocidade.</dd>
         <dt>Hoje</dt><dd>O limite do perfil é o mesmo em qualquer velocidade e some na ultrapassagem a fundo.</dd>
         <dt>Ideia</dt><dd>Fator 1,0 até 43 km/h, 0,75 a 90, 0,5 a 126, 0,35 a 162 km/h; na ultrapassagem acima de 80 km/h, no máximo 1,6 vez isso.</dd>
@@ -485,8 +496,9 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Ver na rodada corrigida do SUMO onde ainda há espera e propor mudanças de via (ligar armadilhas, faixas em encontros de rampa), medindo cada uma contra a base.</li>
-      <li>Depois, proposta 3.</li>
+      <li>Medir a largura real do asfalto no jogo (raios atravessando cada trecho, lendo o tipo de superfície) para saber onde cabe mais faixa; só então aplicar as mudanças de faixa de SF e medir no SUMO.</li>
+      <li>Ligar as armadilhas (aeroportos, Doherty) onde o asfalto existe.</li>
+      <li>openpilot D, E e F: aceleração planejada com limite de jerk, estados de para e anda, volante sem chicotada.</li>
     </ol>
   </section>
 
