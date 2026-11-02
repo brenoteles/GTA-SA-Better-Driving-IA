@@ -85,8 +85,11 @@ def main():
             elif c.lower() == 'edit' and re.fullmatch(r'[0-9A-Za-z\-]{6,}', t.strip() or '-'):
                 code = code or t.strip()
         if 'fastman92' in title.lower() and click and buttons:
-            print('clicking', buttons[0][1])
-            user32.SendMessageW(buttons[0][0], BM_CLICK, 0, 0)
+            # 'Continue' (the first button is 'Note from author', which opens another window)
+            target = next((b for b in buttons if b[1].strip().lower() in ('continue', 'continuar', 'ok')), None)
+            if target:
+                print('clicking', target[1])
+                user32.SendMessageW(target[0], BM_CLICK, 0, 0)
     if code:
         print('disable code:', code)
         if ini:
