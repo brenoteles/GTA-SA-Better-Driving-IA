@@ -4812,7 +4812,8 @@ public:
             // Past the segment's ends by more than 2 m: another segment's (at a corner the clamped end read the lanes of
             // the segment before it)
             const float tRaw = CVector2D::Dot(p - a, d) / len2;
-            if (tRaw * len < -2.0f || (tRaw - 1.0f) * len > 2.0f) continue;
+            // The first piece reaches back 40 m: the car is often still coming up to path[0] (the log: 3-8 m before it)
+            if (tRaw * len < (seg == 0 ? -40.0f : -2.0f) || (tRaw - 1.0f) * len > 2.0f) continue;
             float t = std::clamp(tRaw, 0.0f, 1.0f);
             float dist = (a + d * t - p).Magnitude();
             if (dist >= best) continue;

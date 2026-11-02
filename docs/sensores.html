@@ -367,6 +367,64 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     </div>
   </section>
 
+  <section id="openpilot">
+    <h2>Ideias do openpilot</h2>
+    <p>O openpilot (comma.ai) dirige carros reais. Do código dele interessa o planejamento longitudinal e o rastreamento do líder. Lido no código-fonte (<code>long_mpc.py</code>, <code>longitudinal_planner.py</code>, <code>radard.py</code>, <code>desire_helper.py</code>):</p>
+    <div class="consts">
+      <div class="const"><b>1,25 / 1,45 / 1,75 s</b><span>tempo de seguimento por personalidade: agressivo, padrão, relaxado</span></div>
+      <div class="const"><b>v²/(2·2,5) + T·v + 6</b><span>distância segura até o obstáculo (m); frenagem de conforto 2,5 m/s²</span></div>
+      <div class="const"><b>a·e^(−τ·t²/2)</b><span>aceleração do líder extrapolada, decaindo; τ = 1,5 s (50% em 1 s)</span></div>
+      <div class="const"><b>1,6 → 0,6 m/s³</b><span>limite de jerk do cruzeiro, de 0 a 40 m/s</span></div>
+      <div class="const"><b>crash_cnt &gt; 2</b><span>alerta de colisão só depois de 3 ciclos seguidos (“radar é instável”)</span></div>
+      <div class="const"><b>min(cruzeiro, líder, …)</b><span>o planejador pega a menor aceleração entre as fontes</span></div>
+    </div>
+    <p>O mod já tem equivalentes de algumas: o planejador pega o menor limite de velocidade, a memória do líder segura por alguns instantes como o filtro assimétrico do <code>radard</code>, e a troca de faixa tem máquina de estados com tempo limite. As propostas abaixo são as que faltam, levantadas pelo Gemini lendo o código do mod.</p>
+    <div class="plates">
+      <article class="plate"><div class="rank">A</div><div class="plate-body">
+        <div class="plate-head"><h3>Aceleração do líder e alerta de colisão</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd><code>radard</code>: filtro de Kalman com velocidade e aceleração do líder, decaimento <code>aLeadTau</code>.</dd>
+        <dt>Hoje</dt><dd>O IDM+ e o <code>stopCap</code> usam só a velocidade do líder naquele instante.</dd>
+        <dt>Ideia</dt><dd>Usar a aceleração medida do líder (o mod já mede <code>measAccel</code> dos carros que dirige) e projetá-la com decaimento. Se ele freia mais de 3 m/s² com tempo até colisão abaixo de 1,8 s, frear já.</dd>
+        <dt>Resolve</dt><dd>Batidas traseiras “viu, mas perto/rápido demais” quando o líder freia forte.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #1</span><span class="tag t-claude">Claude</span></div></div></article>
+      <article class="plate"><div class="rank">B</div><div class="plate-body">
+        <div class="plate-head"><h3>Limite de aceleração em curva</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd><code>limit_accel_in_turns</code>: a aceleração lateral consome o orçamento de aderência.</dd>
+        <dt>Hoje</dt><dd>O círculo de atrito só reduz a frenagem; o gás só é cortado depois que a roda patina.</dd>
+        <dt>Ideia</dt><dd>Escalar a aceleração permitida por √(1 − (1,25·a<sub>y</sub>/a<sub>máx</sub>)²), inclusive em ultrapassagem.</dd>
+        <dt>Resolve</dt><dd>O Cadrona editado perdendo a traseira em curva e troca de faixa, antes de patinar.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #2</span></div></div></article>
+      <article class="plate"><div class="rank">C</div><div class="plate-body">
+        <div class="plate-head"><h3>Aceleração máxima cai com a velocidade</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd>Teto de aceleração do cruzeiro por velocidade.</dd>
+        <dt>Hoje</dt><dd>O limite do perfil é o mesmo em qualquer velocidade e some na ultrapassagem a fundo.</dd>
+        <dt>Ideia</dt><dd>Fator 1,0 até 43 km/h, 0,75 a 90, 0,5 a 126, 0,35 a 162 km/h; na ultrapassagem acima de 80 km/h, no máximo 1,6 vez isso.</dd>
+        <dt>Resolve</dt><dd>Arrancadas irreais acima de 150 km/h, sem tempo de reação dos sensores.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #3</span></div></div></article>
+      <article class="plate"><div class="rank">D</div><div class="plate-body">
+        <div class="plate-head"><h3>Aceleração planejada com limite de jerk</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd>Aceleração desejada contínua com |da/dt| limitado (<code>J_CRUISE</code>).</dd>
+        <dt>Hoje</dt><dd>Quando o líder sai da faixa a velocidade-alvo salta num frame para a desejada, e o pedal crava.</dd>
+        <dt>Ideia</dt><dd>Guardar a aceleração planejada entre frames, subindo no máximo 2,5 m/s³ e caindo 4,5 m/s³; os tetos de segurança (líder, curva, semáforo) continuam sem filtro.</dd>
+        <dt>Resolve</dt><dd>Efeito sanfona e trocas gás/freio.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #4</span></div></div></article>
+      <article class="plate"><div class="rank">E</div><div class="plate-body">
+        <div class="plate-head"><h3>Para e anda: parando, parado, saindo</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd>Estados de parada do controle longitudinal.</dd>
+        <dt>Hoje</dt><dd>Abaixo de 8 m/s três lógicas disputam o pedal: encostar na fila, freio total de baixa velocidade e cruzeiro zero.</dd>
+        <dt>Ideia</dt><dd>Um estado só abaixo de 3 m/s: rampa de freio ao parar, freio segurado parado, saída quando o da frente abre 1 m e anda há 0,25 s.</dd>
+        <dt>Resolve</dt><dd>Toques traseiros em filas que andam e param.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #5</span></div></div></article>
+      <article class="plate"><div class="rank">F</div><div class="plate-body">
+        <div class="plate-head"><h3>Volante sem chicotada</h3><span class="status">proposta</span></div>
+        <dl><dt>Do openpilot</dt><dd>Controle de direção por torque com amortecimento e limite de taxa.</dd>
+        <dt>Hoje</dt><dd>O pure pursuit não tem amortecimento nem limite de taxa, e alterna entre fontes sem rampa.</dd>
+        <dt>Ideia</dt><dd>Amortecer pelo giro real do carro e limitar a variação do volante por frame, mais apertado em alta velocidade; desligado em derrapagem e no freio de mão.</dd>
+        <dt>Resolve</dt><dd>Zigue-zague de 15–20°/s em rodovia e chicotadas ao abortar troca de faixa.</dd></dl>
+        <div class="who"><span class="tag t-gemini">Gemini #6</span></div></div></article>
+    </div>
+  </section>
+
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
