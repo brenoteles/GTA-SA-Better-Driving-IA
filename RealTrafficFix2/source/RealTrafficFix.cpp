@@ -411,6 +411,7 @@ static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, 
 static bool cfgCrashout = true;
 static float cfgCrashoutTime = 15.0f;       // s stopped behind something / for no reason
 static float cfgCrashoutLightTime = 50.0f;  // s stopped at a red light (longer than any actuated red)
+static float cfgCrashoutQueueTime = 40.0f;  // s queued behind another waiting car (the one at the head goes first)
 static int crashoutCount = 0;
 static int otherLaneHitCount = 0; // sensor hits on a car in another lane, not taken as the one ahead
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
@@ -3263,8 +3264,11 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     // Crashout: going for it, whatever is ahead (after any backing out)
     if (CTimer::m_snTimeInMilliseconds < xdata.crashoutUntil && veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE_LEFT &&
         veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE_RIGHT && veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE) {
-        *gas = 0.8f;
-        *brake = 0.0f;
+        // At a crawl: full force pressed against something, none from ~9 km/h. At a flat 0.8 the edited Cadrona was at
+        // 20 km/h in 0.3 s and rammed a car backing out of the jam
+        const float fwdSpeed = CVector::Dot(veh->m_vecMoveSpeed, veh->GetForward()) * GAME_SPEED_TO_MPS;
+        *gas = std::clamp((2.5f - fwdSpeed) * 0.35f, 0.0f, 0.8f);
+        *brake = fwdSpeed > 4.0f ? 0.5f : 0.0f;
         *handbrake = false;
         xdata.dbgGas = *gas;
         xdata.dbgBrake = *brake;
@@ -3760,6 +3764,7 @@ public:
         ReadIniBool(ini, "Crashout", cfgCrashout);
         ReadIniFloat(ini, "CrashoutTime", cfgCrashoutTime);
         ReadIniFloat(ini, "CrashoutLightTime", cfgCrashoutLightTime);
+        ReadIniFloat(ini, "CrashoutQueueTime", cfgCrashoutQueueTime);
         ReadIniBool(ini, "SmoothLanes", cfgSmoothLanes);
         ReadIniBool(ini, "ActuatedLights", cfgActuatedLights);
         ReadIniFloat(ini, "SignalMinGreen", cfgSignalMinGreen);
@@ -4299,7 +4304,7 @@ public:
             // backs out 2 s, the nose swinging to a side, to get a new angle
             const bool atRed = xdata.waitState == 1 && xdata.lightColor != LIGHT_NONE && xdata.lightColor != LIGHT_GREEN;
             if (cfgCrashout && !isBike && nowMs >= xdata.crashoutUntil + 1000 &&
-                xdata.stillTime > (atRed ? cfgCrashoutLightTime : cfgCrashoutTime) + xdata.crashoutTries * 6.0f) {
+                xdata.stillTime > (atRed ? cfgCrashoutLightTime : queued ? cfgCrashoutQueueTime : cfgCrashoutTime) + xdata.crashoutTries * 6.0f) {
                 const bool backFirst = (xdata.crashoutTries & 1) != 0;
                 xdata.crashoutTries++;
                 xdata.crashoutUntil = nowMs + (backFirst ? 6500 : 4000);
