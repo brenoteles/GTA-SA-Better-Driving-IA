@@ -216,6 +216,10 @@ public:
     float filtLong = 0.0f;  // m/s2, smoothed
     float filtYawRate = 0.0f; // rad/s, smoothed (heading limiter)
     float prevSteerSample = 0.0f; // steering of the last turn sample (the turn model learns only on steady steering)
+    float prevYawSample = 0.0f;
+    unsigned int steadySince = 0;   // steering and yaw rate steady since (ms)
+    float lastSteerOut = 0.0f;      // the steering given last frame (rate limit)
+    unsigned int lastSteerFrame = 0;
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
@@ -1854,6 +1858,8 @@ static float curRollGrip = 1000.0f;
 // speed). The geometric model (the wheelbase, no understeer) said a tall soft SUV could take an interchange loop at
 // 100+ km/h: the Sandking ran wide off it into the pit under the overpass. For the vehicle being processed (0: not known)
 static bool cfgSteerModel = true;
+static bool cfgSteerRateLimit = true;
+static int steerRateLimitedFrames = 0;
 static float curSteerL = 0.0f, curSteerK = 0.0f;
 // The steering the game allows at a speed (CCarCtrl::FindMaxSteerAngle, 0x427FE0): min(0.7, 0.9 - v) in game units
 // (v/50 m/s) up to 35 m/s, 0.2 above
@@ -3109,12 +3115,16 @@ static void LoadSteerModel() {
     std::ifstream f(steerFile);
     int model, nL, nK;
     float L, K;
+    std::string version;
+    f >> version;
+    if (version != "v2") { lg << "Turn model file from before steady-state learning: starting over\n"; return; }
     while (f >> model >> L >> K >> nL >> nK) learnedSteer[model] = { L, K, nL, nK };
     lg << "Turn model loaded for " << learnedSteer.size() << " models\n";
 }
 static void SaveSteerModel() {
     if (!steerDirty) return;
     std::ofstream f(steerFile, std::ios::trunc);
+    f << "v2\n";
     for (auto& [model, st] : learnedSteer) if (st.nL > 0) f << model << " " << st.L << " " << st.K << " " << st.nL << " " << st.nK << "\n";
     steerDirty = false;
 }
@@ -3123,10 +3133,16 @@ static void SaveSteerModel() {
 static void UpdateSteerModel(CVehicle* veh, ExtendedData& xdata, float speed, const CVector& mn, const CVector& mx) {
     if (!cfgSteerModel || veh->m_nVehicleSubClass != VEHICLE_AUTOMOBILE || veh->GetNumContactWheels() < 4 || xdata.damageFactor < 1.0f) return;
     const float delta = veh->m_fSteerAngle;
-    const bool steady = std::abs(delta - xdata.prevSteerSample) < 0.02f;
-    xdata.prevSteerSample = delta;
     const float yaw = veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS;
-    if (!steady || speed < 3.0f || std::abs(delta) < 0.04f || std::abs(yaw) < 0.03f || GetSlipAngle(veh) > 0.08f) return;
+    const unsigned int now = CTimer::m_snTimeInMilliseconds;
+    // Steady state only: steering and turn rate settled for 0.3 s. Learning in the steering jolts at each road node (the
+    // turn not built up yet) read as understeer: K 0.003 for the Sandking, which turns as the geometry says
+    const bool settled = std::abs(delta - xdata.prevSteerSample) < 0.004f && std::abs(yaw - xdata.prevYawSample) < 0.02f;
+    xdata.prevSteerSample = delta;
+    xdata.prevYawSample = yaw;
+    if (!settled) { xdata.steadySince = now; return; }
+    if (now - xdata.steadySince < 300) return;
+    if (speed < 3.0f || std::abs(delta) < 0.04f || std::abs(yaw) < 0.03f || GetSlipAngle(veh) > 0.08f) return;
     if ((delta > 0.0f) != (yaw > 0.0f)) { steerSignMismatch++; return; }
     steerSignMatch++;
     const float wb = GetWheelBase(veh, mn, mx);
@@ -3808,6 +3824,23 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     ApplyDriverAids(veh, xdata, speed, *steer, gas, brake);
     ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
+    // Steering rate limit at speed (openpilot's lateral control): the game steers from road node to road node, a 0.03-0.05
+    // rad jolt at each, and at 110 km/h that's 0.5-1.5 g sideways for an instant (the measured turn trace): tall cars
+    // were thrown about. From 10 m/s the wheel moves at most 2 rad/s, down to 0.25 rad/s at 35 m/s. Not while sliding
+    // (counter-steer), on the handbrake, braking hard or right after a crash
+    if (cfgSteerRateLimit && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
+        const bool sameRun = xdata.lastSteerFrame + 1 == frameCounter || xdata.lastSteerFrame == frameCounter;
+        const bool exempt = handbrakeTurn || GetSlipAngle(veh) > 0.1f || *brake > 0.6f || CTimer::m_snTimeInMilliseconds - veh->m_nLastCollisionTime < 1000;
+        if (sameRun && !exempt && speed > 10.0f) {
+            const float maxRate = Lerp(2.0f, 0.25f, std::clamp((speed - 10.0f) / 25.0f, 0.0f, 1.0f));
+            const float maxStep = maxRate * CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
+            const float limited = std::clamp(*steer, xdata.lastSteerOut - maxStep, xdata.lastSteerOut + maxStep);
+            if (limited != *steer) steerRateLimitedFrames++;
+            *steer = limited;
+        }
+        xdata.lastSteerOut = *steer;
+        xdata.lastSteerFrame = frameCounter;
+    }
     if (handbrakeTurn) {
         *handbrake = true;
         *brake = 0.0f;
@@ -4100,6 +4133,7 @@ public:
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
         ReadIniBool(ini, "SteerModel", cfgSteerModel);
+        ReadIniBool(ini, "SteerRateLimit", cfgSteerRateLimit);
         ReadIniBool(ini, "RoadEdges", cfgRoadEdges);
         ReadIniBool(ini, "LeadAccel", cfgLeadAccel);
         ReadIniBool(ini, "AccelBySpeed", cfgAccelBySpeed);
@@ -4397,6 +4431,7 @@ public:
 
         Events::drawingEvent += DrawDebug;
         Events::drawingEvent += AutoTest::Draw;
+        Events::menuDrawingEvent += [] { AutoTest::Menu(&FrontEndMenuManager); };
 
         Events::onPauseAllSounds += [] {
             lg.flush();

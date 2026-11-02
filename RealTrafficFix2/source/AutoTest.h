@@ -489,6 +489,20 @@ static void UpdateOrbitShots(unsigned int now) {
     }
 }
 
+// The game's pause menu during a test (the game window lost the focus while loading, or a key reached it): closed as Esc
+// would. The test stood still on it until someone came and clicked Resume
+static int menuResumes = 0;
+void Menu(CMenuManager* menu) {
+    if (!enabled || state == DONE || !menu || !menu->m_bMenuActive || menu->m_nCurrentMenuPage != MENUPAGE_PAUSE_MENU) return;
+    static unsigned int lastResume = 0;
+    const unsigned int now = GetTickCount();
+    if (now - lastResume < 2000) return;
+    lastResume = now;
+    menu->SwitchMenuOnAndOff();
+    menuResumes++;
+    out << "  (pause menu closed by the test, " << menuResumes << ")\n";
+}
+
 void Draw() {
     if (!enabled) return;
     if (state != WAIT_GAME && state != DONE) {
@@ -1354,6 +1368,7 @@ void Update() {
         out << Format("forward collision warnings (leader braking > 3 m/s2, < 1.8 s to it, openpilot): %d\n", fcwCount);
         out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; curves capped by what the steering can do %d; test car off the road %d\n",
             steerSignMatch, steerSignMismatch, steerLimitedCurves, offRoadCount);
+        out << Format("steering rate limited at speed (frames, openpilot): %d\n", steerRateLimitedFrames);
         for (const TripCar& c : tripCars) {
             if (!c.veh) continue;
             auto it = learnedSteer.find(c.veh->m_nModelIndex);
