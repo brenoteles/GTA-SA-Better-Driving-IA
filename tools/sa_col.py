@@ -97,7 +97,7 @@ def quat_matrix(qx, qy, qz, qw, conjugate):
         [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]], dtype=np.float32)
 
 
-def load_world_triangles(game_dir, keep=None, conjugate=True, img_name='models/gta3.img'):
+def load_world_triangles(game_dir, keep=None, conjugate=True, img_name='models/gta3.img', skip_models=()):
     """World triangles (N x 3 x 3 float32) and materials (N) of every map instance; 'keep(x, y, radius)' filters instances.
     Boxes become two triangles for their top face."""
     names = load_ide_names(game_dir)
@@ -119,7 +119,7 @@ def load_world_triangles(game_dir, keep=None, conjugate=True, img_name='models/g
     used = 0
     for inst in all_insts(game_dir, img_name):
         mid, mname, x, y, z, qx, qy, qz, qw, interior = inst[:10]
-        if interior not in (0, 13):
+        if interior not in (0, 13) or mid in skip_models:
             continue
         name = (mname or names.get(mid, '')).lower()
         col = cols.get(name)

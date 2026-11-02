@@ -1481,6 +1481,24 @@ static CCarPathLink* GetLinkBetween(const CNodeAddress& a, const CPathNode* node
     return nullptr;
 }
 
+// Measured asphalt of the narrow road links (tools/road_width.py: the map's collision, every stretch): where the data's
+// 5.4 m lanes are wider than the road, the cars' lanes ran over the kerb. Left/right of the link's direction, metres
+static bool cfgRoadEdges = true;
+static std::unordered_map<uint32_t, std::pair<float, float>> roadEdges;
+static int roadEdgeFrames = 0;
+static void LoadRoadEdges(const std::string& path) {
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        unsigned int area, navi;
+        float l, r;
+        if (ss >> area >> navi >> l >> r) roadEdges[(area << 16) | navi] = { l, r };
+    }
+    lg << "Road edges (measured asphalt of narrow links): " << roadEdges.size() << "\n";
+}
+
 static CCarPathLink* LinkFromAddress(const CCarPathLinkAddress& address) {
     UInt16 raw = *reinterpret_cast<const UInt16*>(&address);
     if (raw == 0xFFFF) return nullptr;
@@ -3477,6 +3495,35 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
         }
     }
 
+    // Narrow roads (measured): the body kept 0.3 m inside the asphalt. Only when it's about to cross the edge and still heading
+    // out; inside it the game's lane stands
+    if (cfgRoadEdges && !roadEdges.empty() && speed > 2.0f && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE && !xdata.bypassUntil) {
+        const UInt16 raw = *reinterpret_cast<const UInt16*>(&veh->m_autoPilot.m_nNextPathNodeInfo);
+        auto it = raw == 0xFFFF ? roadEdges.end() : roadEdges.find(((raw >> 10) << 16) | (raw & 0x3FF));
+        CCarPathLink* link = it != roadEdges.end() ? LinkFromAddress(veh->m_autoPilot.m_nNextPathNodeInfo) : nullptr;
+        if (link) {
+            CVector2D d(link->m_nDirX / 100.0f, link->m_nDirY / 100.0f);
+            const float dl = d.Magnitude();
+            if (dl > 0.3f) {
+                d *= 1.0f / dl;
+                const CVector2D r(d.y, -d.x), lp(link->m_vecPosn.x / 8.0f, link->m_vecPosn.y / 8.0f);
+                const CVector2D pos = veh->GetPosition().To2D(), fwd = veh->GetForward().To2D();
+                const float lat = CVector2D::Dot(pos - lp, r), along = CVector2D::Dot(pos - lp, d);
+                CVector mn, mx;
+                GetEntityDimensions(veh, mn, mx);
+                const float hw = std::max(mx.x, -mn.x);
+                const float hi = it->second.second - hw - 0.3f, lo = -(it->second.first - hw - 0.3f);
+                const float heading = CVector2D::Dot(fwd, r); // > 0: heading right of the link's direction
+                if (hi > lo && std::abs(along) < 40.0f && ((lat > hi && heading > -0.02f) || (lat < lo && heading < 0.02f))) {
+                    const float s = CVector2D::Dot(fwd, d) >= 0.0f ? 1.0f : -1.0f;
+                    const CVector2D target = lp + d * (along + s * std::max(8.0f, speed * 0.8f)) + r * std::clamp(lat, lo, hi);
+                    *steer = SteerTowards(veh, target);
+                    roadEdgeFrames++;
+                }
+            }
+        }
+    }
+
     // Bike weaving into someone beside it (the game's bike logic doesn't look sideways): straight along the road instead
     if (CTimer::m_snTimeInMilliseconds < xdata.bikeHoldUntil) {
         *steer = SteerTowards(veh, veh->GetPosition().To2D() + xdata.bikeRoadDir * std::clamp(speed * 1.2f, 10.0f, 30.0f));
@@ -3865,6 +3912,7 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "RoadEdges", cfgRoadEdges);
         ReadIniBool(ini, "LeadAccel", cfgLeadAccel);
         ReadIniBool(ini, "AccelBySpeed", cfgAccelBySpeed);
         ReadIniBool(ini, "ListLaneChange", cfgListLaneChange);
@@ -4062,6 +4110,7 @@ public:
         }
 
         if (cfgRouteFixes) LoadRouteFixes(dir + "RealTrafficFix.routefixes.txt");
+        if (cfgRoadEdges) LoadRoadEdges(dir + "RealTrafficFix.roadedges.txt");
         wdPath = dir + "RealTrafficFix.watchdog.txt";
         CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
         learnedFile = dir + "RealTrafficFix.limits.txt"; // v2 measurement (the old .learned.txt values were inflated);

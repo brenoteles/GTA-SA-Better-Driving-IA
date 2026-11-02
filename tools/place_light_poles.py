@@ -7,7 +7,13 @@ the road (the game colours each face of a pole by its facing, CTrafficLights::Fi
 aren't lit). The model and its height above the road node are the ones the map's poles use nearby. Not on another road,
 not within 8 m of an existing pole.
 
+With the measured road widths (road_width.py csv, 'widths' argument) the poles go to the real kerb: 0.8 m past the
+asphalt edge of the road they serve, behind the crossing road's measured edge (+2 m), the spot checked against the map's
+collision (pushed out of any road surface) and at the ground's height there. Without it (or where a road wasn't
+measured): the lane data's edge, which put many poles in the road.
+
 usage: python place_light_poles.py <game dir> <data/Paths> <override folder or -> <out .ipl> [yaw offset deg] [lift m]
+       [widths.csv]
 
 lift: the poles raised that much over the road (temporary: placed on the road they were obstacles; 5.5 m puts
 their base over any vehicle and leaves the lights floating over the junction)
@@ -22,6 +28,8 @@ from sa_paths import load_all, Network  # noqa: E402
 from sa_ipl import all_insts, TRAFFIC_LIGHT_MODELS  # noqa: E402
 from sa_to_sumo import merged_paths  # noqa: E402
 from light_poles_learn import lit_approaches  # noqa: E402
+
+ROAD = {0, 1, 2, 3, 7, 8, 26, 27}
 
 LANE_W = 5.4
 
@@ -41,7 +49,7 @@ def seg_dist(px, py, ax, ay, bx, by):
     return math.hypot(ax + dx * t - px, ay + dy * t - py)
 
 
-def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
+def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0, widths_csv=None):
     net = Network(load_all(merged_paths(base, override)))
     node = net.node
     appr = lit_approaches(net)
@@ -76,7 +84,30 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
             dz[p[0]].append(p[4] - best[1].z)
     model_dz = {m: sorted(v)[len(v) // 2] for m, v in dz.items() if v}
 
+    widths, grid, ground_dz = {}, None, {}
+    if widths_csv:
+        import csv
+        for r in csv.DictReader(open(widths_csv)):
+            wl, wr = float(r['width_left']), float(r['width_right'])
+            if float(r['width']) > 1.0 and wl < 24.9 and wr < 24.9:
+                widths[(int(r['area']), int(r['navi']))] = (wl + 0.25, wr + 0.25)
+        from sa_col import load_world_triangles, TriGrid
+        tris, mats, _, _ = load_world_triangles(game_dir, skip_models=set(TRAFFIC_LIGHT_MODELS))
+        grid = TriGrid(tris, mats)
+        # Height of each model's origin over the ground under it (the map's poles, their own collision left out)
+        gz = defaultdict(list)
+        for p in poles:
+            m, hz = grid.surface([(p[2], p[3])], p[4] - 2.0, below=8.0, above=1.5)
+            if m[0] >= 0:
+                gz[p[0]].append(p[4] - float(hz[0]))
+        ground_dz = {m: sorted(v)[len(v) // 2] for m, v in gz.items() if v}
+        print('measured road links %d; model height over the ground: %s' % (
+            len(widths), {TRAFFIC_LIGHT_MODELS[m]: round(v, 2) for m, v in ground_dz.items()}))
+
     def road_half_width(nv):
+        w = widths.get((nv.area_index, nv.id))
+        if w:
+            return max(w)
         return max(nv.left + nv.right, 1) * LANE_W / 2.0
 
     out, stats = [], Counter()
@@ -96,6 +127,12 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
             ow = one_way_offset(nv.left, nv.right)
             o = (nv.x - J.x) * rx + (nv.y - J.y) * ry           # the navi line's offset from the node line
             lat = o + (ow + toward - 0.5) * LANE_W + 1.0
+            measured = widths.get((nv.area_index, nv.id))
+            if measured:
+                ndx, ndy = nv.dx / 100.0, nv.dy / 100.0
+                edge = measured[1] if ndx * ux + ndy * uy >= 0 else measured[0]   # the right of travel
+                lat = o + edge + 0.8
+                stats['at the measured kerb'] += 1
             # before the crossing roads' edge
             cross = 0.0
             for m, lv in legs:
@@ -105,8 +142,24 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
                     continue                                    # along our road, not crossing it
                 cross = max(cross, road_half_width(lv))
             placed = None
-            for back in (cross + 3.0, cross + 6.0, cross + 9.0):
+            zground = None
+            m0 = node[nb]
+            seg0 = math.hypot(m0.x - J.x, m0.y - J.y)
+            for back in ((cross + 2.0, cross + 4.0, cross + 6.0) if grid else (cross + 3.0, cross + 6.0, cross + 9.0)):
                 back = max(6.0, min(back, 18.0))
+                zr = J.z + (m0.z - J.z) * min(back / seg0, 1.0) if seg0 > 1 else J.z
+                if grid:
+                    # Out of any road surface at the road's height, pushed outwards up to 4 m
+                    for push in [i * 0.5 for i in range(9)]:
+                        x, y = J.x - ux * back + rx * (lat + push), J.y - uy * back + ry * (lat + push)
+                        mm, hh = grid.surface([(x, y)], zr, below=3.0, above=2.0)
+                        if not (mm[0] in ROAD and abs(float(hh[0]) - zr) < 0.5):
+                            placed = (x, y, back)
+                            zground = float(hh[0]) if mm[0] >= 0 else None
+                            break
+                    if placed:
+                        break
+                    continue
                 x, y = J.x - ux * back + rx * lat, J.y - uy * back + ry * lat
                 on_road = False
                 for m, lv in legs:
@@ -140,6 +193,8 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
             seg = math.hypot(m.x - J.x, m.y - J.y)
             zroad = J.z + (m.z - J.z) * min(back / seg, 1.0) if seg > 1 else J.z
             z = zroad + model_dz.get(mid, 0.0) + lift
+            if zground is not None and mid in ground_dz:
+                z = zground + ground_dz[mid] + lift
             travel = math.degrees(math.atan2(uy, ux))
             yaw = travel - 90.0 + yaw_offset                     # GTA heading: model +Y = yaw + 90 (math angle)
             h = math.radians(yaw) / 2.0
@@ -160,4 +215,4 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
 
 if __name__ == '__main__':
     main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 180.0,
-         float(sys.argv[6]) if len(sys.argv) > 6 else 0.0)
+         float(sys.argv[6]) if len(sys.argv) > 6 else 0.0, sys.argv[7] if len(sys.argv) > 7 else None)
