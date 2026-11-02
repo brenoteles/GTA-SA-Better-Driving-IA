@@ -316,6 +316,10 @@ public:
     unsigned int lastLaneChange = 0;
     bool trafficAround = false;       // any vehicle beside/close: racing line off
     unsigned char laneAction = 0;     // debug: 1 = overtaking, 2 = back to the right, 3 = to the fast lane
+    // Lane change measurement: when it really got there, the widest angle to the road and the most sideways g
+    bool changeArrived = false;
+    unsigned int changeArriveMs = 0;
+    float changePeakAngle = 0.0f, changePeakLat = 0.0f;
     int lanesHere = 0;
     float distToJunctionAhead = 1000.0f; // m along the road (for rural roads)
     // Lane needed for the next turn/exit of the route: -1 = leftmost lane, 1 = rightmost, 0 = any
@@ -1874,6 +1878,11 @@ static float curRollGrip = 1000.0f;
 static bool cfgSteerModel = true;
 static bool cfgSteerRateLimit = true;
 static int steerRateLimitedFrames = 0;
+// Lane changes as driven ([0] moving over, [1] overtaking): indicator time before, planned, time to really be in the
+// new lane (0.15 lanes), how many never got there before the change ended, the angle to the road and the sideways g
+static int lcCount[2], lcArrived[2];
+static double lcSignalS[2], lcPlannedS[2], lcArriveS[2], lcAngleDeg[2], lcLatG[2];
+static float lcMaxAngleDeg[2], lcMaxLatG[2];
 // Why the limit didn't apply at speed: 0 not the frame after, 1 handbrake turn, 2 sliding, 3 braking hard, 4 just hit
 static int steerRateExempt[5] = {};
 static float curSteerL = 0.0f, curSteerK = 0.0f;
@@ -2937,8 +2946,10 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             float dist = distToNode[i] + along - cfgLightStopMargin;
             if (dist < -cfgLightStopMargin) continue; // already crossed it
 
-            // Yellow: stop if it can be done comfortably (aggressive drivers accept a harder stop before going through)
-            float yellowDecel = decel * Lerp(0.8f, 1.25f, xdata.aggression);
+            // Yellow: stop if it can be done at about the 3 m/s2 yellow times are designed for; calm drivers brake a bit
+            // harder to stop, aggressive ones go through sooner. From the driver's comfortable braking it was inverted
+            // (Gemini): calm 1.6 m/s2 went through from 60 m at 50 km/h, aggressive 5.6 m/s2 only from 17 m
+            float yellowDecel = Lerp(3.5f, 2.5f, xdata.aggression);
             if (xdata.runsRedLights && color != LIGHT_GREEN) lightApproachSpeed = std::min(lightApproachSpeed, RED_LIGHT_RUN_SPEED);
             bool mustStop = !xdata.runsRedLights && (color == LIGHT_RED ||
                 (color == LIGHT_YELLOW && speed * speed / (2.0f * yellowDecel) < std::max(dist, 0.0f)));
@@ -3710,6 +3721,14 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
         float laneSteer = progress < 1.0f ? GetLaneChangeSteer(veh, xdata, speed, progress) : NAN;
         if (progress >= 1.0f || !std::isfinite(laneSteer)) {
             // Done (or the road ended): now it's the game's lane, and the space on the board is free again
+            if (xdata.changeTarget != xdata.changeOrigin) {
+                const int k = xdata.laneAction == 1 ? 1 : 0;
+                if (xdata.changeArrived) { lcArrived[k]++; lcArriveS[k] += xdata.changeArriveMs / 1000.0; }
+                lcAngleDeg[k] += xdata.changePeakAngle;
+                lcLatG[k] += xdata.changePeakLat;
+                lcMaxAngleDeg[k] = std::max(lcMaxAngleDeg[k], xdata.changePeakAngle);
+                lcMaxLatG[k] = std::max(lcMaxLatG[k], xdata.changePeakLat);
+            }
             veh->m_autoPilot.m_nCurrentLane = veh->m_autoPilot.m_nNextLane = static_cast<char>(xdata.changeTarget);
             xdata.laneState = xdata.changeAfter;
             ReleaseLaneSpace(veh);
@@ -3879,10 +3898,12 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     ApplyDriverAids(veh, xdata, speed, *steer, gas, brake);
     ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
-    // Steering rate limit at speed (openpilot's lateral control): the game steers from road node to road node, a 0.03-0.05
-    // rad jolt at each, and at 110 km/h that's 0.5-1.5 g sideways for an instant (the measured turn trace): tall cars
-    // were thrown about. From 10 m/s the wheel moves at most 2 rad/s, down to 0.25 rad/s at 35 m/s. Not while sliding
-    // (counter-steer), on the handbrake, braking hard or right after a crash
+    // Steering smoothed at speed: the game steers from road node to road node, a 0.03-0.05 rad jolt at each, and at
+    // 110 km/h that's 0.5-1.5 g sideways for an instant (the measured turn trace): tall cars were thrown about. A
+    // first-order filter, 0 s at 10 m/s up to 0.15 s from 30 m/s: the jolts become ramps, and a big correction is only
+    // 0.15 s late. A rate limit (2 down to 0.25 rad/s) was later the bigger the correction: at a wide angle the car
+    // overshot, steered back late and zig-zagged. Not while sliding (counter-steer), on the handbrake, braking hard or
+    // right after a crash
     if (cfgSteerRateLimit && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
         const bool sameRun = xdata.lastSteerFrame + 1 == frameCounter || xdata.lastSteerFrame == frameCounter;
         // A hit is a damage record, not m_nLastCollisionTime: that one is stamped by the body touching the road too, and
@@ -3893,11 +3914,11 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
             xdata.lastImpactMs && nowMs - xdata.lastImpactMs < 1000 ? 4 : -1;
         if (why >= 0 && speed > 10.0f) steerRateExempt[why]++;
         if (why < 0 && speed > 10.0f) {
-            const float maxRate = Lerp(2.0f, 0.25f, std::clamp((speed - 10.0f) / 25.0f, 0.0f, 1.0f));
-            const float maxStep = maxRate * CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
-            const float limited = std::clamp(*steer, xdata.lastSteerOut - maxStep, xdata.lastSteerOut + maxStep);
-            if (limited != *steer) steerRateLimitedFrames++;
-            *steer = limited;
+            const float tau = Lerp(0.0f, 0.15f, std::clamp((speed - 10.0f) / 20.0f, 0.0f, 1.0f));
+            const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
+            const float smoothed = xdata.lastSteerOut + (*steer - xdata.lastSteerOut) * (dt / (tau + dt));
+            if (std::abs(smoothed - *steer) > 0.005f) steerRateLimitedFrames++;
+            *steer = smoothed;
         }
         xdata.lastSteerOut = *steer;
         xdata.lastSteerFrame = frameCounter;
@@ -6362,6 +6383,13 @@ public:
         };
         // Starts the lane change: steered smoothly by FollowPathHook, the game's lane is only set when it's done
         auto change = [&](int lane, unsigned char action, eLaneState after) {
+            const int k = action == 1 ? 1 : 0;
+            if (xdata.signalStart && now - xdata.signalStart < 10000) lcSignalS[k] += (now - xdata.signalStart) / 1000.0;
+            lcPlannedS[k] += durationFor(action);
+            lcCount[k]++;
+            xdata.changeArrived = false;
+            xdata.changeArriveMs = 0;
+            xdata.changePeakAngle = xdata.changePeakLat = 0.0f;
             xdata.changeTarget = lane;
             xdata.changeOrigin = myLane;
             xdata.changeFromF = myLaneF;
@@ -6445,6 +6473,18 @@ public:
                 const LaneInfo& target = laneInfo[xdata.changeTarget];
                 float closing = target.backSpeed - speed;
                 fastBehind = target.backVeh && closing > 3.0f && target.backGap / closing < 1.5f;
+            }
+            if (!xdata.changeArrived && std::abs(xdata.changeTarget - myLaneF) < 0.15f) {
+                xdata.changeArrived = true;
+                xdata.changeArriveMs = now - xdata.changeStart;
+            }
+            {
+                const CVector2D vel = veh->m_vecMoveSpeed.To2D();
+                if (vel.Magnitude() > 0.05f) {
+                    const float angle = std::abs(std::atan2(CVector2D::Dot(vel, r), CVector2D::Dot(vel, d))) * 57.2958f;
+                    xdata.changePeakAngle = std::max(xdata.changePeakAngle, angle);
+                }
+                xdata.changePeakLat = std::max(xdata.changePeakLat, std::abs(xdata.filtLat) / GRAVITY);
             }
             if (xdata.changeTarget != xdata.changeOrigin && (fastBehind ||
                 !SideClear(veh, xdata, xdata.changeTarget > xdata.changeOrigin ? 1 : -1, speed, lanesLeft,

@@ -1376,7 +1376,13 @@ void Update() {
         out << Format("forward collision warnings (leader braking > 3 m/s2, < 1.8 s to it, openpilot): %d\n", fcwCount);
         out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; path points (every car, every scan) whose curve speed the steering capped %d; test car off the road %d\n",
             steerSignMatch, steerSignMismatch, steerLimitedCurves, offRoadCount);
-        out << Format("steering rate limited at speed (frames, openpilot): %d; not limited: not the frame after %d, handbrake turn %d, sliding %d, braking hard %d, just hit %d\n",
+        for (int k = 0; k < 2; k++) {
+            const int n = std::max(lcCount[k], 1), a = std::max(lcArrived[k], 1);
+            out << Format("lane changes (%s): %d, indicator %.2f s, planned %.2f s, in the new lane after %.2f s (%d of %d got there), widest angle avg %.1f max %.1f deg, sideways avg %.2f max %.2f g\n",
+                k ? "overtaking" : "moving over", lcCount[k], lcSignalS[k] / n, lcPlannedS[k] / n, lcArriveS[k] / a, lcArrived[k], lcCount[k],
+                lcAngleDeg[k] / n, lcMaxAngleDeg[k], lcLatG[k] / n, lcMaxLatG[k]);
+        }
+        out << Format("steering smoothed at speed (frames over 0.005 rad from the game, openpilot): %d; not smoothed: not the frame after %d, handbrake turn %d, sliding %d, braking hard %d, just hit %d\n",
             steerRateLimitedFrames, steerRateExempt[0], steerRateExempt[1], steerRateExempt[2], steerRateExempt[3], steerRateExempt[4]);
         out << Format("acceleration held to the jerk limit (frames, openpilot D): %d; queue starts held until the one ahead really went (frames, E): %d\n",
             jerkLimitedFrames, queueHolds);
