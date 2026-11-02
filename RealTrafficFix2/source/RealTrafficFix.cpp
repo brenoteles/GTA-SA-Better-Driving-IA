@@ -75,11 +75,11 @@ static const char* roadNames[] = { "?", "dirt", "narrow", "street", "rural", "av
 // Driver profiles. Each driver gets one when the vehicle is created (weights in the ini, biased by vehicle type and driver)
 enum eDriverProfile : unsigned char {
     PROFILE_CALM, PROFILE_SAFE, PROFILE_NORMAL, PROFILE_FAST, PROFILE_AGGRESSIVE, PROFILE_FLEEING, PROFILE_MAX_PERFORMANCE,
-    PROFILE_WHEELSPIN, NUM_PROFILES
+    PROFILE_WHEELSPIN, PROFILE_ALONE, NUM_PROFILES
 };
-static const char* profileNames[NUM_PROFILES] = { "calm", "safe", "normal", "fast", "aggressive", "fleeing", "max perf", "wheelspin" };
+static const char* profileNames[NUM_PROFILES] = { "calm", "safe", "normal", "fast", "aggressive", "fleeing", "max perf", "wheelspin", "alone" };
 static const char* profileSections[NUM_PROFILES] = { "Profile.Calm", "Profile.Safe", "Profile.Normal", "Profile.Fast",
-    "Profile.Aggressive", "Profile.Fleeing", "Profile.MaxPerformance", "Profile.Wheelspin" };
+    "Profile.Aggressive", "Profile.Fleeing", "Profile.MaxPerformance", "Profile.Wheelspin", "Profile.Alone" };
 
 struct DriverProfile {
     int chance;                 // relative weight
@@ -114,6 +114,7 @@ static DriverProfile profiles[NUM_PROFILES] = {
     {    0,   1.70f, 9.0f, 6.0f, 0.3f, 2.0f, 0.88f, 1.00f, 0.98f,  4.0f, 1.00f,  1, 90.0f, true,  false, true  }, // fleeing
     {    0,   1.00f, 9.0f, 7.0f, 0.3f, 3.0f, 0.95f, 1.00f, 0.95f,  6.0f, 0.80f,  1, 75.0f, true,  true,  false }, // max performance
     {    0,   1.25f, 3.5f, 4.0f, 0.3f, 1.0f, 0.62f, 1.00f, 0.95f,  6.0f, 0.85f,  1, 65.0f, false, false, false }, // wheelspin (see ApplyWheelspin)
+    {    0,   2.00f, 2.8f, 3.5f, 0.4f, 0.9f, 0.62f, 0.98f, 0.92f,  8.0f, 0.70f,  1, 60.0f, false, false, false }, // alone: fast at 2x the road (tests)
 };
 
 // Lane changes of the mod (overtaking, keeping right)
@@ -221,6 +222,8 @@ public:
     float lastSteerOut = 0.0f;      // the steering given last frame (rate limit)
     unsigned int lastSteerFrame = 0;
     unsigned int lastImpactMs = 0;  // last frame something damaged it (a real hit, not the body touching the ground)
+    float laneKeepInt = 0.0f;       // lane keeping PID: integral of the distance to the lane centre (m s)
+    unsigned int laneKeepFrame = 0;
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
@@ -3253,21 +3256,13 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
 
 static CVehicle* followPathVehicle = nullptr;
 
-// Pure pursuit: steering so the vehicle's arc passes through 'target'
-static float SteerTowards(CVehicle* veh, const CVector2D& target) {
-    const CVector2D pos = veh->GetPosition().To2D();
-    CVector2D toTarget = target - pos;
-    float dist = std::max(toTarget.Magnitude(), 1.0f);
-    CVector2D fwd = veh->GetForward().To2D();
-    float alpha = WrapAngle(CGeneral::GetATanOfXY(toTarget.x, toTarget.y) - CGeneral::GetATanOfXY(fwd.x, fwd.y));
-
+// The steering that really makes a curvature (> 0: to the left): the measured effective wheelbase plus the understeer at
+// this speed, else the geometric wheelbase
+static float SteerForCurvature(CVehicle* veh, float curvature) {
     CVector modelMin, modelMax;
     GetEntityDimensions(veh, modelMin, modelMax);
     float wheelBase = GetWheelBase(veh, modelMin, modelMax);
-    // The curvature to the target (pure pursuit) and the steering that really makes it: the measured effective wheelbase
-    // plus the understeer at this speed
-    const float curvature = 2.0f * std::sin(alpha) / dist;
-    float steer = std::atan(2.0f * wheelBase * std::sin(alpha) / dist);
+    float steer = std::atan(wheelBase * curvature);
     auto it = cfgSteerModel ? learnedSteer.find(veh->m_nModelIndex) : learnedSteer.end();
     if (it != learnedSteer.end() && it->second.nL >= 20) {
         const float v = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
@@ -3275,6 +3270,16 @@ static float SteerTowards(CVehicle* veh, const CVector2D& target) {
     }
     float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh); // CCarCtrl::FindMaxSteerAngle
     return std::clamp(steer, -maxSteer, maxSteer);
+}
+
+// Pure pursuit: steering so the vehicle's arc passes through 'target'
+static float SteerTowards(CVehicle* veh, const CVector2D& target) {
+    const CVector2D pos = veh->GetPosition().To2D();
+    CVector2D toTarget = target - pos;
+    float dist = std::max(toTarget.Magnitude(), 1.0f);
+    CVector2D fwd = veh->GetForward().To2D();
+    float alpha = WrapAngle(CGeneral::GetATanOfXY(toTarget.x, toTarget.y) - CGeneral::GetATanOfXY(fwd.x, fwd.y));
+    return SteerForCurvature(veh, 2.0f * std::sin(alpha) / dist);
 }
 
 // Pure pursuit on the racing line: steer so the vehicle's arc passes through the point lookDist ahead on the line
@@ -3381,7 +3386,7 @@ static float GetSmoothLaneSteer(CVehicle* veh, const ExtendedData& xdata, float 
 // The centre of lane laneF lookDist ahead along the route (segment 1 -> 2 is current node -> next node, each segment with
 // its own lanes). False where the road data doesn't go on
 static bool LanePointAhead(CVehicle* veh, const ExtendedData& xdata, float lookDist, float laneF, CVector2D& target,
-    int* segOut = nullptr) {
+    int* segOut = nullptr, CVector2D* dirOut = nullptr) {
     if (xdata.pathCount < 3) return false;
     const CVector2D pos = veh->GetPosition().To2D();
     int seg = 1;
@@ -3406,6 +3411,7 @@ static bool LanePointAhead(CVehicle* veh, const ExtendedData& xdata, float lookD
     float lat = (xdata.pathLaneOffset[seg] + laneF) * LANE_WIDTH;
     target = linkPos + dir * CVector2D::Dot(point - linkPos, dir) + r * lat;
     if (segOut) *segOut = seg;
+    if (dirOut) *dirOut = dir;
     return true;
 }
 
@@ -3421,26 +3427,44 @@ static float GetLaneChangeSteer(CVehicle* veh, const ExtendedData& xdata, float 
 
 // Lane keeping at speed: the game steers by the angle to its next point (steering = heading error at every speed), so at
 // 170 km/h 11 degrees off was full lock (0.2 rad, ~3 g): the car overshot, steered back the same way and weaved from
-// lock to lock (test 153627). Pure pursuit to the lane centre one second ahead: the gain falls with speed. Only when it's
-// in the lane the game wants (else the game brings it there)
+// lock to lock (test 153627). Pure pursuit 1 s ahead still weaved a little. A PID on the distance to the lane centre:
+// the road's own curvature (three lane points ahead) as feed-forward, plus a sideways acceleration from the error
+// (P), how fast it's closing (D: the speed across the lane) and what stays off (I), as a curvature a / v^2 through the
+// measured turn model. Tuned as a spring: 1.2 rad/s, damping 0.8 (no overshoot), at most 0.35 g of correction. Only in
+// the lane the game wants (else the game brings it there), never into a junction or where the lanes change
 static int laneKeepFrames = 0;
-static float GetLaneKeepSteer(CVehicle* veh, const ExtendedData& xdata, float speed) {
+static double laneKeepErrSum = 0.0;
+static float laneKeepErrMax = 0.0f;
+static float GetLaneKeepSteer(CVehicle* veh, ExtendedData& xdata, float speed) {
     if (xdata.pathCount < 3 || !xdata.pathLinkOk[1]) return NAN;
     const float laneF = static_cast<float>(veh->m_autoPilot.m_nNextLane);
-    CVector2D d = xdata.path[2].To2D() - xdata.path[1].To2D();
-    const float len = d.Magnitude();
-    if (len < 0.5f) return NAN;
-    d *= 1.0f / len;
-    const float physical = CVector2D::Dot(veh->GetPosition().To2D() - xdata.pathLinkPos[1], CVector2D(d.y, -d.x)) / LANE_WIDTH -
-        xdata.pathLaneOffset[1];
-    if (std::abs(physical - laneF) > 0.6f) return NAN;
-    // Not into a junction (the game picks the way through), nor where the lanes change (lane numbers start elsewhere)
     const float lookDist = std::clamp(speed, 20.0f, 60.0f);
     if (DistToJunctionAhead(veh, lookDist + speed * 1.5f) < lookDist + speed * 1.5f) return NAN;
-    CVector2D target;
+    CVector2D p0, p1, p2, dir;
     int seg = 1;
-    if (!LanePointAhead(veh, xdata, lookDist, laneF, target, &seg) || xdata.pathLaneOffset[seg] != xdata.pathLaneOffset[1]) return NAN;
-    return SteerTowards(veh, target);
+    if (!LanePointAhead(veh, xdata, 0.0f, laneF, p0, nullptr, &dir) || !LanePointAhead(veh, xdata, lookDist * 0.5f, laneF, p1) ||
+        !LanePointAhead(veh, xdata, lookDist, laneF, p2, &seg) || xdata.pathLaneOffset[seg] != xdata.pathLaneOffset[1]) return NAN;
+    const CVector2D left(-dir.y, dir.x);
+    const float err = CVector2D::Dot(veh->GetPosition().To2D() - p0, left); // m, > 0: left of the centre
+    if (std::abs(err) > 0.6f * LANE_WIDTH) return NAN;
+    const CVector2D vel = veh->m_vecMoveSpeed.To2D() * GAME_SPEED_TO_MPS;
+    const float v = std::max(vel.Magnitude(), 1.0f);
+    const float errRate = CVector2D::Cross(dir, vel);                       // m/s across the lane, > 0: to the left
+    // Feed-forward: the lane's curvature (> 0: bends left)
+    float roadCurv = 0.0f;
+    {
+        const float a = (p1 - p0).Magnitude(), b = (p2 - p1).Magnitude(), c = (p2 - p0).Magnitude();
+        if (a > 1.0f && b > 1.0f && c > 1.0f) roadCurv = 2.0f * CVector2D::Cross(p1 - p0, p2 - p1) / (a * b * c);
+    }
+    const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
+    if (xdata.laneKeepFrame + 1 != frameCounter) xdata.laneKeepInt = 0.0f; // a new stretch: no old error
+    xdata.laneKeepFrame = frameCounter;
+    xdata.laneKeepInt = std::clamp(xdata.laneKeepInt + err * dt, -2.0f, 2.0f);
+    const float kp = 1.44f, kd = 1.92f, ki = 0.15f;
+    const float accel = std::clamp(-(kp * err + kd * errRate + ki * xdata.laneKeepInt), -0.35f * GRAVITY, 0.35f * GRAVITY);
+    laneKeepErrSum += std::abs(err);
+    laneKeepErrMax = std::max(laneKeepErrMax, std::abs(err));
+    return SteerForCurvature(veh, roadCurv + accel / (v * v));
 }
 
 // Creeping up to a stopped vehicle in a queue: our own pedals (the game's car-ahead logic stops ~5 m behind it)
@@ -3748,14 +3772,14 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
         }
     }
 
-    // Lane keeping at speed (see GetLaneKeepSteer): blended in from 54 to 83 km/h, away from junctions
+    // Lane keeping at speed (see GetLaneKeepSteer): blended in from 43 to 65 km/h, away from junctions
     // (distToJunctionAhead is only measured on rural roads: on freeways and avenues it's always 1000; GetLaneKeepSteer
     // measures it)
     if (cfgLaneKeep && (xdata.laneState == LANE_KEEP || xdata.laneState == LANE_OVERTAKING) && !xdata.bypassUntil &&
-        xdata.lineBlend <= 0.0f && speed > 15.0f && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
+        xdata.lineBlend <= 0.0f && speed > 12.0f && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
         const float keep = GetLaneKeepSteer(veh, xdata, speed);
         if (std::isfinite(keep)) {
-            *steer += (keep - *steer) * std::clamp((speed - 15.0f) / 8.0f, 0.0f, 1.0f);
+            *steer += (keep - *steer) * std::clamp((speed - 12.0f) / 6.0f, 0.0f, 1.0f);
             laneKeepFrames++;
         }
     }

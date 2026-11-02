@@ -41,7 +41,7 @@ AUTOTEST_INI = os.path.join(SCRIPTS, 'RealTrafficFix.autotest.ini')
 MIXSETS_INI = os.path.join(GAME_DIR, 'modloader', 'MixSets', 'MixSets.ini')
 # Driver profile of the test car (AutoTest TripProfile)
 DRIVERS = {'calmo': 'calm', 'seguro': 'safe', 'normal': 'normal', 'rapido': 'fast', 'agressivo': 'aggressive', 'fuga': 'fleeing',
-           'destracionador': 'wheelspin'}
+           'destracionador': 'wheelspin', 'sozinho': 'alone'}
 DEFAULT_XLSX = os.path.join(os.path.expanduser('~'), 'Desktop', 'RealTrafficFix_Testes.xlsx')
 
 SCENARIOS = {
@@ -196,6 +196,7 @@ class App:
         self.seconds = tk.StringVar(value='90')
         self.maxmin = tk.StringVar(value='35')
         self.nopeds = tk.BooleanVar(value=True)
+        self.notraffic = tk.BooleanVar(value=False)
         self.stoposc = tk.BooleanVar(value=False)
         self.twocars = tk.BooleanVar(value=False)
         self.driver = tk.StringVar(value='rapido')
@@ -221,7 +222,7 @@ class App:
         row += 1
         opts = ttk.Frame(frm)
         opts.grid(row=row, column=0, columnspan=4, sticky='w', pady=2)
-        for text, var in [('Sem pedestres', self.nopeds), ('Parar em oscilacao', self.stoposc), ('Dois carros (normal + agressivo)', self.twocars),
+        for text, var in [('Sem pedestres', self.nopeds), ('Sem trafego', self.notraffic), ('Parar em oscilacao', self.stoposc), ('Dois carros (normal + agressivo)', self.twocars),
                           ('Compilar antes', self.build), ('Usar o .ini do projeto', self.useini)]:
             ttk.Checkbutton(opts, text=text, variable=var).pack(side='left', padx=4)
         row += 1
@@ -397,7 +398,7 @@ class App:
             autotest = ['[AutoTest]', 'Mode = mod', f'Tag = {tag}', f'SecondsPerLocation = {self.seconds.get()}',
                         f'StopOnOscillation = {int(self.stoposc.get())}', f'CarModel = {self.car.get()}', 'MaxLocations = 20',
                         f'HighwayOnly = {sc["HighwayOnly"]}', f'Scenario = {sc["Scenario"]}', f'Route = {sc.get("Route", "")}', f'RouteMaxMinutes = {self.maxmin.get()}',
-                        f'NoPeds = {int(self.nopeds.get())}', f'TripCars = {2 if self.twocars.get() else 1}', f'TripProfile = {DRIVERS[self.driver.get()]}', 'ExitWhenDone = 1']
+                        f'NoPeds = {int(self.nopeds.get())}', f'NoTraffic = {int(self.notraffic.get())}', f'TripCars = {2 if self.twocars.get() else 1}', f'TripProfile = {DRIVERS[self.driver.get()]}', 'ExitWhenDone = 1']
             with open(AUTOTEST_INI, 'w', encoding='ascii', newline='') as f:
                 f.write('\r\n'.join(autotest) + '\r\n')
             self.set_nopause(True)
@@ -540,6 +541,8 @@ if __name__ == '__main__':
         for name, sc in SCENARIOS.items():
             if sc['Scenario'] == want:
                 app.scenario.set(name)
+    if '--notraffic' in sys.argv:  # only the test car
+        app.notraffic.set(True)
     if '--start' in sys.argv:  # start a test right away (default options)
         root.after(500, app.start)
     root.mainloop()

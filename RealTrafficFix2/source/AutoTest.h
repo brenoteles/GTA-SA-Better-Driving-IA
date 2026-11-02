@@ -260,6 +260,7 @@ static int tripCarCount = 1; // TripCars = 2: also the aggressive driver
 static double limiterTime[2][NUM_LIMITERS] = {};
 static int routeMaxMinutes = 35;
 static bool noPeds = true;       // no pedestrians: only the traffic is tested
+static bool noTraffic = false;   // no other cars either: only the test car's own driving (steering)
 static unsigned int stopAt = 0;
 
 static std::unordered_map<CVehicle*, History> histories;
@@ -412,13 +413,16 @@ void Init(const std::string& moduleDir) {
     routeMode = scanMode || ini.ReadString("AutoTest", "Scenario", "") == "route";
     routeFilter = ini.ReadString("AutoTest", "Route", "");
     noPeds = ini.ReadInteger("AutoTest", "NoPeds", 1) != 0;
+    noTraffic = ini.ReadInteger("AutoTest", "NoTraffic", 0) != 0;
+    if (noTraffic) cfgAmbientSpawn = false;
     tripCarCount = std::clamp(ini.ReadInteger("AutoTest", "TripCars", 1), 1, 2);
     // Driver of the (first) test car
     {
         static const struct { const char* key; eDriverProfile profile; const char* label; } drivers[] = {
             { "calm", PROFILE_CALM, "CALM" }, { "safe", PROFILE_SAFE, "SAFE" }, { "normal", PROFILE_NORMAL, "NORMAL" },
             { "fast", PROFILE_FAST, "FAST" }, { "aggressive", PROFILE_AGGRESSIVE, "AGGRESSIVE" },
-            { "fleeing", PROFILE_FLEEING, "FLEEING" }, { "wheelspin", PROFILE_WHEELSPIN, "WHEELSPIN" } };
+            { "fleeing", PROFILE_FLEEING, "FLEEING" }, { "wheelspin", PROFILE_WHEELSPIN, "WHEELSPIN" },
+            { "alone", PROFILE_ALONE, "ALONE" } };
         std::string want = ini.ReadString("AutoTest", "TripProfile", "normal");
         for (const auto& d : drivers) if (want == d.key) { tripCars[0].profile = d.profile; tripCars[0].label = d.label; }
     }
@@ -972,6 +976,20 @@ void Update() {
         }
     }
 
+    if (noTraffic) {
+        // No cars made by the game; the random ones there are removed (off screen, the way the game does) every 2 s
+        Command<COMMAND_SET_CAR_DENSITY_MULTIPLIER>(0.0f);
+        static unsigned int lastCarClear = 0;
+        if (now - lastCarClear > 2000) {
+            lastCarClear = now;
+            for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
+                CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
+                if (!v || v->m_nCreatedBy != RANDOM_VEHICLE || v == tripCars[0].veh || v == tripCars[1].veh) continue;
+                spawnRemovals.push_back(v);
+            }
+        }
+    }
+
     switch (state) {
     case WAIT_GAME:
         if (now < 8000) return; // let the save load settle
@@ -1408,7 +1426,8 @@ void Update() {
         out << Format("actuated lights: switched by the safety valve (a road red too long with someone waiting) %d\n", signalForcedCount);
         out << Format("joined signals (divided avenues, close junctions as one controller): %d, links inside them %d\n", signalClusterCount, (int)signalInternalLinks.size());
         out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
-        out << Format("lane keeping at speed (pure pursuit 1 s ahead): %d vehicle-frames\n", laneKeepFrames);
+        out << Format("lane keeping at speed (PID to the lane centre): %d vehicle-frames, off the centre avg %.2f m, max %.2f m\n",
+            laneKeepFrames, laneKeepFrames ? laneKeepErrSum / laneKeepFrames : 0.0, laneKeepErrMax);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("route leader (mode %d): rays and route agree %d, route says other lane where the rays would brake %d, route says our lane where the rays would ignore it %d, not on the route %d\n",
             cfgRouteLeader, routeAgreeCount, routeOtherLaneRaysWouldBrake, routeInLaneRaysWouldIgnore, routeUnknownCount);
