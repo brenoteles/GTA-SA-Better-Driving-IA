@@ -162,9 +162,22 @@ static CVector lastScanPos;
 static int scanSamples = 0;
 // The trip: two cars (a normal and an aggressive driver) from the same place to the same destination, at the same time.
 // The player rides in one of them; Left/Right arrow switch to the other one
+// The test car's turning, 10 times a second, the last 15 s: what it measured (radius = speed / yaw rate) against what
+// the turn model predicts from its steering, with the speeds and the route around it. Dumped when it leaves the road
+struct TurnSample {
+    unsigned int t;
+    float speed, target, curveSpeed, steer, yaw, rMeas, rPred, slip, latG, offPath, dz;
+    unsigned char limiter;
+};
+static const int TURN_TRACE = 150;
+static int offRoadCount = 0;
+
 struct TripCar {
     const char* label;
     eDriverProfile profile;
+    TurnSample turn[TURN_TRACE];
+    int turnCount = 0, turnHead = 0;
+    unsigned int turnLast = 0, offSince = 0, offDumped = 0;
     int handle = -1, driver = -1;
     CVehicle* veh = nullptr;
     CVector lastPos;
@@ -180,6 +193,67 @@ struct TripCar {
     int blip = -1;      // radar blip
 };
 static TripCar tripCars[2] = { { "NORMAL", PROFILE_NORMAL }, { "AGGRESSIVE", PROFILE_AGGRESSIVE } };
+
+static float Minutes();
+static void RecordTurn(TripCar& c, unsigned int now) {
+    if (!c.veh || now - c.turnLast < 100) return;
+    c.turnLast = now;
+    CVehicle* v = c.veh;
+    const ExtendedData& x = vehExData.Get(v);
+    TurnSample t{};
+    t.t = now;
+    t.speed = v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+    t.target = x.targetSpeed;
+    t.curveSpeed = x.curveSpeed;
+    t.steer = v->m_fSteerAngle;
+    t.yaw = v->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS;
+    t.rMeas = std::abs(t.yaw) > 0.005f ? std::min(t.speed / std::abs(t.yaw), 999.0f) : 999.0f;
+    auto it = learnedSteer.find(v->m_nModelIndex);
+    const float L = it != learnedSteer.end() && it->second.L > 0.0f ? it->second.L : 2.7f;
+    const float K = it != learnedSteer.end() && it->second.nK >= 30 ? std::max(it->second.K, 0.0f) : 0.0f;
+    t.rPred = std::abs(t.steer) > 0.005f ? std::min((L + K * t.speed * t.speed) / std::tan(std::abs(t.steer)), 999.0f) : 999.0f;
+    t.slip = GetSlipAngle(v);
+    t.latG = x.filtLat / GRAVITY;
+    t.limiter = static_cast<unsigned char>(x.limiter);
+    // Off the route: the distance to the nearest of its first pieces, and the height below it
+    t.offPath = 0.0f;
+    t.dz = 0.0f;
+    if (x.pathCount >= 3) {
+        const CVector2D p = v->GetPosition().To2D();
+        float best = 1e9f, bestZ = 0.0f;
+        for (int i = 0; i + 1 < std::min(x.pathCount, 5); i++) {
+            CVector2D a = x.path[i].To2D(), d = x.path[i + 1].To2D() - a;
+            float l2 = d.MagnitudeSqr();
+            float u = l2 > 0.01f ? std::clamp(CVector2D::Dot(p - a, d) / l2, 0.0f, 1.0f) : 0.0f;
+            float dist = (a + d * u - p).Magnitude();
+            if (dist < best) { best = dist; bestZ = x.path[i].z + (x.path[i + 1].z - x.path[i].z) * u; }
+        }
+        t.offPath = best;
+        t.dz = v->GetPosition().z - bestZ;
+    }
+    c.turn[c.turnHead] = t;
+    c.turnHead = (c.turnHead + 1) % TURN_TRACE;
+    c.turnCount = std::min(c.turnCount + 1, TURN_TRACE);
+    // Off the road: 12 m off the route or 3 m below it for a second
+    const bool off = t.offPath > 12.0f || t.dz < -3.0f;
+    if (!off) { c.offSince = 0; return; }
+    if (!c.offSince) c.offSince = now;
+    if (now - c.offSince < 1000 || (c.offDumped && now - c.offDumped < 30000)) return;
+    c.offDumped = now;
+    offRoadCount++;
+    out << Format("=== OFF ROAD #%d t=%.2f min: %s model %d at (%.0f, %.0f, %.0f), %.0f m off the route, %.1f m below it" "\n",
+        offRoadCount, Minutes(), c.label, v->m_nModelIndex, v->GetPosition().x, v->GetPosition().y, v->GetPosition().z, t.offPath, -t.dz);
+    out << Format("  turn model: L %.2f m, K %.4f (samples %d/%d)" "\n", L, K, it != learnedSteer.end() ? it->second.nL : 0,
+        it != learnedSteer.end() ? it->second.nK : 0);
+    out << "    t(ms)  speed target curveSp limiter     steer  yaw   R meas R pred  slip  latG  offPath   dz" "\n";
+    for (int i = 0; i < c.turnCount; i++) {
+        const TurnSample& q = c.turn[(c.turnHead - c.turnCount + i + TURN_TRACE) % TURN_TRACE];
+        out << Format("  %7d %6.1f %6.1f %7.1f %-10s %6.3f %5.2f %6.0f %6.0f %5.2f %5.2f %8.1f %5.1f" "\n",
+            static_cast<int>(q.t) - static_cast<int>(now), q.speed * 3.6f, q.target * 3.6f, std::min(q.curveSpeed * 3.6f, 999.0f),
+            limiterNames[q.limiter], q.steer, q.yaw, q.rMeas, q.rPred, q.slip, q.latG, q.offPath, q.dz);
+    }
+    out.flush();
+}
 static int followed = 0;
 static int tripCarCount = 1; // TripCars = 2: also the aggressive driver
 // Where the time goes: seconds moving with each speed limiter in charge, freeway / everything else (mod-driven, near the camera)
@@ -1016,6 +1090,7 @@ void Update() {
                     {
                         const float before = c.still;
                         c.still = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f ? c.still + dt : 0.0f;
+                        RecordTurn(c, now);
                         if (static_cast<int>(before / 40.0f) < static_cast<int>(c.still / 40.0f)) {
                             out << Format("  [%s] stuck %.0f s: shots of the scene from 6 angles (stuck_%02d_*)\n", c.label, c.still, orbitCount + 1);
                             StartOrbitShots(c.veh, Format("stuck_%02d", orbitCount + 1));
@@ -1277,6 +1352,19 @@ void Update() {
         out << Format("turns tightened for a vehicle on the outside: %d\n", turnGuardCount);
         out << Format("waited before a junction (the road beyond it full): %d (found along the route past the first piece: %d)\n", boxWaitCount, boxWaitRouteCount);
         out << Format("forward collision warnings (leader braking > 3 m/s2, < 1.8 s to it, openpilot): %d\n", fcwCount);
+        out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; curves capped by what the steering can do %d; test car off the road %d\n",
+            steerSignMatch, steerSignMismatch, steerLimitedCurves, offRoadCount);
+        for (const TripCar& c : tripCars) {
+            if (!c.veh) continue;
+            auto it = learnedSteer.find(c.veh->m_nModelIndex);
+            if (it == learnedSteer.end()) continue;
+            CVector mn, mx;
+            GetEntityDimensions(c.veh, mn, mx);
+            out << Format("  %s model %d: wheelbase %.2f m, effective %.2f m (%d samples), understeer K %.4f (%d samples): radius at full lock x%.2f at 80 km/h, x%.2f at 120\n",
+                c.label, c.veh->m_nModelIndex, GetWheelBase(c.veh, mn, mx), it->second.L, it->second.nL, it->second.K, it->second.nK,
+                (it->second.L + std::max(it->second.K, 0.0f) * 22.2f * 22.2f) / GetWheelBase(c.veh, mn, mx),
+                (it->second.L + std::max(it->second.K, 0.0f) * 33.3f * 33.3f) / GetWheelBase(c.veh, mn, mx));
+        }
         out << Format("kept inside the measured asphalt of narrow roads (frames): %d\n", roadEdgeFrames);
         out << Format("waited their turn at a junction without lights (first come, first served): %d\n", firstComeWaitCount);
         out << Format("low-speed full brakes behind a vehicle: %d\n", lowSpeedBrakeCount);

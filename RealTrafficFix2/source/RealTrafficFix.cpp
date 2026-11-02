@@ -215,6 +215,7 @@ public:
     float filtLat = 0.0f;   // m/s2, smoothed
     float filtLong = 0.0f;  // m/s2, smoothed
     float filtYawRate = 0.0f; // rad/s, smoothed (heading limiter)
+    float prevSteerSample = 0.0f; // steering of the last turn sample (the turn model learns only on steady steering)
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
@@ -1848,11 +1849,43 @@ static float cfgHighwayGapFactor = 0.3f;
 static float cfgCityGapFactor = 0.7f;     // following time gap elsewhere, x the profile's  // following time gap on freeways/fast roads, x the profile's
 // Lateral g the vehicle being driven can take before it tips over (see GetRollGrip): the fast-curve boost never goes past it
 static float curRollGrip = 1000.0f;
+// The turn each model really makes, measured in the game (UpdateSteerModel): steering angle d gives the curvature
+// k = tan(d) / (L + K v^2), L the effective wheelbase (low speed), K the understeer gradient (the radius opening up with
+// speed). The geometric model (the wheelbase, no understeer) said a tall soft SUV could take an interchange loop at
+// 100+ km/h: the Sandking ran wide off it into the pit under the overpass. For the vehicle being processed (0: not known)
+static bool cfgSteerModel = true;
+static float curSteerL = 0.0f, curSteerK = 0.0f;
+// The steering the game allows at a speed (CCarCtrl::FindMaxSteerAngle, 0x427FE0): min(0.7, 0.9 - v) in game units
+// (v/50 m/s) up to 35 m/s, 0.2 above
+static float MaxSteerAt(float v) {
+    const float g = v / GAME_SPEED_TO_MPS;
+    return g <= 0.7f ? std::min(0.7f, 0.9f - g) : 0.2f;
+}
+// Highest speed whose curvature the steering can still make, with 15% to spare (the car's measured turn)
+static float SteerSpeedFor(float curvature) {
+    if (curvature < 1e-4f || curSteerL <= 0.0f) return 1000.0f;
+    auto ok = [curvature](float v) { return curvature * (curSteerL + curSteerK * v * v) <= 0.85f * std::tan(MaxSteerAt(v)); };
+    float lo = 3.0f, hi = 90.0f;
+    if (!ok(lo)) return lo;
+    if (ok(hi)) return hi;
+    for (int i = 0; i < 20; i++) {
+        const float mid = (lo + hi) * 0.5f;
+        if (ok(mid)) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+static int steerLimitedCurves = 0;
 static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
     float t = std::clamp((v - 60.0f / 3.6f) / ((110.0f - 60.0f) / 3.6f), 0.0f, 1.0f);
     float boosted = grip * (1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
-    return std::sqrt(std::min(boosted, std::max(curRollGrip, grip)) * GRAVITY / curvature);
+    const float gripSpeed = std::sqrt(std::min(boosted, std::max(curRollGrip, grip)) * GRAVITY / curvature);
+    // Not faster than the steering can turn it (the grip boost knew nothing of understeer)
+    if (cfgSteerModel && curSteerL > 0.0f) {
+        const float steerSpeed = SteerSpeedFor(curvature);
+        if (steerSpeed < gripSpeed) { steerLimitedCurves++; return steerSpeed; }
+    }
+    return gripSpeed;
 }
 
 // Rollover: tall vehicles tip over before their tyres slide (the cement truck rolled in a curve at 133 km/h). Static
@@ -3067,12 +3100,62 @@ static float GetWheelBase(CVehicle* veh, const CVector& modelMin, const CVector&
 
 // Max speed (m/s) for the turn the vehicle is making right now. Curvature is the largest of what the AI
 // asks with the steering wheel (bicycle model) and what the car is really doing (yaw rate / speed)
+struct ModelSteer { float L = 0.0f, K = 0.0f; int nL = 0, nK = 0; };
+static std::unordered_map<int, ModelSteer> learnedSteer;
+static std::string steerFile;
+static bool steerDirty = false;
+static int steerSignMatch = 0, steerSignMismatch = 0;
+static void LoadSteerModel() {
+    std::ifstream f(steerFile);
+    int model, nL, nK;
+    float L, K;
+    while (f >> model >> L >> K >> nL >> nK) learnedSteer[model] = { L, K, nL, nK };
+    lg << "Turn model loaded for " << learnedSteer.size() << " models\n";
+}
+static void SaveSteerModel() {
+    if (!steerDirty) return;
+    std::ofstream f(steerFile, std::ios::trunc);
+    for (auto& [model, st] : learnedSteer) if (st.nL > 0) f << model << " " << st.L << " " << st.K << " " << st.nL << " " << st.nK << "\n";
+    steerDirty = false;
+}
+// Measured each frame on steady steering, four wheels down, no slide: the curvature the car really makes (yaw rate /
+// speed) against its steering angle. Below 12 m/s the effective wheelbase, above it the understeer gradient
+static void UpdateSteerModel(CVehicle* veh, ExtendedData& xdata, float speed, const CVector& mn, const CVector& mx) {
+    if (!cfgSteerModel || veh->m_nVehicleSubClass != VEHICLE_AUTOMOBILE || veh->GetNumContactWheels() < 4 || xdata.damageFactor < 1.0f) return;
+    const float delta = veh->m_fSteerAngle;
+    const bool steady = std::abs(delta - xdata.prevSteerSample) < 0.02f;
+    xdata.prevSteerSample = delta;
+    const float yaw = veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS;
+    if (!steady || speed < 3.0f || std::abs(delta) < 0.04f || std::abs(yaw) < 0.03f || GetSlipAngle(veh) > 0.08f) return;
+    if ((delta > 0.0f) != (yaw > 0.0f)) { steerSignMismatch++; return; }
+    steerSignMatch++;
+    const float wb = GetWheelBase(veh, mn, mx);
+    ModelSteer& st = learnedSteer[veh->m_nModelIndex];
+    if (st.L <= 0.0f) st.L = wb;
+    const float k = std::abs(yaw) / speed;
+    if (speed < 12.0f && std::abs(delta) > 0.08f) {
+        const float Ls = std::tan(std::abs(delta)) / k;
+        if (Ls > wb * 0.6f && Ls < wb * 2.5f) { st.L += (Ls - st.L) * 0.02f; st.nL++; steerDirty = true; }
+    }
+    else if (speed >= 12.0f && st.nL >= 20) {
+        const float Ks = (std::abs(delta) - std::atan(st.L * k)) / (speed * speed * k);
+        if (Ks > -0.01f && Ks < 0.06f) { st.K += (Ks - st.K) * 0.02f; st.nK++; steerDirty = true; }
+    }
+}
+// The vehicle's turn for the curve speeds (CurveSpeedFor): known once there are enough samples
+static void SetCurrentSteerModel(CVehicle* veh) {
+    auto it = learnedSteer.find(veh->m_nModelIndex);
+    curSteerL = (it != learnedSteer.end() && it->second.nL >= 20) ? it->second.L : 0.0f;
+    curSteerK = (it != learnedSteer.end() && it->second.nK >= 30) ? std::max(it->second.K, 0.0f) : 0.0f;
+}
+
 static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& modelMin, const CVector& modelMax, float speed, float grip) {
     float wheelBase = GetWheelBase(veh, modelMin, modelMax);
     // Small steering corrections (lane keeping, lane changes) aren't a turn: at speed 3 degrees of steering read as a
     // 30 m radius and held traffic at ~45 km/h on freeways. The steering only counts from ~8 degrees (a real turn starting)
     float steerAngle = std::max(std::abs(veh->m_fSteerAngle) - 0.14f, 0.0f);
-    float steerCurvature = std::tan(std::min(steerAngle, 1.2f)) / wheelBase;
+    // The curvature the steering really gives (measured turn model: understeer opens it up with speed)
+    float steerCurvature = std::tan(std::min(steerAngle, 1.2f)) / (curSteerL > 0.0f ? curSteerL + curSteerK * speed * speed : wheelBase);
     // The real turn, smoothed (~0.4 s): the AI's steering wobbles on freeways (15-20 degrees/s back and forth), which
     // read as a tight curve for an instant and braked the car
     float yawRate = veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS; // rad/s
@@ -3117,7 +3200,15 @@ static float SteerTowards(CVehicle* veh, const CVector2D& target) {
     CVector modelMin, modelMax;
     GetEntityDimensions(veh, modelMin, modelMax);
     float wheelBase = GetWheelBase(veh, modelMin, modelMax);
+    // The curvature to the target (pure pursuit) and the steering that really makes it: the measured effective wheelbase
+    // plus the understeer at this speed
+    const float curvature = 2.0f * std::sin(alpha) / dist;
     float steer = std::atan(2.0f * wheelBase * std::sin(alpha) / dist);
+    auto it = cfgSteerModel ? learnedSteer.find(veh->m_nModelIndex) : learnedSteer.end();
+    if (it != learnedSteer.end() && it->second.nL >= 20) {
+        const float v = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+        steer = std::atan(it->second.L * curvature) + (it->second.nK >= 30 ? std::max(it->second.K, 0.0f) : 0.0f) * v * v * curvature;
+    }
     float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh); // CCarCtrl::FindMaxSteerAngle
     return std::clamp(steer, -maxSteer, maxSteer);
 }
@@ -4008,6 +4099,7 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "SteerModel", cfgSteerModel);
         ReadIniBool(ini, "RoadEdges", cfgRoadEdges);
         ReadIniBool(ini, "LeadAccel", cfgLeadAccel);
         ReadIniBool(ini, "AccelBySpeed", cfgAccelBySpeed);
@@ -4211,6 +4303,8 @@ public:
         CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
         learnedFile = dir + "RealTrafficFix.limits.txt"; // v2 measurement (the old .learned.txt values were inflated);
         if (cfgAdaptiveLimits) LoadLearnedLimits();
+        steerFile = dir + "RealTrafficFix.steer.txt";
+        if (cfgSteerModel) LoadSteerModel();
 
         // Runs once per game frame, before CWorld::Process (where the AI reads the cruise speed),
         // for every vehicle, not only the ones being rendered
@@ -4257,7 +4351,7 @@ public:
             if (cfgRouteFixes && frameCounter % 120 == 1) ApplyRouteFixes(); // ~2 s, and right after the road data loads
             WdStage("UpdatePassMeasures");
             UpdatePassMeasures();
-            if (frameCounter % 3000 == 0) SaveLearnedLimits(); // ~1 min
+            if (frameCounter % 3000 == 0) { SaveLearnedLimits(); SaveSteerModel(); } // ~1 min
 
             if (checkBumps == -1) {
                 checkBumps = 0;
@@ -4307,6 +4401,7 @@ public:
         Events::onPauseAllSounds += [] {
             lg.flush();
             SaveLearnedLimits();
+            SaveSteerModel();
         };
     }
 
@@ -4489,6 +4584,7 @@ public:
         grip *= xdata.surfaceFactor * damageGrip;
         // Not past what tips it over
         curRollGrip = GetRollGrip(vehicle);
+        SetCurrentSteerModel(vehicle);
         grip = std::min(grip, curRollGrip);
         decel *= xdata.surfaceFactor * damageGrip;
         // Curves and the braking before them: a share of what this car can really do (learned per model), not only the
@@ -4670,6 +4766,7 @@ public:
 
         xdata.valid = true;
         UpdateLearnedLimits(vehicle, xdata, speed, CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS);
+        UpdateSteerModel(vehicle, xdata, speed, modelMin, modelMax);
         if (cfgTestMode) {
             debugVehiclesProcessed++;
             if (racer) debugRacers++;
