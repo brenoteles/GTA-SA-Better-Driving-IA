@@ -251,6 +251,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
           <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
           <tr><td class="mono">120816</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Proposta 3 e openpilot A e C: 8,26 min, 77 km/h, 2,18 colisões/min</td></tr>
+          <tr><td class="mono">123526</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Carros dentro do asfalto e postes no meio-fio: 7,74 min, 82 km/h, 2,20 colisões/min, só 3 fortes</td></tr>
           <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
         </tbody>
       </table>
@@ -533,6 +534,36 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     </ul>
     <p>Ela também resolve os postes: eles caíram no meio da rua porque a borda foi calculada pelas faixas dos dados. Com a borda real do asfalto, cada poste pode ir logo depois do meio-fio.</p>
     <div class="who"><span class="tag t-claude">Claude: leitor de colisões, medição, análise</span><span class="tag t-gemini">Gemini: pedido de conferência do formato COL e da rotação dos IPL (a primeira tentativa foi bloqueada por permissão; acesso ampliado)</span><span class="tag t-user">ideia do usuário: não dirigir o mapa inteiro</span></div>
+  </section>
+
+  <section id="quatro">
+    <h2>Os quatro passos com a largura medida</h2>
+    <h3>1. Carros dentro do asfalto nas ruas estreitas</h3>
+    <p><code>tools/road_edges.py</code> gera <code>RealTrafficFix.roadedges.txt</code> com 1.776 ligações onde as faixas dos dados (5,4 m) passam do asfalto medido, com a borda de cada lado. O mod carrega o arquivo e, enquanto o carro anda numa dessas ligações, se a carroceria vai passar a 0,3 m da borda e ainda aponta para fora, volta para o limite. Dentro do asfalto o jogo segue mandando. Exemplo: rua 1+1 com 3,75 m de cada lado, faixa do jogo a 2,7 m do meio; o carro é puxado 0,25 m para dentro.</p>
+    <h3>2. Postes no meio-fio de verdade</h3>
+    <p>O gerador de postes agora usa a borda medida da rua que o poste atende (o poste 0,8 m depois do meio-fio), a largura medida da rua transversal para o recuo, confere na colisão que o ponto não é pista (se for, empurra para fora de 0,5 em 0,5 m até 4 m) e pega a altura do chão ali. A altura de cada modelo sobre o chão vem dos postes originais (CJ_TRAFFIC_LIGHT4 tem a origem 1,21 m acima do chão; pelo nó parecia 0,18 m, porque os nós ficam ~1 m acima do asfalto). Resultado: 2.563 postes, 2.989 aproximações pela borda medida, no chão (sem os 5,5 m de antes).</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Teste 123526 (passos 1 e 2)</th><th>Valor</th></tr></thead>
+      <tbody>
+        <tr><td>Resultado</td><td>chegou em 7,74 min, 82 km/h, 3 colisões do carro</td></tr>
+        <tr><td>Colisões no tráfego</td><td>2,20/min; as fortes (&gt; 20 km/h) caíram de 7 para 3</td></tr>
+        <tr><td>Correção de borda</td><td>61 frames (a rota é quase toda rodovia)</td></tr>
+        <tr><td>Congelamento</td><td>nenhum</td></tr>
+      </tbody></table></div>
+    <h3>3. Faixas extras, primeiro no SUMO</h3>
+    <p><code>tools/lane_additions.py</code> só acrescenta faixa a um trecho inteiro entre cruzamentos: mão única, todas as ligações medidas com as duas bordas e espaço para mais uma faixa de 5,4 m em todas. Meio trecho deixaria afunilamentos a cada poucos metros. De 2.861 trechos, 79 passaram (608 ligações); o fim da rampa da Garver Bridge não passou, porque parte do trecho fica no deck da ponte, onde não dá para achar as bordas.</p>
+    <p>Para comparar de forma justa, as duas redes do SUMO mantêm cada segmento do GTA com o nome original e sem rampas deduzidas (elas mudam de nome com o número de faixas), e as mesmas 3.000 viagens rodam nas duas:</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>SUMO, mesmas viagens</th><th class="num">Base</th><th class="num">Com as 79 faixas</th></tr></thead>
+      <tbody>
+        <tr><td>Tempo por viagem</td><td class="num">746,6 s</td><td class="num">727,5 s (−2,6%)</td></tr>
+        <tr><td>Tempo parado</td><td class="num">334 s</td><td class="num">318 s (−4,7%)</td></tr>
+        <tr><td>Velocidade média</td><td class="num">10,13 m/s</td><td class="num">10,21 m/s</td></tr>
+        <tr><td>Teleportes</td><td class="num">456</td><td class="num">463 (ruído)</td></tr>
+      </tbody></table></div>
+    <p>Ganho pequeno e medido, sem criar engarrafamento novo. As faixas foram gravadas nos arquivos de rota (<code>tools/apply_lanes.py</code>); o validador dá exatamente os mesmos erros antes e depois (todos já existiam). Os arquivos anteriores ficaram guardados. Instalado no jogo; o teste está rodando.</p>
+    <h3>4. fastman92 só com a depuração de rotas</h3>
+    <p>Instalado na pasta do jogo sem sobrescrever nada. O jogo já tem um <code>zlib1.dll</code> diferente (de 2021, usado por outro mod); o do FLA (2020) não foi copiado. Na primeira execução o FLA abre uma janela própria e o jogo espera ela fechar; ela mostra o código que a desliga. Depois disso vem o ini, onde só a depuração de rotas será ligada.</p>
   </section>
 
   <section id="fla">
