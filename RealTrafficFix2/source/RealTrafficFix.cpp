@@ -1544,7 +1544,8 @@ static int signalClusterCount = 0;
 static bool JunctionHasLight(const CNodeAddress& a, CPathNode* n) {
     for (int k = 0; k < n->NumberAdjNodes; k++) {
         CCarPathLink* l = GetLinkBetween(a, n, GetAdjacentNode(n, a, k));
-        if (l && l->m_nTrafficLightState) return true;
+        // For traffic arriving here (the link between two junctions carries the light of one of them only)
+        if (l && l->m_nTrafficLightState && (l->m_bTrafficLightDirection ? l->m_address == a : !(l->m_address == a))) return true;
     }
     return false;
 }
@@ -1554,7 +1555,7 @@ static uint32_t SignalRep(const CNodeAddress& j) {
     if (it != signalRepOf.end()) return it->second;
     std::vector<CNodeAddress> members{ j };
     std::vector<const CCarPathLink*> internal;
-    for (size_t m = 0; m < members.size() && members.size() < 4; m++) {
+    for (size_t m = 0; m < members.size(); m++) {
         const CNodeAddress a = members[m];
         CPathNode* an = GetNode(a);
         if (!an) continue;
@@ -1579,7 +1580,7 @@ static uint32_t SignalRep(const CNodeAddress& j) {
                 internal.insert(internal.end(), chain.begin(), chain.end());
                 continue;
             }
-            if (signalRepOf.count(SignalKey(curA))) continue; // already in another controller
+            if (signalRepOf.count(SignalKey(curA)) || members.size() >= 4) continue; // another controller's, or full
             members.push_back(curA);
             internal.insert(internal.end(), chain.begin(), chain.end());
         }
@@ -1617,7 +1618,6 @@ static void UpdateSignal(JunctionSignal& sig, const std::vector<CNodeAddress>& m
                 CNodeAddress nb = GetAdjacentNode(jn, member, k);
                 CPathNode* nn = GetNode(nb);
                 if (!nn) { sig.legsKnown = false; continue; } // not streamed in yet: look again later
-                if (signalInternalLinks.count(GetLinkBetween(member, jn, nb))) continue; // inside the joined junction
                 CVector2D d = GetNodePos(nn).To2D() - jp.To2D();
                 float len = d.Magnitude();
                 if (len < 0.5f) continue;
@@ -1724,11 +1724,15 @@ static eLightColor SignalColor(const CNodeAddress& junction, int cycle) {
     return sub == 0 ? LIGHT_GREEN : (sub == 1 ? LIGHT_YELLOW : LIGHT_RED);
 }
 
-// A light on a link inside a joined junction (the median): green for its cycle's whole phase, clearance included
+// A light on a link inside a joined junction (the median): green through its cycle's green, yellow and the 2 s added to
+// the all-red to clear the median; red for the last (normal) all-red, so nobody crosses the far carriageway as it opens
 static eLightColor SignalColorForLink(const CCarPathLink* link, const CNodeAddress& junction, int cycle) {
     if (!signalInternalLinks.empty() && signalInternalLinks.count(link)) {
         const JunctionSignal& sig = SignalOf(junction);
-        return (sig.phase < 3 ? 1 : 2) == cycle ? LIGHT_GREEN : LIGHT_RED;
+        if ((sig.phase < 3 ? 1 : 2) != cycle) return LIGHT_RED;
+        const int sub = sig.phase % 3;
+        const float elapsed = (CTimer::m_snTimeInMilliseconds - sig.phaseStart) / 1000.0f;
+        return (sub < 2 || elapsed < 2.0f) ? LIGHT_GREEN : LIGHT_RED;
     }
     return SignalColor(junction, cycle);
 }

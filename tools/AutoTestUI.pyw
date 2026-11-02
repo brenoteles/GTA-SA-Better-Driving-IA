@@ -309,6 +309,11 @@ class App:
             out = subprocess.run([sys.executable.replace('pythonw', 'python'), script, '--click', '--ini', fla_ini],
                                  capture_output=True, text=True).stdout
             if 'clicking' in out:
+                try:
+                    with open(os.path.join(SCRIPTS, 'fla_window_last.txt'), 'w', encoding='utf-8') as f:
+                        f.write(out)
+                except OSError:
+                    pass
                 code = re.search(r'disable code: (\S+)', out)
                 self.log('fastman92: janela fechada' + (f', codigo {code.group(1)} salvo no ini' if code else
                                                         ' (codigo nao encontrado no texto da janela)'))
