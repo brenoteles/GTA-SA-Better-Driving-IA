@@ -1521,8 +1521,10 @@ struct JunctionSignal {
     int demand[3] = {};                 // cars arriving on cycle 1/2 roads within 60 m
     bool arriving[3] = {};              // one of them within the gap time of the stop line
     unsigned int lastGreen[3] = {};     // when each cycle last had green
-    // Its roads arriving with a light: direction from the junction out along the road, and the light's cycle
-    std::vector<std::pair<CVector2D, int>> legs;
+    // Its roads arriving with a light (of every junction joined into it): the junction's position, the direction out along
+    // the road, the light's cycle
+    struct Leg { CVector2D origin, dir; int cycle; float z; };
+    std::vector<Leg> legs;
     bool legsKnown = false;
 };
 static int signalForcedCount = 0;
@@ -1530,71 +1532,146 @@ static std::unordered_map<uint32_t, JunctionSignal> junctionSignals;
 static int signalGapOutCount = 0, signalMaxOutCount = 0, signalRestCount = 0;
 static uint32_t SignalKey(const CNodeAddress& a) { return (static_cast<uint32_t>(a.Region) << 16) | a.Index; }
 
-static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsigned int now) {
-    if (now - sig.lastUpdate < 250) return;
-    sig.lastUpdate = now;
-    CPathNode* jn = GetNode(junction);
-    if (!jn) return;
-    const CVector jp = GetNodePos(jn);
-    sig.demand[1] = sig.demand[2] = 0;
-    sig.arriving[1] = sig.arriving[2] = false;
-    if (!sig.legsKnown) {
-        sig.legsKnown = true;
-        for (int k = 0; k < jn->NumberAdjNodes; k++) {
-            CNodeAddress nb = GetAdjacentNode(jn, junction, k);
-            CPathNode* nn = GetNode(nb);
-            if (!nn) { sig.legsKnown = false; continue; } // not streamed in yet: look again later
-            CVector2D d = GetNodePos(nn).To2D() - jp.To2D();
-            float len = d.Magnitude();
-            if (len < 0.5f) continue;
-            // The road's light: on the link at the junction, or a node or two up the road (the game's own lights often sit
-            // there; those roads never counted as waiting)
-            CNodeAddress prevA = junction, curA = nb;
-            CPathNode* prevN = jn;
-            CPathNode* curN = nn;
-            int cycle = 0;
-            for (int step = 0; step < 3 && curN; step++) {
-                CCarPathLink* link = GetLinkBetween(prevA, prevN, curA);
-                if (link && link->m_nTrafficLightState) { cycle = link->m_nTrafficLightState; break; }
-                if (curN->NumberAdjNodes != 2) break;
+// Joined signals (SUMO's tls.join): the junctions of a divided avenue, or two close junctions on one road (< 35 m apart along
+// it), are one controller. Separately the cross street got green at one carriageway and red at the other: cars stopped in
+// the median, the next one stopped in the junction behind, and the avenue locked up (east of Grove, every few tests).
+// The links between them are inside the junction: green for traffic already there while its cycle has green and through
+// the clearance after it (yellow + all-red, 2 s longer for joined ones), so nobody waits in the median
+static std::unordered_map<uint32_t, uint32_t> signalRepOf;                 // member junction -> its controller's key
+static std::unordered_map<uint32_t, std::vector<CNodeAddress>> signalMembers;
+static std::unordered_set<const CCarPathLink*> signalInternalLinks;
+static int signalClusterCount = 0;
+static bool JunctionHasLight(const CNodeAddress& a, CPathNode* n) {
+    for (int k = 0; k < n->NumberAdjNodes; k++) {
+        CCarPathLink* l = GetLinkBetween(a, n, GetAdjacentNode(n, a, k));
+        if (l && l->m_nTrafficLightState) return true;
+    }
+    return false;
+}
+static uint32_t SignalRep(const CNodeAddress& j) {
+    const uint32_t key = SignalKey(j);
+    auto it = signalRepOf.find(key);
+    if (it != signalRepOf.end()) return it->second;
+    std::vector<CNodeAddress> members{ j };
+    std::vector<const CCarPathLink*> internal;
+    for (size_t m = 0; m < members.size() && members.size() < 4; m++) {
+        const CNodeAddress a = members[m];
+        CPathNode* an = GetNode(a);
+        if (!an) continue;
+        for (int k = 0; k < an->NumberAdjNodes; k++) {
+            CNodeAddress prevA = a, curA = GetAdjacentNode(an, a, k);
+            CPathNode* prevN = an;
+            CPathNode* curN = GetNode(curA);
+            std::vector<const CCarPathLink*> chain;
+            float len = 0.0f;
+            while (curN) {
+                const CCarPathLink* l = GetLinkBetween(prevA, prevN, curA);
+                if (l) chain.push_back(l);
+                len += (GetNodePos(curN) - GetNodePos(prevN)).Magnitude2D();
+                if (len > 35.0f || curN->NumberAdjNodes != 2) break;
                 CNodeAddress nextA = GetAdjacentNode(curN, curA, 0);
                 if (nextA == prevA) nextA = GetAdjacentNode(curN, curA, 1);
                 prevA = curA; prevN = curN;
                 curA = nextA; curN = GetNode(curA);
             }
-            if (cycle) sig.legs.push_back({ d * (1.0f / len), cycle });
+            if (!curN || len > 35.0f || curN->NumberAdjNodes <= 2 || !JunctionHasLight(curA, curN)) continue;
+            if (std::find(members.begin(), members.end(), curA) != members.end()) {
+                internal.insert(internal.end(), chain.begin(), chain.end());
+                continue;
+            }
+            if (signalRepOf.count(SignalKey(curA))) continue; // already in another controller
+            members.push_back(curA);
+            internal.insert(internal.end(), chain.begin(), chain.end());
+        }
+    }
+    uint32_t repKey = key;
+    for (const CNodeAddress& m : members) repKey = std::min(repKey, SignalKey(m));
+    for (const CNodeAddress& m : members) signalRepOf[SignalKey(m)] = repKey;
+    signalMembers[repKey] = members;
+    if (members.size() > 1) {
+        signalInternalLinks.insert(internal.begin(), internal.end());
+        signalClusterCount++;
+        if (signalClusterCount <= 20) {
+            lg << "Signals joined:";
+            for (const CNodeAddress& m : members) lg << " " << m.Region << ":" << m.Index;
+            lg << " (" << internal.size() << " links inside)" << "\n";
+        }
+    }
+    return repKey;
+}
+
+static void UpdateSignal(JunctionSignal& sig, const std::vector<CNodeAddress>& members, unsigned int now) {
+    if (now - sig.lastUpdate < 250) return;
+    sig.lastUpdate = now;
+    if (members.empty()) return;
+    const CNodeAddress& junction = members[0];
+    sig.demand[1] = sig.demand[2] = 0;
+    sig.arriving[1] = sig.arriving[2] = false;
+    if (!sig.legsKnown) {
+        sig.legsKnown = true;
+        for (const CNodeAddress& member : members) {
+            CPathNode* jn = GetNode(member);
+            if (!jn) { sig.legsKnown = false; continue; }
+            const CVector jp = GetNodePos(jn);
+            for (int k = 0; k < jn->NumberAdjNodes; k++) {
+                CNodeAddress nb = GetAdjacentNode(jn, member, k);
+                CPathNode* nn = GetNode(nb);
+                if (!nn) { sig.legsKnown = false; continue; } // not streamed in yet: look again later
+                if (signalInternalLinks.count(GetLinkBetween(member, jn, nb))) continue; // inside the joined junction
+                CVector2D d = GetNodePos(nn).To2D() - jp.To2D();
+                float len = d.Magnitude();
+                if (len < 0.5f) continue;
+                // The road's light: on the link at the junction, or a node or two up the road (the game's own lights often
+                // sit there; those roads never counted as waiting)
+                CNodeAddress prevA = member, curA = nb;
+                CPathNode* prevN = jn;
+                CPathNode* curN = nn;
+                int cycle = 0;
+                for (int step = 0; step < 3 && curN; step++) {
+                    CCarPathLink* link = GetLinkBetween(prevA, prevN, curA);
+                    if (link && link->m_nTrafficLightState) { cycle = link->m_nTrafficLightState; break; }
+                    if (curN->NumberAdjNodes != 2) break;
+                    CNodeAddress nextA = GetAdjacentNode(curN, curA, 0);
+                    if (nextA == prevA) nextA = GetAdjacentNode(curN, curA, 1);
+                    prevA = curA; prevN = curN;
+                    curA = nextA; curN = GetNode(curA);
+                }
+                if (cycle) sig.legs.push_back({ jp.To2D(), d * (1.0f / len), cycle, jp.z });
+            }
         }
         if (!sig.legsKnown) sig.legs.clear();
     }
-    // Who's waiting/arriving: by where it is (the road it's on, the one whose direction from the junction is closest to
+    // Who's waiting/arriving: by where it is (the road it's on, the one whose direction from its junction is closest to
     // it) and that it's heading for the junction. By the cars' next node, the ones queued further back or with the light a
     // few nodes before the junction weren't counted: nobody waiting, the junction never gave them green
     for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
         CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
         if (!v || !v->m_pDriver || sig.legs.empty()) continue;
-        CVector2D rel = v->GetPosition().To2D() - jp.To2D();
-        float dist = rel.Magnitude();
-        if (dist > 60.0f || dist < 3.0f || std::abs(jp.z - v->GetPosition().z) > 6.0f) continue;
-        CVector2D out = rel * (1.0f / dist);
-        if (CVector2D::Dot(v->GetForward().To2D(), out) > -0.5f) continue; // not heading for the junction
-        // On a road: along it from the junction and within ~3 lanes of its centre line, heading the opposite way to the
-        // road's direction out (an angle cone missed cars in the outer lanes close to the stop line)
+        const CVector2D vp = v->GetPosition().To2D(), vf = v->GetForward().To2D();
         int c = 0;
-        float bestAcross = 12.0f;
+        float bestAcross = 12.0f, cDist = 0.0f;
         for (const auto& leg : sig.legs) {
-            float along = CVector2D::Dot(leg.first, rel), across = std::abs(CVector2D::Cross(leg.first, rel));
-            if (along > 1.0f && across < bestAcross && CVector2D::Dot(v->GetForward().To2D(), leg.first) < -0.7f) {
+            CVector2D rel = vp - leg.origin;
+            float dist = rel.Magnitude();
+            if (dist > 60.0f || dist < 3.0f || std::abs(leg.z - v->GetPosition().z) > 6.0f) continue;
+            if (CVector2D::Dot(vf, rel * (1.0f / dist)) > -0.5f) continue; // not heading for the junction
+            // On a road: along it from the junction and within ~3 lanes of its centre line, heading the opposite way to
+            // the road's direction out (an angle cone missed cars in the outer lanes close to the stop line)
+            float along = CVector2D::Dot(leg.dir, rel), across = std::abs(CVector2D::Cross(leg.dir, rel));
+            if (along > 1.0f && across < bestAcross && CVector2D::Dot(vf, leg.dir) < -0.7f) {
                 bestAcross = across;
-                c = leg.second;
+                c = leg.cycle;
+                cDist = dist;
             }
         }
         if (!c) continue;
         sig.demand[c]++;
         float speed = v->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
-        if (speed > 1.0f && dist < 10.0f + speed * cfgSignalGap) sig.arriving[c] = true;
+        if (speed > 1.0f && cDist < 10.0f + speed * cfgSignalGap) sig.arriving[c] = true;
     }
     const float elapsed = (now - sig.phaseStart) / 1000.0f;
     const int sub = sig.phase % 3;
+    const float allRed = cfgSignalAllRed + (members.size() > 1 ? 2.0f : 0.0f); // joined: time to clear the median
     if (sub == 0) {
         const int green = sig.phase < 3 ? 1 : 2, other = 3 - green;
         sig.lastGreen[green] = now;
@@ -1620,25 +1697,40 @@ static void UpdateSignal(JunctionSignal& sig, const CNodeAddress& junction, unsi
         else if (elapsed >= cfgSignalMaxGreen && sig.demand[other] == 0 && now - sig.phaseStart < 250 + static_cast<unsigned>(cfgSignalMaxGreen * 1000))
             signalRestCount++;
     }
-    else if ((sub == 1 && elapsed >= cfgSignalYellow) || (sub == 2 && elapsed >= cfgSignalAllRed)) {
+    else if ((sub == 1 && elapsed >= cfgSignalYellow) || (sub == 2 && elapsed >= allRed)) {
         sig.phase = (sig.phase + 1) % 6;
         sig.phaseStart = now;
     }
 }
 
-static eLightColor SignalColor(const CNodeAddress& junction, int cycle) {
+static JunctionSignal& SignalOf(const CNodeAddress& junction) {
     const unsigned int now = CTimer::m_snTimeInMilliseconds;
-    auto it = junctionSignals.find(SignalKey(junction));
+    const uint32_t key = SignalRep(junction);
+    auto it = junctionSignals.find(key);
     if (it == junctionSignals.end()) {
         JunctionSignal sig;
-        sig.phase = (SignalKey(junction) & 1) ? 3 : 0; // neighbours not all switching together
+        sig.phase = (key & 1) ? 3 : 0; // neighbours not all switching together
         sig.phaseStart = now;
-        it = junctionSignals.emplace(SignalKey(junction), sig).first;
+        it = junctionSignals.emplace(key, sig).first;
     }
-    UpdateSignal(it->second, junction, now);
-    const int green = it->second.phase < 3 ? 1 : 2, sub = it->second.phase % 3;
+    UpdateSignal(it->second, signalMembers[key], now);
+    return it->second;
+}
+
+static eLightColor SignalColor(const CNodeAddress& junction, int cycle) {
+    const JunctionSignal& sig = SignalOf(junction);
+    const int green = sig.phase < 3 ? 1 : 2, sub = sig.phase % 3;
     if (cycle != green) return LIGHT_RED;
     return sub == 0 ? LIGHT_GREEN : (sub == 1 ? LIGHT_YELLOW : LIGHT_RED);
+}
+
+// A light on a link inside a joined junction (the median): green for its cycle's whole phase, clearance included
+static eLightColor SignalColorForLink(const CCarPathLink* link, const CNodeAddress& junction, int cycle) {
+    if (!signalInternalLinks.empty() && signalInternalLinks.count(link)) {
+        const JunctionSignal& sig = SignalOf(junction);
+        return (sig.phase < 3 ? 1 : 2) == cycle ? LIGHT_GREEN : LIGHT_RED;
+    }
+    return SignalColor(junction, cycle);
 }
 
 static unsigned char GlobalLightForCars(int cycle) {
@@ -1665,7 +1757,7 @@ static unsigned char __cdecl SignalForVehicleLink(int cycle, CVehicle* veh, CCar
         }
     }
     if (junction.IsEmpty()) return GlobalLightForCars(cycle);
-    return static_cast<unsigned char>(SignalColor(junction, cycle));
+    return static_cast<unsigned char>(SignalColorForLink(link, junction, cycle));
 }
 static void __declspec(naked) SignalVehicle1() { __asm { push edi
                                                           push esi
@@ -1736,7 +1828,7 @@ static eLightColor GetLinkLightColor(const CCarPathLink* link, const CNodeAddres
     if (!link->m_nTrafficLightState) return LIGHT_NONE;
     bool appliesToUs = link->m_bTrafficLightDirection ? (link->m_address == towards) : (link->m_address != towards);
     if (!appliesToUs) return LIGHT_NONE;
-    if (cfgActuatedLights) return SignalColor(towards, link->m_nTrafficLightState);
+    if (cfgActuatedLights) return SignalColorForLink(link, towards, link->m_nTrafficLightState);
     unsigned char color = GlobalLightForCars(link->m_nTrafficLightState);
     return color <= LIGHT_RED ? static_cast<eLightColor>(color) : LIGHT_RED;
 }

@@ -1286,6 +1286,7 @@ void Update() {
         out << Format("actuated lights: %d junctions; greens ended for nobody arriving %d, at the max green %d\n",
             (int)junctionSignals.size(), signalGapOutCount, signalMaxOutCount);
         out << Format("actuated lights: switched by the safety valve (a road red too long with someone waiting) %d\n", signalForcedCount);
+        out << Format("joined signals (divided avenues, close junctions as one controller): %d, links inside them %d\n", signalClusterCount, (int)signalInternalLinks.size());
         out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("route leader (mode %d): rays and route agree %d, route says other lane where the rays would brake %d, route says our lane where the rays would ignore it %d, not on the route %d\n",
