@@ -63,11 +63,12 @@ def children(hwnd):
     return out
 
 
-def main():
-    click = '--click' in sys.argv
-    ini = None
-    if '--ini' in sys.argv:
-        ini = sys.argv[sys.argv.index('--ini') + 1]
+def run(click=False, ini=None):
+    """Does the work and returns the report (the test UI calls it in its own process: no console window)"""
+    lines = []
+
+    def print(*args):                                       # noqa: A001 - collect instead of printing
+        lines.append(' '.join(str(x) for x in args))
     code = None
     for w in windows_of('gta_sa.exe'):
         title = text_of(w)
@@ -98,6 +99,14 @@ def main():
             if raw2 != raw:
                 open(ini, 'wb').write(raw2.encode('latin-1'))
                 print('written to', ini)
+    return '\n'.join(lines)
+
+
+def main():
+    ini = sys.argv[sys.argv.index('--ini') + 1] if '--ini' in sys.argv else None
+    out = run('--click' in sys.argv, ini)
+    if out:
+        sys.stdout.write(out + '\n')
 
 
 if __name__ == '__main__':

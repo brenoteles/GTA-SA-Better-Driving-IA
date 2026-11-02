@@ -303,7 +303,11 @@ class App:
 
     # ---------------------------------------------------------------- test run
     def keep_game_focused(self):
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'focus_game.py')
+        # In this process (a console window every 3 s flashed and took the focus), and only until the game has the
+        # focus once: then it's left alone (the user may be using another window)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ctypes
+        import focus_game
         for _ in range(80):
             time.sleep(3)
             try:
@@ -311,14 +315,18 @@ class App:
                     return
             except OSError:
                 pass
-            subprocess.run([sys.executable.replace('pythonw', 'python'), script], capture_output=True)
+            hwnd = focus_game.game_window()
+            if hwnd and ctypes.windll.user32.GetForegroundWindow() == hwnd:
+                return
+            if hwnd:
+                focus_game.focus()
 
     def handle_fla_window(self, fla_ini):
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fla_window.py')
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import fla_window
         for _ in range(90):
             time.sleep(1)
-            out = subprocess.run([sys.executable.replace('pythonw', 'python'), script, '--click', '--ini', fla_ini],
-                                 capture_output=True, text=True).stdout
+            out = fla_window.run(True, fla_ini)
             if 'clicking' in out:
                 try:
                     with open(os.path.join(SCRIPTS, 'fla_window_last.txt'), 'w', encoding='utf-8') as f:

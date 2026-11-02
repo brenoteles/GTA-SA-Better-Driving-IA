@@ -1570,7 +1570,10 @@ static uint32_t SignalRep(const CNodeAddress& j) {
             CPathNode* curN = GetNode(curA);
             std::vector<const CCarPathLink*> chain;
             float len = 0.0f;
-            while (curN) {
+            int steps = 0;
+            // Capped: two nodes at the same spot (or linked twice) never add up the 35 m, and the walk went round them
+            // for ever inside the game's light check (the game froze 3 s into a test, twice)
+            while (curN && steps++ < 40) {
                 const CCarPathLink* l = GetLinkBetween(prevA, prevN, curA);
                 if (l) chain.push_back(l);
                 len += (GetNodePos(curN) - GetNodePos(prevN)).Magnitude2D();
