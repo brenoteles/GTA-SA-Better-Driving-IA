@@ -7,7 +7,10 @@ the road (the game colours each face of a pole by its facing, CTrafficLights::Fi
 aren't lit). The model and its height above the road node are the ones the map's poles use nearby. Not on another road,
 not within 8 m of an existing pole.
 
-usage: python place_light_poles.py <game dir> <data/Paths> <override folder or -> <out .ipl> [yaw offset deg]
+usage: python place_light_poles.py <game dir> <data/Paths> <override folder or -> <out .ipl> [yaw offset deg] [lift m]
+
+lift: the poles raised that much over the road (temporary: placed on the road they were obstacles; 5.5 m puts
+their base over any vehicle and leaves the lights floating over the junction)
 """
 import math
 import os
@@ -38,7 +41,7 @@ def seg_dist(px, py, ax, ay, bx, by):
     return math.hypot(ax + dx * t - px, ay + dy * t - py)
 
 
-def main(game_dir, base, override, out_ipl, yaw_offset=180.0):
+def main(game_dir, base, override, out_ipl, yaw_offset=180.0, lift=0.0):
     net = Network(load_all(merged_paths(base, override)))
     node = net.node
     appr = lit_approaches(net)
@@ -136,7 +139,7 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0):
             m = node[nb]
             seg = math.hypot(m.x - J.x, m.y - J.y)
             zroad = J.z + (m.z - J.z) * min(back / seg, 1.0) if seg > 1 else J.z
-            z = zroad + model_dz.get(mid, 0.0)
+            z = zroad + model_dz.get(mid, 0.0) + lift
             travel = math.degrees(math.atan2(uy, ux))
             yaw = travel - 90.0 + yaw_offset                     # GTA heading: model +Y = yaw + 90 (math angle)
             h = math.radians(yaw) / 2.0
@@ -156,4 +159,5 @@ def main(game_dir, base, override, out_ipl, yaw_offset=180.0):
 
 
 if __name__ == '__main__':
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 180.0)
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]) if len(sys.argv) > 5 else 180.0,
+         float(sys.argv[6]) if len(sys.argv) > 6 else 0.0)
