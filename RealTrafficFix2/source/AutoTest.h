@@ -1288,6 +1288,8 @@ void Update() {
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("route leader (mode %d): rays and route agree %d, route says other lane where the rays would brake %d, route says our lane where the rays would ignore it %d, not on the route %d\n",
             cfgRouteLeader, routeAgreeCount, routeOtherLaneRaysWouldBrake, routeInLaneRaysWouldIgnore, routeUnknownCount);
+        out << Format("lane changes from the vehicle list: side blocked where the rays saw it clear %d, cars counted in two lanes %d, refused for the braking forced on the one behind %d\n",
+            sideListOnlyCount, straddleCount, backDecelRefusedCount);
         out << Format("route leader, why not on the route: no route ahead %d, it off the road network %d, us off our route %d, it not on our route's roads %d, it behind us %d, it across the road %d\n",
             routeUnknownWhy[0], routeUnknownWhy[1], routeUnknownWhy[2], routeUnknownWhy[3], routeUnknownWhy[4], routeUnknownWhy[5]);
         out << Format("crashout (stopped too long, pushed its way out): %d\n", crashoutCount);

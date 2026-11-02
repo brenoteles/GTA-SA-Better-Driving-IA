@@ -479,6 +479,11 @@ static int cfgRacerDrivingStyle = DRIVINGSTYLE_SLOW_DOWN_FOR_CARS; // cars: no w
 static int cfgRacerBikeDrivingStyle = 5;                           // bikes: DRIVINGSTYLE_AVOID_CARS_OBEY_LIGHTS (weave through traffic)
 static bool cfgOvertaking = true;
 static float cfgOvertakeRearTime = 3.5f;    // s a faster vehicle coming from behind in the target lane needs to reach us
+// Lane changes judged from the vehicle list too (like CARLA's traffic manager), not only the 3 side rays: any body in the
+// strip we move into, cars straddling two lanes counted in both, and how hard the one behind would have to brake
+static bool cfgListLaneChange = true;
+static float cfgLaneChangeMaxBackDecel = 2.0f; // m/s2 the car behind in the target lane may need to brake for us
+static int sideListOnlyCount = 0, straddleCount = 0, backDecelRefusedCount = 0;
 static bool cfgKeepRight = true;            // drivers go back to the right lanes when they're free (by profile)
 static bool cfgDestinations = true;         // every driver has a destination; junction exits and lanes are chosen for it
 static bool cfgTurnSignals = true;          // indicators before lane changes and turns
@@ -3770,6 +3775,8 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "ListLaneChange", cfgListLaneChange);
+        ReadIniFloat(ini, "LaneChangeMaxBackDecel", cfgLaneChangeMaxBackDecel);
         ReadIniInt(ini, "RouteLeader", cfgRouteLeader);
         ReadIniBool(ini, "Crashout", cfgCrashout);
         ReadIniFloat(ini, "CrashoutTime", cfgCrashoutTime);
@@ -5325,6 +5332,40 @@ public:
         CWorld::pIgnoreEntity = nullptr;
         xdata.numSideRays = 3;
         xdata.sideRayTime = CTimer::m_snTimeInMilliseconds;
+        // Every vehicle's body in the strip we move into, from the vehicle list: a car between two of the rays (a short one
+        // level with our doors, the nose of one just behind) wasn't seen, and side contacts in lane changes were the
+        // second most common collision. The strip follows the curve we're on
+        if (cfgListLaneChange) {
+            const float halfWidth = std::max(mx.x, -mn.x);
+            const float stripIn = halfWidth - 0.4f, stripOut = halfWidth + LANE_WIDTH * lanes + 0.4f;
+            const float lonFrom = mn.y - std::clamp(speed * 0.8f, 15.0f, 25.0f), lonTo = mx.y + std::min(speed * 0.6f, 15.0f);
+            const CVector2D f = veh->GetForward().To2D(), rgt = veh->GetRight().To2D();
+            const float curv = speed > 3.0f ? -xdata.filtYawRate / speed : 0.0f; // > 0: curving right
+            bool listClear = true;
+            for (int k = 0; k < CPools::ms_pVehiclePool->m_nSize && listClear; k++) {
+                CVehicle* o = CPools::ms_pVehiclePool->GetAt(k);
+                if (!o || o == veh || o == veh->m_pTrailer || o == veh->m_pTractor) continue;
+                if (std::abs(o->GetPosition().z - veh->GetPosition().z) > 4.0f) continue;
+                const CVector2D rel = (o->GetPosition() - veh->GetPosition()).To2D();
+                if (rel.MagnitudeSqr() > 40.0f * 40.0f) continue;
+                const float lon = CVector2D::Dot(rel, f);
+                const float lat = (CVector2D::Dot(rel, rgt) - 0.5f * curv * lon * lon) * side; // > 0: on the side we go to
+                if (passing && o == passing && lon > mx.y) continue;
+                CVector omn, omx;
+                GetEntityDimensions(o, omn, omx);
+                const float c = std::abs(CVector2D::Dot(o->GetForward().To2D(), f)), sn = std::sqrt(std::max(1.0f - c * c, 0.0f));
+                const float ohw = std::max(omx.x, -omn.x), ohl = std::max(omx.y, -omn.y);
+                const float halfAcross = ohw * c + ohl * sn, halfAlong = ohl * c + ohw * sn;
+                // Level with us anything reaching our side counts; ahead or behind it must stick out 0.8 m past our side (the
+                // car in front of us in our own lane isn't in the way)
+                const bool level = lon + halfAlong > mn.y && lon - halfAlong < mx.y;
+                const float inner = level ? stripIn : halfWidth + 0.8f;
+                if (lat + halfAcross > inner && lat - halfAcross < stripOut && lon + halfAlong > lonFrom && lon - halfAlong < lonTo)
+                    listClear = false;
+            }
+            if (clear && !listClear) sideListOnlyCount++;
+            clear &= listClear;
+        }
         return clear;
     }
 
@@ -5489,6 +5530,19 @@ public:
             float bodies = halfLength + otherMax.y;
             float otherSpeed = CVector2D::Dot(other->m_vecMoveSpeed.To2D(), d) * GAME_SPEED_TO_MPS;
             addToLane(lane, lon, bodies, otherSpeed, other);
+            // Straddling two lanes (changing lanes, swung wide, crashed at an angle): in both, if more than 0.8 m of it is
+            // in the other one. Counted only in the lane of its centre, the other lane looked free
+            if (cfgListLaneChange) {
+                const float c = std::abs(CVector2D::Dot(other->GetForward().To2D(), d)), sn = std::sqrt(std::max(1.0f - c * c, 0.0f));
+                const float halfAcross = (std::max(otherMax.x, -otherMin.x) * c + std::max(otherMax.y, -otherMin.y) * sn) / LANE_WIDTH;
+                const int lo = static_cast<int>(std::floor(laneF - halfAcross + 0.15f + 0.5f));
+                const int hi = static_cast<int>(std::floor(laneF + halfAcross - 0.15f + 0.5f));
+                for (int l = std::max(lo, 0); l <= std::min(hi, lanes - 1); l++) {
+                    if (l == lane) continue;
+                    addToLane(l, lon, bodies, otherSpeed, other);
+                    straddleCount++;
+                }
+            }
             if (lane != myLane && std::abs(lon) < bodies + 8.0f) xdata.trafficAround = true; // beside us
 
             bool sameLink = other->m_pDriver && *reinterpret_cast<const UInt16*>(&other->m_autoPilot.m_nNextPathNodeInfo) == myLink;
@@ -5623,6 +5677,15 @@ public:
             }
             float closing = backSpeed - speed;
             if (backOk && closing > 0.0f && !backYields) backOk = info.backGap / closing > cfgOvertakeRearTime * Lerp(1.3f, 0.7f, aggr);
+            // MOBIL's safety criterion: the braking we'd force on the one behind (to get down to our speed before reaching
+            // us, keeping 2 m), at most LaneChangeMaxBackDecel (more for aggressive drivers)
+            if (cfgListLaneChange && backOk && info.backVeh && closing > 0.0f) {
+                const float needDecel = closing * closing / (2.0f * std::max(info.backGap - 2.0f, 0.5f));
+                if (needDecel > cfgLaneChangeMaxBackDecel * Lerp(0.8f, 1.4f, aggr)) {
+                    backOk = false;
+                    backDecelRefusedCount++;
+                }
+            }
             return frontOk && backOk;
         };
         // Overtake planned with what the cars tell each other (positions, speeds, the speed each one wants): how long the
