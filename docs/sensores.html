@@ -192,6 +192,11 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <p>O teste parou a 291 m do fim, no mesmo ponto em que o jogo tinha travado: fila parada em (-2765, 2355). O spawner criava o veículo nivelado na altura do chão sob o centro e só depois o virava para a direção da via, sem inclinar; na descida íngreme a ponta de cima de um caminhão ficava dentro do morro. Agora o veículo é assentado nas rodas acompanhando o chão, e se ainda ficar enterrado numa ponta não é criado.</p>
       </li>
       <li>
+        <div class="meta"><span class="mono">b688d04</span><span class="tag t-claude">Claude</span></div>
+        <h3>Jogo congelando: vigia no mod</h3>
+        <p>O jogo congelou duas vezes (testes 085846 e 100429) sem nada no log. O mod agora marca a etapa que está rodando e, se passarem 5 s sem frame, grava onde parou em <code>RealTrafficFix.watchdog.txt</code>.</p>
+      </li>
+      <li>
         <div class="meta"><span class="mono">092740</span><span class="tag t-claude">Claude</span></div>
         <h3>Teste completo das propostas 1 e 2: menor taxa de colisões até agora</h3>
         <p>Chegou em 7,45 min a 86 km/h, com 0,67 colisões/min no tráfego e só 1 toque lateral. Passou pela descida de Bayside; um spawn enterrado foi recusado. A lista de veículos barrou 1551 trocas de faixa que os raios liberariam, e 12 pela frenagem imposta ao carro de trás.</p>
@@ -425,10 +430,45 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     </div>
   </section>
 
+  <section id="sumo">
+    <h2>Rede de ruas avaliada no SUMO</h2>
+    <p>A rede que o jogo carrega (os arquivos originais com os do mod por cima) foi convertida para o SUMO: 28.991 nós, 48.073 trechos com sentido e 1.429 cruzamentos com semáforo. Na conversão apareceu um bug nas nossas ferramentas: a classe de velocidade era lida nos bits errados e toda rua parecia rodovia.</p>
+    <h3>Conectividade</h3>
+    <div class="consts">
+      <div class="const"><b>88%</b><span>dos nós numa rede só, onde se chega e se sai de qualquer ponto</span></div>
+      <div class="const"><b>432</b><span>nós armadilha: o carro entra e não tem saída legal</span></div>
+      <div class="const"><b>1.140</b><span>nós de onde só se sai (894 nas trilhas de descida do Chiliad)</span></div>
+      <div class="const"><b>235</b><span>becos sem continuação</span></div>
+    </div>
+    <p>Onde estão as armadilhas, segundo o Gemini com as coordenadas: 48 no anel do túnel do aeroporto de LS, 94 em volta dos hangares do aeroporto de LV, 46 em Doherty/Hashbury (SF), 30 nos condomínios de Rockshore (LV), entradas de manobrista dos cassinos da Strip feitas só no sentido de saída.</p>
+    <h3>Simulação: uma hora, 3.000 viagens</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Rodada</th><th class="num">Teleportes</th><th class="num">Velocidade média</th><th class="num">Parado por viagem</th><th class="num">Viagens completas</th></tr></thead>
+      <tbody>
+        <tr><td>Primeira conversão</td><td class="num">729</td><td class="num">7,4 m/s</td><td class="num">542 s</td><td class="num">2.317</td></tr>
+        <tr><td>Conversão corrigida (sugestões do Gemini)</td><td class="num">41</td><td class="num">12,0 m/s</td><td class="num">129 s</td><td class="num">3.001</td></tr>
+      </tbody></table></div>
+    <p>A primeira rodada era quase toda artefato da conversão. O Gemini apontou as opções do <code>netconvert</code>: juntar os nós de um mesmo cruzamento, coordenar os semáforos, deduzir as rampas de rodovia, liberar retorno longe de semáforo e fechar ao tráfego as peças fora da rede principal. A segunda rodada é a base para medir qualquer mudança de via. A primeira apontava gargalos nos encontros de rampa das rodovias de LS (1713, 421) e (1717, −541) e na Strip de LV (x ≈ 2048); eles precisam ser conferidos de novo na rodada corrigida.</p>
+    <div class="who"><span class="tag t-claude">Claude: conversão, conectividade, simulação</span><span class="tag t-gemini">Gemini: leitura dos resultados, regiões, opções do netconvert</span></div>
+  </section>
+
+  <section id="postes">
+    <h2>Semáforos físicos</h2>
+    <p>Os semáforos criados antes só existiam nos dados das ruas: os carros paravam em sinais que ninguém via. Agora há postes de verdade.</p>
+    <ul>
+      <li>O mapa tem 1.583 postes, quase todos dentro dos IPL binários do <code>gta3.img</code>. Medindo onde eles ficam: uns 10 m antes do centro do cruzamento e 5,4 m à direita do eixo da rua, alinhados com as ruas.</li>
+      <li>A regra de posição (canto direito, além da borda da rua transversal + 3 m, 1 m fora da pista) caiu a menos de 8 m de um poste original em 1.385 casos. Esses ficaram só com o original.</li>
+      <li>Foram criados <b>2.560 postes</b> com o modelo da cidade (MTraffic1 em LS, CJ_TRAFFIC_LIGHT4/5 em SF e LV), em pé (o jogo não acende poste inclinado) e nunca em cima de outra rua.</li>
+      <li>Instalados como mod do modloader: o IPL e um <code>gta.dat</code> com uma linha a mais. Sem essa linha o modloader ignora o IPL.</li>
+      <li>Falta conferir no jogo a altura e a direção dos postes novos.</li>
+    </ul>
+  </section>
+
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Testar a correção da projeção: a rota deve passar a julgar a maioria dos carros atingidos.</li>
+      <li>Teste no jogo com os postes novos e o vigia de congelamento.</li>
+      <li>Ver na rodada corrigida do SUMO onde ainda há espera e propor mudanças de via (ligar armadilhas, faixas em encontros de rampa), medindo cada uma contra a base.</li>
       <li>Depois, proposta 3.</li>
     </ol>
   </section>
