@@ -162,9 +162,14 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
         <p>Com 80% de gás o Cadrona foi de 0 a 20 km/h em 0,3 s e bateu num carro dando ré. O empurrão agora vai até ~9 km/h, e carros na fila esperam 40 s para o da frente sair primeiro.</p>
       </li>
       <li>
-        <div class="meta"><span class="mono">em andamento</span><span class="tag t-gemini">Gemini</span><span class="tag t-claude">Claude</span><span class="tag t-carla">CARLA</span></div>
+        <div class="meta"><span class="mono">2fcc0fc</span><span class="tag t-gemini">Gemini</span><span class="tag t-claude">Claude</span><span class="tag t-carla">CARLA</span></div>
         <h3>Estudo dos sensores com base no CARLA</h3>
-        <p>Proposta de trocar os raios por uma lista de veículos projetada na rota, envelopes ao longo do caminho e negociação de conflito em cruzamentos. Detalhes abaixo.</p>
+        <p>Sete propostas: lista de veículos projetada na rota, envelopes ao longo do caminho, negociação de conflito em cruzamentos e outras. Detalhes abaixo.</p>
+      </li>
+      <li>
+        <div class="meta"><span class="mono">64ba393</span><span class="tag t-claude">Claude</span><span class="tag t-gemini">Gemini</span></div>
+        <h3>Proposta 1 no jogo: líder pela rota</h3>
+        <p>O carro atingido pelo sensor é projetado na rota planejada e só vira líder se a carroceria dele cruza o caminho que vamos fazer. Primeiro teste: chegou em 7,19 min a 89 km/h de média, o melhor até agora. O Gemini revisou o código e achou 7 pontos: 5 entraram (projeção além da ponta do segmento, alcance de 20 m, sem ponto cego no meio da troca de faixa, largura de veículo em ângulo, margem maior para carro parado). O de devolver carros na contramão aos raios foi revertido, porque o log mostrou os raios freando para carro na contramão a 11 m de lado; o último estava errado.</p>
       </li>
     </ol>
   </section>
@@ -178,7 +183,8 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">191902</td><td><span class="pill bad">falhou</span></td><td class="num">7,42 km</td><td class="num">2</td><td>Parado 90 s num vermelho a 1,78 km do fim</td></tr>
           <tr><td class="mono">081411</td><td><span class="pill bad">falhou</span></td><td class="num">4,08 km</td><td class="num">4</td><td>Rodou a 175 km/h numa curva da rodovia, atingido a 149 km/h</td></tr>
           <tr><td class="mono">082034</td><td><span class="pill bad">falhou</span></td><td class="num">0,40 km</td><td class="num">5</td><td>Gridlock em Grove: 60 carros em 120 m, 3 andando</td></tr>
-          <tr><td class="mono">082622</td><td><span class="pill warn">interrompido</span></td><td class="num">10,40 km</td><td class="num">2</td><td>Melhor até agora; crashout a 80% de gás bateu a 290 m de Bayside</td></tr>
+          <tr><td class="mono">082622</td><td><span class="pill warn">interrompido</span></td><td class="num">10,40 km</td><td class="num">2</td><td>Crashout a 80% de gás bateu a 290 m de Bayside</td></tr>
+          <tr><td class="mono">085011</td><td><span class="pill good">chegou</span></td><td class="num">10,63 km</td><td class="num">1</td><td>Líder pela rota: 7,19 min, 89 km/h de média, 1,25 colisões/min no tráfego (antes 1,9 a 4). Rota e raios discordaram 309 vezes; a rota só julgou ~3% dos casos</td></tr>
         </tbody>
       </table>
     </div>
@@ -237,7 +243,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <article class="plate">
         <div class="rank">1</div>
         <div class="plate-body">
-          <div class="plate-head"><h3>Líder pela rota, não pelo raio</h3><span class="status">planejada</span></div>
+          <div class="plate-head"><h3>Líder pela rota, não pelo raio</h3><span class="status doing">no jogo, em ajuste</span></div>
           <dl>
             <dt>Ideia</dt><dd>Registro dos ~100 carros num grid espacial. Os candidatos dos próximos 60 m são projetados na rota planejada em coordenadas de Frenet (distância ao longo da rota e desvio lateral). O líder é o mais próximo à frente cujo desvio cabe na nossa faixa.</dd>
             <dt>Do CARLA</dt><dd>Registro de veículos, buffer de caminho da localização, mapa em memória.</dd>
@@ -331,9 +337,8 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <section id="proximos">
     <h2>Próximos passos</h2>
     <ol>
-      <li>Implementar a proposta 1 atrás de uma opção no ini, rodando lado a lado com os raios e registrando quando os dois discordam.</li>
-      <li>Pedir ao Gemini a revisão do código novo antes do teste.</li>
-      <li>Teste do Cadrona de Grove a Bayside; comparar colisões por minuto e casos de líder errado com os testes acima.</li>
+      <li>Entender por que a rota não julga 97% dos veículos atingidos (contadores por motivo já no teste) e ampliar a cobertura.</li>
+      <li>Repetir o teste com a versão revisada pelo Gemini e comparar com o 085011.</li>
       <li>Seguir para as propostas 2 e 3.</li>
     </ol>
   </section>
