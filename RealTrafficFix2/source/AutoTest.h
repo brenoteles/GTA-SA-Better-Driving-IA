@@ -1374,9 +1374,10 @@ void Update() {
         out << Format("turns tightened for a vehicle on the outside: %d\n", turnGuardCount);
         out << Format("waited before a junction (the road beyond it full): %d (found along the route past the first piece: %d)\n", boxWaitCount, boxWaitRouteCount);
         out << Format("forward collision warnings (leader braking > 3 m/s2, < 1.8 s to it, openpilot): %d\n", fcwCount);
-        out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; curves capped by what the steering can do %d; test car off the road %d\n",
+        out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; path points (every car, every scan) whose curve speed the steering capped %d; test car off the road %d\n",
             steerSignMatch, steerSignMismatch, steerLimitedCurves, offRoadCount);
-        out << Format("steering rate limited at speed (frames, openpilot): %d\n", steerRateLimitedFrames);
+        out << Format("steering rate limited at speed (frames, openpilot): %d; not limited: not the frame after %d, handbrake turn %d, sliding %d, braking hard %d, just hit %d\n",
+            steerRateLimitedFrames, steerRateExempt[0], steerRateExempt[1], steerRateExempt[2], steerRateExempt[3], steerRateExempt[4]);
         out << Format("acceleration held to the jerk limit (frames, openpilot D): %d; queue starts held until the one ahead really went (frames, E): %d\n",
             jerkLimitedFrames, queueHolds);
         for (const TripCar& c : tripCars) {

@@ -220,6 +220,7 @@ public:
     unsigned int steadySince = 0;   // steering and yaw rate steady since (ms)
     float lastSteerOut = 0.0f;      // the steering given last frame (rate limit)
     unsigned int lastSteerFrame = 0;
+    unsigned int lastImpactMs = 0;  // last frame something damaged it (a real hit, not the body touching the ground)
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
@@ -1873,6 +1874,8 @@ static float curRollGrip = 1000.0f;
 static bool cfgSteerModel = true;
 static bool cfgSteerRateLimit = true;
 static int steerRateLimitedFrames = 0;
+// Why the limit didn't apply at speed: 0 not the frame after, 1 handbrake turn, 2 sliding, 3 braking hard, 4 just hit
+static int steerRateExempt[5] = {};
 static float curSteerL = 0.0f, curSteerK = 0.0f;
 // The steering the game allows at a speed (CCarCtrl::FindMaxSteerAngle, 0x427FE0): min(0.7, 0.9 - v) in game units
 // (v/50 m/s) up to 35 m/s, 0.2 above
@@ -3882,8 +3885,14 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     // (counter-steer), on the handbrake, braking hard or right after a crash
     if (cfgSteerRateLimit && veh->m_nVehicleSubClass == VEHICLE_AUTOMOBILE) {
         const bool sameRun = xdata.lastSteerFrame + 1 == frameCounter || xdata.lastSteerFrame == frameCounter;
-        const bool exempt = handbrakeTurn || GetSlipAngle(veh) > 0.1f || *brake > 0.6f || CTimer::m_snTimeInMilliseconds - veh->m_nLastCollisionTime < 1000;
-        if (sameRun && !exempt && speed > 10.0f) {
+        // A hit is a damage record, not m_nLastCollisionTime: that one is stamped by the body touching the road too, and
+        // kept every car exempt the whole test (0 frames limited while the wheel jumped 0.07 rad in 100 ms at 120 km/h)
+        // (from the last frame: the hook runs before ProcessControl clears it). Over 10: a bumper grazing a dip isn't a hit
+        if (veh->m_pDamageEntity && veh->m_fDamageIntensity > 10.0f) xdata.lastImpactMs = nowMs;
+        const int why = !sameRun ? 0 : handbrakeTurn ? 1 : GetSlipAngle(veh) > 0.1f ? 2 : *brake > 0.6f ? 3 :
+            xdata.lastImpactMs && nowMs - xdata.lastImpactMs < 1000 ? 4 : -1;
+        if (why >= 0 && speed > 10.0f) steerRateExempt[why]++;
+        if (why < 0 && speed > 10.0f) {
             const float maxRate = Lerp(2.0f, 0.25f, std::clamp((speed - 10.0f) / 25.0f, 0.0f, 1.0f));
             const float maxStep = maxRate * CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
             const float limited = std::clamp(*steer, xdata.lastSteerOut - maxStep, xdata.lastSteerOut + maxStep);
