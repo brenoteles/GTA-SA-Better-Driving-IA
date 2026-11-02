@@ -123,6 +123,7 @@ static const char* laneStateNames[] = { "", "signal (overtake)", "OVERTAKING", "
 // CAutoPilot::m_nTempAction values handled by CCarCtrl::SteerAICarWithPhysics (jump table @ 0x438310)
 static constexpr char TEMPACT_REVERSE_LEFT = 13;  // reverse with full left lock, gas -0.75
 static constexpr char TEMPACT_REVERSE_RIGHT = 14; // reverse with full right lock
+static constexpr char TEMPACT_REVERSE = 3;        // straight back (CCarAI after 1 s pressed against a car)
 
 enum eAidFlags : unsigned char { AID_ABS = 1, AID_TC = 2, AID_ESC = 4, AID_COUNTERSTEER = 8, AID_PEDALS = 16, AID_ACCEL = 32 };
 
@@ -162,6 +163,8 @@ public:
     CVehicle* deadlockIgnore = nullptr; // the vehicle it waits for in a circle of waiting cars: not seen for a while
     unsigned int deadlockUntil = 0;
     unsigned char noseReverses = 0;     // nose-to-nose standoffs it backed out of
+    unsigned int crashoutUntil = 0;     // crashout: stopped too long, pushing its way out (until then)
+    unsigned char crashoutTries = 0;    // pushes in this stop (every other one backs out first)
     unsigned int ignoreLightsUntil = 0; // a light that never turns green (or the game holding it for no reason): ignored
     eObstacleType memObstacle = OBSTACLE_NONE;
     float memGap = 0.0f, memLeaderSpeed = 0.0f;
@@ -404,6 +407,11 @@ static bool cfgV2VOvertakes = true;              // overtakes planned with every
 static bool cfgTurnSideGuard = true;             // turning: watch the outside of the turn for vehicles there
 static int turnGuardCount = 0, boxWaitCount = 0, firstComeWaitCount = 0, lowSpeedBrakeCount = 0, bypassScrapeCount = 0;
 static int bypassLaneCount = 0, brokenRemovedCount = 0, deadlockBreakCount = 0, noOncomingBypassCount = 0, brokenLightCount = 0;
+// Crashout: a driver stopped too long (a jam that never clears, wedged after a crash) goes for it, hitting what's in the way
+static bool cfgCrashout = true;
+static float cfgCrashoutTime = 15.0f;       // s stopped behind something / for no reason
+static float cfgCrashoutLightTime = 50.0f;  // s stopped at a red light (longer than any actuated red)
+static int crashoutCount = 0;
 static int otherLaneHitCount = 0; // sensor hits on a car in another lane, not taken as the one ahead
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
 // One list for all junctions: a big intersection is several junction nodes close together (each way across it has its
@@ -3252,6 +3260,16 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     xdata.prevFwdSpeed = fwdSpeed;
     xdata.prevFwdFrame = frameCounter;
 
+    // Crashout: going for it, whatever is ahead (after any backing out)
+    if (CTimer::m_snTimeInMilliseconds < xdata.crashoutUntil && veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE_LEFT &&
+        veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE_RIGHT && veh->m_autoPilot.m_nTempAction != TEMPACT_REVERSE) {
+        *gas = 0.8f;
+        *brake = 0.0f;
+        *handbrake = false;
+        xdata.dbgGas = *gas;
+        xdata.dbgBrake = *brake;
+        return;
+    }
     if (cfgCloseUpInQueues && ApplyCloseUp(veh, xdata, gas, brake)) {
         xdata.dbgGas = *gas;
         xdata.dbgBrake = *brake;
@@ -3739,6 +3757,9 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "Crashout", cfgCrashout);
+        ReadIniFloat(ini, "CrashoutTime", cfgCrashoutTime);
+        ReadIniFloat(ini, "CrashoutLightTime", cfgCrashoutLightTime);
         ReadIniBool(ini, "SmoothLanes", cfgSmoothLanes);
         ReadIniBool(ini, "ActuatedLights", cfgActuatedLights);
         ReadIniFloat(ini, "SignalMinGreen", cfgSignalMinGreen);
@@ -4273,6 +4294,35 @@ public:
                 xdata.stillTime = 0.0f;
                 brokenLightCount++;
             }
+            // Crashout: stopped too long, it goes, hitting what's in the way (a gridlock at Grove held the whole street for
+            // minutes, the test car wedged against its leader). Pushes 4 s ignoring the car ahead; every other try it first
+            // backs out 2 s, the nose swinging to a side, to get a new angle
+            const bool atRed = xdata.waitState == 1 && xdata.lightColor != LIGHT_NONE && xdata.lightColor != LIGHT_GREEN;
+            if (cfgCrashout && !isBike && nowMs >= xdata.crashoutUntil + 1000 &&
+                xdata.stillTime > (atRed ? cfgCrashoutLightTime : cfgCrashoutTime) + xdata.crashoutTries * 6.0f) {
+                const bool backFirst = (xdata.crashoutTries & 1) != 0;
+                xdata.crashoutTries++;
+                xdata.crashoutUntil = nowMs + (backFirst ? 6500 : 4000);
+                if (backFirst) {
+                    ap.m_nTempAction = (xdata.crashoutTries & 2) ? TEMPACT_REVERSE_LEFT : TEMPACT_REVERSE_RIGHT;
+                    ap.m_nTempActionTime = nowMs + 2500;
+                }
+                xdata.deadlockIgnore = xdata.leaderVeh;
+                xdata.deadlockUntil = xdata.crashoutUntil;
+                xdata.memObstacle = OBSTACLE_NONE;
+                xdata.memLeaderVeh = nullptr;
+                crashoutCount++;
+                if (crashoutCount <= 40)
+                    lg << "Crashout: veh " << CPools::GetVehicleRef(vehicle) << " stopped " << xdata.stillTime << " s ("
+                       << (atRed ? "red light" : queued ? "queued" : "no reason") << "), try " << (int)xdata.crashoutTries
+                       << (backFirst ? ", backing out first" : "") << "\n";
+            }
+            if (nowMs < xdata.crashoutUntil) {
+                ap.m_nCarDrivingStyle = DRIVINGSTYLE_PLOUGH_THROUGH;
+                target = std::max(target, 20.0f / MPS_TO_KMH);
+                holdForLight = false;
+                xdata.waitState = 0;
+            }
             if (nowMs < xdata.ignoreLightsUntil) {
                 ap.m_nCarDrivingStyle = DRIVINGSTYLE_AVOID_CARS;
                 target = std::min(target, 15.0f / MPS_TO_KMH);
@@ -4289,6 +4339,7 @@ public:
 
         float speed = vehicle->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS; // m/s
         if (speed > 1.0f) xdata.stillTime = 0.0f;
+        if (speed > 3.0f && CTimer::m_snTimeInMilliseconds > xdata.crashoutUntil + 3000) xdata.crashoutTries = 0; // out of it
         const bool bypassing = UpdateBypass(vehicle, xdata, false, dt);
 
         // Looks like it isn't stuck on the ground

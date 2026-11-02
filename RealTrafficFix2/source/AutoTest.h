@@ -369,6 +369,52 @@ static void TakeShot(const std::string& name) {
     pendingShot = shotDir + name + ".jpg";
 }
 
+// The test car stuck: shots of the scene from 6 angles (front, both sides, behind, high front, from above), the camera
+// moved round it, then given back. For looking at what holds the traffic (with the log's waiting chain)
+static struct {
+    CVehicle* veh = nullptr;
+    int step = -1;
+    unsigned int stepStart = 0;
+    std::string name;
+} orbit;
+static int orbitCount = 0;
+static void StartOrbitShots(CVehicle* veh, const std::string& name) {
+    if (orbit.step >= 0 || !veh) return;
+    orbit.veh = veh;
+    orbit.step = 0;
+    orbit.stepStart = 0;
+    orbit.name = name;
+    orbitCount++;
+}
+static void UpdateOrbitShots(unsigned int now) {
+    if (orbit.step < 0) return;
+    if (!orbit.veh || !CPools::ms_pVehiclePool->IsObjectValid(orbit.veh) || orbit.step >= 6) {
+        TheCamera.Restore();
+        orbit.step = -1;
+        return;
+    }
+    // angle around the car from its front (degrees), distance, height
+    static const float views[6][3] = { { 0, 14, 4 }, { 90, 14, 4 }, { 180, 16, 5 }, { 270, 14, 4 }, { 35, 22, 14 }, { 0, 1, 45 } };
+    if (!orbit.stepStart) {
+        const float* v = views[orbit.step];
+        const CVector c = orbit.veh->GetPosition();
+        const CVector2D f = orbit.veh->GetForward().To2D(), r = orbit.veh->GetRight().To2D();
+        const float a = v[0] * 3.14159265f / 180.0f;
+        CVector2D dir = f * std::cos(a) + r * std::sin(a);
+        CVector pos(c.x + dir.x * v[1], c.y + dir.y * v[1], c.z + v[2]);
+        CVector up(0.0f, 0.0f, 0.0f);
+        TheCamera.SetCamPositionForFixedMode(&pos, &up);
+        TheCamera.TakeControlNoEntity(&c, 2, 1); // jump cut, script in control
+        orbit.stepStart = now;
+    }
+    else if (now - orbit.stepStart > 350 && pendingShot.empty()) {
+        static const char* names[6] = { "front", "right", "rear", "left", "high", "top" };
+        TakeShot(Format("%s_%d_%s", orbit.name.c_str(), orbit.step + 1, names[orbit.step]));
+        orbit.step++;
+        orbit.stepStart = 0;
+    }
+}
+
 void Draw() {
     if (!enabled) return;
     if (state != WAIT_GAME && state != DONE) {
@@ -812,6 +858,7 @@ void Update() {
     CPlayerPed* player = FindPlayerPed();
     if (!player) return;
     unsigned int now = Now();
+    UpdateOrbitShots(now);
     // The scan runs with the normal traffic: its rays only see the ground (buildings), never vehicles
     if (noPeds) {
         // Every frame (the game resets it); the ones already there are removed every 2 s
@@ -966,7 +1013,14 @@ void Update() {
                     float step = (c.veh->GetPosition() - c.lastPos).Magnitude2D();
                     if (step < 50.0f) c.driven += step;
                     c.lastPos = c.veh->GetPosition();
-                    c.still = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f ? c.still + dt : 0.0f;
+                    {
+                        const float before = c.still;
+                        c.still = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f ? c.still + dt : 0.0f;
+                        if (static_cast<int>(before / 40.0f) < static_cast<int>(c.still / 40.0f)) {
+                            out << Format("  [%s] stuck %.0f s: shots of the scene from 6 angles (stuck_%02d_*)\n", c.label, c.still, orbitCount + 1);
+                            StartOrbitShots(c.veh, Format("stuck_%02d", orbitCount + 1));
+                        }
+                    }
                     const CVector2D carPos = c.veh->GetPosition().To2D();
                     const CVector2D wpPos = WaypointPos(l, c.wp);
                     const float toWp = (wpPos - carPos).Magnitude();
@@ -1232,6 +1286,7 @@ void Update() {
         out << Format("actuated lights: switched by the safety valve (a road red too long with someone waiting) %d\n", signalForcedCount);
         out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
+        out << Format("crashout (stopped too long, pushed its way out): %d\n", crashoutCount);
         out << Format("held at a light/by the game 25 s with the road clear, went through (broken light): %d\n", brokenLightCount);
         out << Format("going round through the oncoming lanes refused (two-way roads): %d\n", noOncomingBypassCount);
         out << Format("route exits the game would have refused, taken anyway: %d\n", forcedExitCount);
