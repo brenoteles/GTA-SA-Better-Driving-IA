@@ -229,6 +229,7 @@ public:
     float measAccel = 0.0f;       // m/s2 along the forward, smoothed
     float jerkAccel = 0.0f;       // acceleration allowed now, growing at the jerk limit (openpilot D)
     bool queueStopped = false;    // stopped in a queue: waits for the one ahead to really go (openpilot E)
+    bool lastSearchFailed = false; // the last route search didn't reach the destination
     unsigned int leaderMovingSince = 0;
     // The leader's acceleration (openpilot radard): its speed along ours, differentiated and smoothed
     CVehicle* accLeader = nullptr;
@@ -2170,6 +2171,7 @@ static void PickDestination(ExtendedData& xdata, CVehicle* veh) {
         if (!IsUsableCarNode(addr, node) || node->NumberAdjNodes < 2) continue;
         bool isWide = node->Speed >= 2 || IsWideRoadNode(addr, node);
         float dist = (GetNodePos(node) - pos).Magnitude2D();
+        if (dist < 150.0f) continue; // "arrived" at once: a new pick every frame
         float score = std::min(dist, maxDist) / maxDist;
         if (dist >= minDist && dist <= maxDist) score += 2.0f;
         if (wide && isWide) score += node->Speed >= 2 ? 4.0f : 3.0f;
@@ -2395,15 +2397,19 @@ static void UpdateDestination(ExtendedData& xdata, CVehicle* veh) {
         // again for the same unreachable place every 300 ms, 200000 A* steps each: with the cars piled up at the edge of
         // the map (Bayside) the game crawled at a few frames a second, three test runs stalled there. A fixed destination
         // (the test car): again only when the route didn't reach it, and not as often
-        if (!xdata.route.empty() && xdata.routePos >= static_cast<int>(xdata.route.size()) - 3) {
+        if (!xdata.route.empty() && xdata.routePos > 0 && xdata.routePos >= static_cast<int>(xdata.route.size()) - 3) {
             if (!xdata.fixedDestination) { PickDestination(xdata, veh); needRoute = true; }
             else if (!xdata.routeComplete && now - xdata.routeTime > 2000) needRoute = true;
         }
     }
-    if (needRoute && now - xdata.routeTime > 300 && routesThisFrame < 2) {
+    // After a search that didn't get there, the fixed destination waits 2 s (200000 steps each: every 300 ms was a crawl)
+    const unsigned int retry = xdata.fixedDestination && xdata.lastSearchFailed ? 2000u : 300u;
+    if (needRoute && now - xdata.routeTime > retry && routesThisFrame < 2) {
         routesThisFrame++;
         ResolveFixedDestination(xdata);
-        if (!CalculateRoute(veh, xdata) && !xdata.fixedDestination) PickDestination(xdata, veh); // somewhere it can get to, next time
+        const bool ok = CalculateRoute(veh, xdata);
+        xdata.lastSearchFailed = !ok || !xdata.routeComplete;
+        if (!ok && !xdata.fixedDestination) PickDestination(xdata, veh); // somewhere it can get to, next time
     }
 }
 
@@ -3479,8 +3485,13 @@ static void ApplyAccelLimit(CVehicle* veh, ExtendedData& xdata, float speed, flo
     // The acceleration allowed grows at the jerk limit (3 m/s3 standing, 2 at 25 m/s, more for aggressive drivers); off the
     // gas or braking it starts again from what the car is really doing
     float limit = xdata.accelLimit;
-    if (cfgJerkLimit && cfgPedalControl) {
-        if (*gas <= 0.0f || *brake > 0.05f) xdata.jerkAccel = std::max(xdata.measAccel, 0.0f);
+    const bool fullGasOvertake = cfgOvertakeFullThrottle && (xdata.laneState == LANE_SIGNAL_OVERTAKE || xdata.laneState == LANE_OVERTAKING ||
+        (xdata.laneState == LANE_CHANGING && xdata.changeAfter == LANE_OVERTAKING));
+    if (cfgJerkLimit && cfgPedalControl && !fullGasOvertake) {
+        // Starting again from what the car does, but never below 0.8 m/s2 or what holds it on the slope (from 0 it crawled
+        // off the line, rolled back on hills)
+        if (*gas <= 0.0f || *brake > 0.05f)
+            xdata.jerkAccel = std::max({ xdata.measAccel, 0.8f, veh->GetForward().z * GRAVITY + 0.5f });
         else {
             const float jerk = Lerp(3.0f, 2.0f, std::clamp(speed / 25.0f, 0.0f, 1.0f)) * (1.0f + 0.5f * xdata.aggression);
             xdata.jerkAccel = std::min(xdata.jerkAccel + jerk * dt, 8.0f);
@@ -3493,16 +3504,18 @@ static void ApplyAccelLimit(CVehicle* veh, ExtendedData& xdata, float speed, flo
         return;
     }
     const float cruiseGas = CruiseGas(veh, speed);
-    if (!xdata.accelLimiting) xdata.gasTrim = 0.1f + 0.06f * limit; // first guess, corrected below
+    if (!xdata.accelLimiting) xdata.gasTrim = 0.1f; // first guess, corrected below
     xdata.accelLimiting = true;
     float error = limit - xdata.measAccel;
     xdata.gasTrim = std::clamp(xdata.gasTrim + error * 0.3f * dt, -cruiseGas, 1.0f);
-    float cap = std::clamp(cruiseGas + xdata.gasTrim + error * 0.05f, 0.05f, 1.0f);
+    // The gas for the acceleration wanted goes straight in (feed-forward); the integrator only corrects (with the jerk ramp
+    // starting near 0 it lagged ~2 s behind it)
+    float cap = std::clamp(cruiseGas + 0.06f * limit + xdata.gasTrim + error * 0.05f, 0.05f, 1.0f);
     if (*gas > cap) {
         *gas = cap;
         xdata.aidFlags |= AID_ACCEL;
     }
-    else xdata.gasTrim = std::min(xdata.gasTrim, *gas - cruiseGas + 0.1f); // not limiting now: no wind-up
+    else xdata.gasTrim = std::min(xdata.gasTrim, *gas - cruiseGas - 0.06f * limit + 0.1f); // not limiting now: no wind-up
 }
 
 // Counter-steer: when the car slides, steer into the direction it's really going, like a driver catching a slide
@@ -4671,8 +4684,9 @@ public:
                 const bool release = !behindVehicle ||
                     (xdata.leaderMovingSince && nowMs - xdata.leaderMovingSince > 250 && xdata.gap > minGap + 1.0f);
                 if (release) xdata.queueStopped = false;
-                else if (xdata.leaderSpeed >= 1.0f) {
-                    xdata.closeUpTarget = 0.0f; // the one ahead is only just moving: hold
+                else if (xdata.leaderSpeed >= 1.0f || xdata.gap < minGap + 1.3f) {
+                    // The one ahead is only just moving, or there's under 1 m to creep into: hold
+                    xdata.closeUpTarget = 0.0f;
                     queueHolds++;
                 }
             }
@@ -5269,6 +5283,7 @@ public:
     }
 
     static bool IsQueuedBehind(const ExtendedData& xdata, float minGap) {
+        if (xdata.queueStopped && xdata.obstacle == OBSTACLE_VEHICLE) return true; // held by stop-and-go: queued for the game too
         return (xdata.obstacle == OBSTACLE_VEHICLE || xdata.obstacle == OBSTACLE_PED) && xdata.leaderSpeed < 1.5f &&
             xdata.gap < minGap + 0.3f; // stops close behind (it was minGap + 5 m: queues at lights were far apart)
     }
