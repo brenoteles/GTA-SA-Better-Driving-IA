@@ -414,6 +414,15 @@ static float cfgCrashoutLightTime = 50.0f;  // s stopped at a red light (longer 
 static float cfgCrashoutQueueTime = 40.0f;  // s queued behind another waiting car (the one at the head goes first)
 static int crashoutCount = 0;
 static int otherLaneHitCount = 0; // sensor hits on a car in another lane, not taken as the one ahead
+// Route leader (like CARLA's traffic manager: other vehicles judged along the route we'll drive, not by where a ray
+// happens to hit): 0 off, 1 the rays decide and the route's verdict is only logged, 2 the route decides for vehicles
+// following the roads (the rays still decide for buildings, peds, objects and cars off the road network)
+static int cfgRouteLeader = 2;
+enum eRouteVerdict { ROUTE_UNKNOWN, ROUTE_IN_LANE, ROUTE_OTHER_LANE };
+static int routeAgreeCount = 0, routeUnknownCount = 0, routeOtherLaneRaysWouldBrake = 0, routeInLaneRaysWouldIgnore = 0, routeLogged = 0;
+// Why the route couldn't judge: no route ahead, the other off the road network, us off our route, it not on our route's
+// links, it behind us, it across the road
+static int routeUnknownWhy[6] = {};
 static bool cfgJunctionFirstCome = true;          // junctions without lights: first come, first served
 // One list for all junctions: a big intersection is several junction nodes close together (each way across it has its
 // own), the claims of all of them within 30 m count together
@@ -3761,6 +3770,7 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniInt(ini, "RouteLeader", cfgRouteLeader);
         ReadIniBool(ini, "Crashout", cfgCrashout);
         ReadIniFloat(ini, "CrashoutTime", cfgCrashoutTime);
         ReadIniFloat(ini, "CrashoutLightTime", cfgCrashoutLightTime);
@@ -4753,6 +4763,90 @@ public:
             xdata.gap < minGap + 0.3f; // stops close behind (it was minGap + 5 m: queues at lights were far apart)
     }
 
+    // Where a point is along the route ahead (m from the current node) and across it (lanes of that segment). With 'links',
+    // only on those road links (another vehicle must be on our road, not on a ramp or a road running close beside it)
+    static bool ProjectOnRoute(const ExtendedData& xdata, const float* cum, const CVector2D& p, CCarPathLink* const* links,
+        float& along, float& laneF, CVector2D& dirOut)
+    {
+        float best = 20.0f; // 4 lanes of 5.4 m and a median: lanes far from the node line
+        bool found = false;
+        for (int seg = 1; seg + 1 < xdata.pathCount; seg++) {
+            if (!xdata.pathLinkOk[seg]) continue;
+            if (links && xdata.pathLink[seg] != links[0] && xdata.pathLink[seg] != links[1]) continue;
+            CVector2D a = xdata.path[seg].To2D(), d = xdata.path[seg + 1].To2D() - a;
+            float len2 = d.MagnitudeSqr();
+            if (len2 < 0.25f) continue;
+            float len = std::sqrt(len2);
+            // Past the segment's ends by more than 2 m: another segment's (at a corner the clamped end read the lanes of
+            // the segment before it)
+            const float tRaw = CVector2D::Dot(p - a, d) / len2;
+            if (tRaw * len < -2.0f || (tRaw - 1.0f) * len > 2.0f) continue;
+            float t = std::clamp(tRaw, 0.0f, 1.0f);
+            float dist = (a + d * t - p).Magnitude();
+            if (dist >= best) continue;
+            CVector2D dir = d * (1.0f / len);
+            best = dist;
+            found = true;
+            along = cum[seg] + t * len;
+            laneF = CVector2D::Dot(p - xdata.pathLinkPos[seg], CVector2D(dir.y, -dir.x)) / LANE_WIDTH - xdata.pathLaneOffset[seg];
+            dirOut = dir;
+        }
+        return found;
+    }
+
+    // Lanes the car will be in 's' metres ahead: from where it really is now (it may sit between lanes) to the lane it steers
+    // for, over ~1.5 s. Both lanes while changing lanes
+    static void RouteLaneRefs(CVehicle* veh, const ExtendedData& xdata, float myLaneF, float s, float speed, float& refA, float& refB) {
+        const CAutoPilot& ap = veh->m_autoPilot;
+        const float laneB = static_cast<float>(xdata.laneState == LANE_CHANGING ? xdata.changeTarget : ap.m_nNextLane);
+        const bool pullingOut = xdata.laneState == LANE_CHANGING && xdata.laneAction == 1 && std::abs(myLaneF - ap.m_nNextLane) > 0.45f;
+        const float laneA = pullingOut ? laneB : static_cast<float>(ap.m_nNextLane);
+        const float blend = std::clamp(s / std::max(15.0f, speed * 1.5f), 0.0f, 1.0f);
+        refA = myLaneF + (laneA - myLaneF) * blend;
+        refB = myLaneF + (laneB - myLaneF) * blend;
+    }
+
+    // Is 'other' ahead of us in the path we'll drive? Its body and ours overlapping sideways (+0.5 m) along the route, the
+    // curve and our lane change taken into account. Unknown for vehicles off the road network, across the road (crashed) or
+    // not ahead on our route: the rays judge those
+    static eRouteVerdict JudgeOnRoute(CVehicle* veh, const ExtendedData& xdata, CVehicle* other, float speed, float myHalfWidth,
+        float& lateralGap, float& ahead)
+    {
+        const int n = xdata.pathCount;
+        if (n < 3) { routeUnknownWhy[0]++; return ROUTE_UNKNOWN; }
+        CCarPathLink* links[2] = { LinkFromAddress(other->m_autoPilot.m_nCurrentPathNodeInfo),
+            LinkFromAddress(other->m_autoPilot.m_nNextPathNodeInfo) };
+        if (other->m_nStatus == STATUS_WRECKED || (!links[0] && !links[1])) { routeUnknownWhy[1]++; return ROUTE_UNKNOWN; }
+        float cum[MAX_LOOKAHEAD_NODES + 1] = {};
+        for (int i = 2; i < n; i++) cum[i] = cum[i - 1] + (xdata.path[i] - xdata.path[i - 1]).Magnitude2D();
+        float myAlong, myLaneF, oAlong, oLaneF;
+        CVector2D myDir, oDir;
+        if (!ProjectOnRoute(xdata, cum, veh->GetPosition().To2D(), nullptr, myAlong, myLaneF, myDir)) { routeUnknownWhy[2]++; return ROUTE_UNKNOWN; }
+        if (!ProjectOnRoute(xdata, cum, other->GetPosition().To2D(), links, oAlong, oLaneF, oDir)) { routeUnknownWhy[3]++; return ROUTE_UNKNOWN; }
+        // Across the road (crashed, turning across): the rays'. Coming the other way it's judged too: in its own lanes not
+        // ours to brake for (the rays braked for oncoming cars 11 m to the side in curves), in our path an obstacle
+        if (std::abs(CVector2D::Dot(other->GetForward().To2D(), oDir)) < 0.7f) { routeUnknownWhy[5]++; return ROUTE_UNKNOWN; }
+        {
+            CVector oMin, oMax;
+            GetEntityDimensions(other, oMin, oMax);
+            if (oAlong + oMax.y <= myAlong) { routeUnknownWhy[4]++; return ROUTE_UNKNOWN; } // all of it behind our centre
+        }
+        ahead = oAlong - myAlong;
+        float refA, refB;
+        RouteLaneRefs(veh, xdata, myLaneF, ahead, speed, refA, refB);
+        const float dLanes = std::max({ std::min(refA, refB) - oLaneF, oLaneF - std::max(refA, refB), 0.0f });
+        // Its width across the road: a long vehicle at an angle (turning, changing lanes, half across after a knock) covers
+        // more of it than its width
+        CVector oMin, oMax;
+        GetEntityDimensions(other, oMin, oMax);
+        const float c = std::abs(CVector2D::Dot(other->GetForward().To2D(), oDir));
+        const float oHalfWidth = std::max(oMax.x, -oMin.x) * c + std::max(oMax.y, -oMin.y) * std::sqrt(std::max(1.0f - c * c, 0.0f));
+        lateralGap = dLanes * LANE_WIDTH - myHalfWidth - oHalfWidth;
+        // Much slower or stopped: a wider margin before calling it the next lane (a wrong guess there is a hard rear-end)
+        const float otherSpeed = CVector::Dot(other->m_vecMoveSpeed, veh->GetForward()) * GAME_SPEED_TO_MPS;
+        return lateralGap < (otherSpeed < speed - 5.0f ? 1.2f : 0.5f) ? ROUTE_IN_LANE : ROUTE_OTHER_LANE;
+    }
+
     static void UpdateObstacles(CVehicle* vehicle, ExtendedData& xdata, const CVector& modelMin, const CVector& modelMax,
         bool isBike, bool racer, float speed, float timeGap, float decel)
     {
@@ -4876,8 +4970,35 @@ public:
                     // And only one going about our speed (within 5 m/s): a stopped or much slower one always counts, a
                     // wrong guess there is a hard rear-end (the Cadrona at 108 km/h lost a stopped car at 37 m in a curve)
                     const float hitFwdSpeed = CVector::Dot(hitVeh->m_vecMoveSpeed, forward) * GAME_SPEED_TO_MPS;
-                    if (parallel && lon > 0.0f && lon < 40.0f && hitFwdSpeed > speed - 5.0f &&
-                        std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 1.0f) {
+                    const bool raysSayOtherLane = parallel && lon > 0.0f && lon < 40.0f && hitFwdSpeed > speed - 5.0f &&
+                        std::abs(lat) > modelMax.x + std::max(oMax.x, -oMin.x) + 1.0f;
+                    if (cfgRouteLeader > 0 && !isBike) {
+                        float latGap = 0.0f, ahead = 0.0f;
+                        const eRouteVerdict rv = JudgeOnRoute(vehicle, xdata, hitVeh, speed, std::max(modelMax.x, -modelMin.x), latGap, ahead);
+                        if (rv == ROUTE_UNKNOWN) routeUnknownCount++;
+                        else if ((rv == ROUTE_OTHER_LANE) == raysSayOtherLane) routeAgreeCount++;
+                        else {
+                            if (rv == ROUTE_OTHER_LANE) routeOtherLaneRaysWouldBrake++;
+                            else routeInLaneRaysWouldIgnore++;
+                            if (routeLogged++ < 40)
+                                lg << "Route leader: veh " << CPools::GetVehicleRef(vehicle) << " at " << speedKmh << " km/h, veh "
+                                   << CPools::GetVehicleRef(hitVeh) << " " << ahead << " m ahead on the route at " << hitFwdSpeed * MPS_TO_KMH
+                                   << " km/h: route says " << (rv == ROUTE_OTHER_LANE ? "other lane" : "our lane") << " (side gap "
+                                   << latGap << " m), the rays " << (raysSayOtherLane ? "other lane" : "our lane") << " (lat " << lat
+                                   << " m)" << (cfgRouteLeader == 2 ? ", route used" : "") << "\n";
+                        }
+                        if (cfgRouteLeader == 2 && rv != ROUTE_UNKNOWN) {
+                            if (rv == ROUTE_OTHER_LANE) {
+                                xdata.rayColor[i] = { 255, 0, 255, 255 };
+                                otherLaneHitCount++;
+                                continue;
+                            }
+                            type = OBSTACLE_VEHICLE;
+                            leaderSpeed = std::max(hitFwdSpeed, 0.0f);
+                            break;
+                        }
+                    }
+                    if (raysSayOtherLane) {
                         xdata.rayColor[i] = { 255, 140, 0, 255 };
                         otherLaneHitCount++;
                         continue;
@@ -4949,30 +5070,13 @@ public:
         float cum[MAX_LOOKAHEAD_NODES + 1] = {};
         for (int i = 2; i < n; i++) cum[i] = cum[i - 1] + (xdata.path[i] - xdata.path[i - 1]).Magnitude2D();
 
-        // Where a point is along the route (m from the current node) and across it (lanes of that segment). With 'links',
-        // only on those road links (another vehicle must be on our road, not on a ramp or a road running close beside it)
         auto project = [&](const CVector2D& p, float& along, float& laneF, CVector2D& dirOut, CCarPathLink* const* links) {
-            float best = 12.0f;
-            bool found = false;
-            for (int seg = 1; seg + 1 < n; seg++) {
-                if (!xdata.pathLinkOk[seg]) continue;
-                if (links && xdata.pathLink[seg] != links[0] && xdata.pathLink[seg] != links[1]) continue;
-                CVector2D a = xdata.path[seg].To2D(), d = xdata.path[seg + 1].To2D() - a;
-                float len2 = d.MagnitudeSqr();
-                if (len2 < 0.25f) continue;
-                float t = std::clamp(CVector2D::Dot(p - a, d) / len2, 0.0f, 1.0f);
-                float dist = (a + d * t - p).Magnitude();
-                if (dist >= best) continue;
-                float len = std::sqrt(len2);
-                CVector2D dir = d * (1.0f / len);
-                best = dist;
-                found = true;
-                along = cum[seg] + t * len;
-                laneF = CVector2D::Dot(p - xdata.pathLinkPos[seg], CVector2D(dir.y, -dir.x)) / LANE_WIDTH - xdata.pathLaneOffset[seg];
-                dirOut = dir;
-            }
-            return found;
+            return ProjectOnRoute(xdata, cum, p, links, along, laneF, dirOut);
         };
+        CVector myMin, myMax;
+        GetEntityDimensions(veh, myMin, myMax);
+        const float myHalfWidth = std::max(myMax.x, -myMin.x);
+        const float mySpeed = veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
 
         const CVector pos = veh->GetPosition();
         float myAlong, myLaneF;
@@ -5001,7 +5105,19 @@ public:
             float along, laneF;
             CVector2D dir;
             if (!project(other->GetPosition().To2D(), along, laneF, dir, links) || along <= myAlong) continue;
-            if (std::abs(laneF - laneA) > 0.6f && std::abs(laneF - laneB) > 0.6f) continue;
+            if (cfgRouteLeader == 2) {
+                // Bodies overlapping sideways along the path we'll drive (0.6 of a 5.4 m lane let in cars in the next lane
+                // on wide roads, and the game's lane number isn't where the car is)
+                float refA, refB;
+                RouteLaneRefs(veh, xdata, myLaneF, along - myAlong, mySpeed, refA, refB);
+                CVector oMin, oMax;
+                GetEntityDimensions(other, oMin, oMax);
+                const float dLanes = std::max({ std::min(refA, refB) - laneF, laneF - std::max(refA, refB), 0.0f });
+                const float c = std::abs(CVector2D::Dot(other->GetForward().To2D(), dir));
+                const float oHalfWidth = std::max(oMax.x, -oMin.x) * c + std::max(oMax.y, -oMin.y) * std::sqrt(std::max(1.0f - c * c, 0.0f));
+                if (dLanes * LANE_WIDTH - myHalfWidth - oHalfWidth >= 0.5f) continue;
+            }
+            else if (std::abs(laneF - laneA) > 0.6f && std::abs(laneF - laneB) > 0.6f) continue;
             CVector2D vel = other->m_vecMoveSpeed.To2D() * GAME_SPEED_TO_MPS;
             if (CVector2D::Dot(other->GetForward().To2D(), dir) < -0.3f && vel.Magnitude() > 2.0f) continue; // coming the other way
             CVector otherMin, otherMax;
