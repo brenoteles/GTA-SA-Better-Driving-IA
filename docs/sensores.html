@@ -120,7 +120,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
   <header>
     <span class="eyebrow">Real Traffic Fix · GTA San Andreas 1.0 US · atualizado 02/11/2026</span>
     <h1>Sensores do Real Traffic Fix</h1>
-    <p class="lede">O que o Claude e o Gemini estão fazendo para os carros da IA enxergarem melhor o trânsito, com o CARLA como referência. O teste padrão é o Cadrona (handling editado, aceleração muito alta) com piloto rápido, de Grove Street até Bayside.</p>
+    <p class="lede">O que o Claude e o Gemini estão fazendo para os carros da IA enxergarem melhor o trânsito, com o CARLA como referência. O teste padrão era o Cadrona (handling editado, aceleração muito alta) com piloto rápido, de Grove Street até Bayside; a partir de agora é o Sandking.</p>
     <div class="who">
       <span class="tag t-claude">Claude: código, testes no jogo, leitura dos logs</span>
       <span class="tag t-gemini">Gemini 4 Argon: revisão de código e análise (via Antigravity)</span>
@@ -251,6 +251,8 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
           <tr><td class="mono">114543</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">5</td><td>Correção da curva com carro ao lado; rota decide: 8,35 min, 2,40 colisões/min</td></tr>
           <tr><td class="mono">115452</td><td><span class="pill good">chegou</span></td><td class="num">10,64 km</td><td class="num">8</td><td>A/B, raios decidem: 8,19 min, 3,66 colisões/min</td></tr>
           <tr><td class="mono">120816</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Proposta 3 e openpilot A e C: 8,26 min, 77 km/h, 2,18 colisões/min</td></tr>
+          <tr><td class="mono">133337</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Semáforos agrupados com a revisão: 8,72 min, 2,18 colisões/min, largada limpa</td></tr>
+          <tr><td class="mono">131948</td><td><span class="pill good">chegou</span></td><td class="num">10,58 km</td><td class="num">1</td><td>Semáforos agrupados, primeira versão: 7,57 min, 4,62 colisões/min</td></tr>
           <tr><td class="mono">125544</td><td><span class="pill warn">chegou</span></td><td class="num">10,68 km</td><td class="num">11</td><td>79 faixas novas e FLA: 10,14 min, 11,54 colisões/min; engavetamento no cruzamento (2872, −1661) logo na largada, longe das faixas novas</td></tr>
           <tr><td class="mono">123526</td><td><span class="pill good">chegou</span></td><td class="num">10,60 km</td><td class="num">3</td><td>Carros dentro do asfalto e postes no meio-fio: 7,74 min, 82 km/h, 2,20 colisões/min, só 3 fortes</td></tr>
           <tr><td class="mono">092740</td><td><span class="pill good">chegou</span></td><td class="num">10,62 km</td><td class="num">1</td><td>Propostas 1 e 2 e correção do spawn: 7,45 min, 86 km/h, 0,67 colisões/min no tráfego (melhor até agora)</td></tr>
@@ -568,6 +570,22 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
     <p>Instalado na pasta do jogo sem sobrescrever nada. O jogo já tem um <code>zlib1.dll</code> diferente (de 2021, usado por outro mod); o do FLA (2020) não foi copiado e o FLA carregou com o existente. Na primeira execução ele gerou o ini com todos os limites comentados (não mexe em nada que o Open Limit Adjuster já mexe). No ini: depuração de rotas ligada, limite de coronas em 10.000 (cada nó vira uma corona) e o tratador de crash do FLA desligado, como o próprio leiame recomenda (o jogo já tem o CrashInfo). Vale a partir da próxima abertura. A janela do FLA ainda aparece em toda abertura: falta o código de desligar, que só aparece nela.</p>
   </section>
 
+  <section id="agrupados">
+    <h2>Semáforos agrupados: o cruzamento a leste de Grove</h2>
+    <p><code>tools/junction_report.py</code> mostrou o que é o ponto (2872, −1661): uma avenida de pistas separadas (2 faixas por sentido, 19 m de canteiro) cruzada por uma rua 1+1. Cada pista tinha o seu semáforo, sem coordenação: a transversal tinha verde numa e vermelho na outra, carros paravam no canteiro (cabem 2), o terceiro ficava dentro do cruzamento de trás e a avenida travava.</p>
+    <p>A correção é a do SUMO (<code>--tls.join</code>): cruzamentos de uma mesma avenida, ou a menos de 35 m pela via, viram um controlador só. A demanda soma as vias de todos; os links entre eles (o canteiro) têm verde durante a fase do seu sentido, o amarelo e os 2 s a mais do vermelho geral, e vermelho no último 1,5 s, para ninguém cruzar a pista de lá quando ela abre. Vale para toda avenida assim no mapa: 28 grupos.</p>
+    <p>Revisão do Gemini lendo o código: 4 de 5 pontos válidos e aplicados. O mais grave: carros esperando no canteiro (quem vira da avenida) não contavam como demanda; sem ninguém de fora, o controlador nunca daria verde a eles. Outro: a luz tinha que valer para a junção testada; sem isso, um nó sem semáforo (15:516) entrou num grupo de 4 e aquela região teve 22 apertos. Ficou de fora um detalhe visual dos postes.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Teste</th><th class="num">Colisões/min</th><th>Cruzamento de Grove</th><th>Região (2700, −1600)</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">125544 (sem agrupar)</td><td class="num">11,54</td><td>81 colisões</td><td>—</td></tr>
+        <tr><td class="mono">131948 (primeira versão)</td><td class="num">4,62</td><td>1</td><td>22 (15:516 agrupado por engano)</td></tr>
+        <tr><td class="mono">133337 (com a revisão)</td><td class="num">2,18</td><td>—</td><td>1</td></tr>
+      </tbody></table></div>
+    <p>Próximo ponto que se repete: a descida de Bayside (−2800, 2300), com 8 colisões no último teste.</p>
+    <div class="who"><span class="tag t-claude">Claude: diagnóstico e código</span><span class="tag t-gemini">Gemini: revisão</span><span class="tag t-user">ideia original: SUMO</span></div>
+  </section>
+
   <section id="fla">
     <h2>fastman92 limit adjuster</h2>
     <p>Ferramenta trazida pelo usuário (v6.5). Foi extraída numa pasta separada e lida antes de qualquer instalação.</p>
@@ -575,6 +593,7 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
       <li><b>Formato de rotas FLA4:</b> o endereço de ligação passa de 10 bits (até 1.024 por área, o limite que impediu adensar os nós) para 16 bits de ligação e 16 de área, com coordenadas de 32 bits. Com o patch ligado, os nós passam de 28 para 44 bytes, as ligações de 14 para 24 e o endereço de 2 para 4. O mod lê essas estruturas diretamente em dezenas de lugares, então adotar o formato exige adaptar o mod: é um projeto à parte.</li>
       <li><b>Conflito:</b> o jogo já tem o Open Limit Adjuster aumentando os pools (veículos 400, objetos 10.000, prédios 100.000…). Dois ajustadores mexendo no mesmo limite é receita de crash, então o FLA só vale pelo que o outro não faz.</li>
       <li><b>Depuração de rotas:</b> o FLA desenha os nós de rua no jogo. Útil para conferir no olho os semáforos, as faixas e a largura medida; será instalado só com isso ligado.</li>
+      <li><b>A janela de abertura:</b> o jogo só seguia depois de clicar nela. O código-fonte no GitHub é "só para visualização" e não tem a parte que gera o código de desligar. Em vez disso, <code>tools/fla_window.py</code> lê a janela pelo Windows: acha o código no texto dela (815AD-5CF6D-3A582-4E8D1-7CFEA), grava no ini e aperta "Continue". O lançador dos testes faz isso sozinho. Com o código no ini, a janela não volta.</li>
     </ul>
   </section>
 
