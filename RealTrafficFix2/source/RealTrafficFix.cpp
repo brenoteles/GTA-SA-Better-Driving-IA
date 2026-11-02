@@ -2025,6 +2025,11 @@ static float GetRoadSpeed(eRoadType type) {
 
 static int routesThisFrame = 0;     // route searches are spread over frames
 static int routeSearchCount = 0, routeFailCount = 0, offRouteCount = 0;
+static long long routeExpansionsTotal = 0;   // A* steps, all searches
+static float modFrameMsMax = 0.0f;          // the mod's longest frame (ms)
+static int modSlowFrames = 0;                // frames where the mod took over 50 ms
+static int routeIncompleteCount = 0;         // searches that didn't reach the destination (route to the closest point)
+static int routeExpansionsFrame = 0;         // this frame
 // Why vehicles leave their route (AutoTest): no exit planned for that junction, the game took another exit than the
 // planned one, the node wasn't a junction (the route didn't match the road)
 static int offRouteNoPlan = 0, offRouteRejected = 0, offRouteNotJunction = 0, seqPlanApplied = 0, seqNoPlan = 0;
@@ -2218,7 +2223,11 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     int expansions = 0;
     bool found = false;
     uint32_t goalHit = goalKey;
-    while (!open.empty() && expansions < 200000) {
+    // Random destinations: 30000 steps (any reachable place within 2.5 km takes far fewer; an unreachable one took the
+    // whole 200000 every time). The test car's fixed destination keeps the full search
+    const int maxExpansions = xdata.fixedDestination ? 200000 : 30000;
+    struct CountSteps { int& n; ~CountSteps() { routeExpansionsTotal += n; routeExpansionsFrame += n; } } countSteps{ expansions };
+    while (!open.empty() && expansions < maxExpansions) {
         uint32_t k = open.top().second;
         open.pop();
         Rec& rec = recs[k];
@@ -2277,6 +2286,7 @@ static bool CalculateRoute(CVehicle* veh, ExtendedData& xdata) {
     }
     std::reverse(xdata.route.begin(), xdata.route.end());
     xdata.routeComplete = found;
+    if (!found) routeIncompleteCount++;
     xdata.planCount = 0;
     return true;
 }
@@ -2371,12 +2381,17 @@ static void UpdateDestination(ExtendedData& xdata, CVehicle* veh) {
             xdata.routePos = 0;
             rejoinRouteCount++;
         }
+        // At the end of its route. A random destination: a new one, also when the route only got part of the way (a
+        // destination it can't reach: 12% of the nodes are in traps and islands). Before, an incomplete route was planned
+        // again for the same unreachable place every 300 ms, 200000 A* steps each: with the cars piled up at the edge of
+        // the map (Bayside) the game crawled at a few frames a second, three test runs stalled there. A fixed destination
+        // (the test car): again only when the route didn't reach it, and not as often
         if (!xdata.route.empty() && xdata.routePos >= static_cast<int>(xdata.route.size()) - 3) {
-            if (xdata.routeComplete && !xdata.fixedDestination) { PickDestination(xdata, veh); }
-            needRoute = true;
+            if (!xdata.fixedDestination) { PickDestination(xdata, veh); needRoute = true; }
+            else if (!xdata.routeComplete && now - xdata.routeTime > 2000) needRoute = true;
         }
     }
-    if (needRoute && now - xdata.routeTime > 300 && routesThisFrame < 4) {
+    if (needRoute && now - xdata.routeTime > 300 && routesThisFrame < 2) {
         routesThisFrame++;
         ResolveFixedDestination(xdata);
         if (!CalculateRoute(veh, xdata) && !xdata.fixedDestination) PickDestination(xdata, veh); // somewhere it can get to, next time
@@ -4349,6 +4364,9 @@ public:
             playerPed = FindPlayerPed();
             frameCounter++;
             wdBeat++;
+            LARGE_INTEGER frameT0, frameT1, freq;
+            QueryPerformanceCounter(&frameT0);
+            routeExpansionsFrame = 0;
             WdStage("BreakDeadlocks");
             BreakDeadlocks();
             WdStage("RemoveBrokenDown");
@@ -4430,6 +4448,17 @@ public:
             WdStage("AutoTest::Update");
             AutoTest::Update();
             WdStage("game");
+            // The mod's own time this frame: over 50 ms is a stutter (logged with what it did), the A* searches above all
+            QueryPerformanceCounter(&frameT1);
+            QueryPerformanceFrequency(&freq);
+            const float modMs = static_cast<float>(frameT1.QuadPart - frameT0.QuadPart) * 1000.0f / static_cast<float>(freq.QuadPart);
+            modFrameMsMax = std::max(modFrameMsMax, modMs);
+            if (modMs > 50.0f) {
+                modSlowFrames++;
+                if (modSlowFrames <= 30)
+                    lg << "Slow mod frame: " << modMs << " ms, routes " << routesThisFrame << ", A* steps " << routeExpansionsFrame
+                       << ", vehicles processed " << debugVehiclesProcessed << "\n";
+            }
         };
 
         Events::drawingEvent += DrawDebug;

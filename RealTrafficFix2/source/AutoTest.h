@@ -1433,6 +1433,8 @@ void Update() {
         out << Format("lane change board: %d granted, %d requests denied (%d waits: someone else had that space); overtakes that "
             "waited their turn: %d\n", boardGranted, boardDenied, boardDeniedAttempts, overtakeWaitCount);
         out << Format("routes calculated: %d (failed %d), vehicles that left their route: %d\n", routeSearchCount, routeFailCount, offRouteCount);
+        out << Format("route searches that did not reach the destination: %d; A* steps %lld (%.0f per search); mod time per frame: longest %.0f ms, %d frames over 50 ms\n",
+            routeIncompleteCount, routeExpansionsTotal, routeSearchCount ? (double)routeExpansionsTotal / routeSearchCount : 0.0, modFrameMsMax, modSlowFrames);
         out << Format("  left the route: no plan %d, the game took another exit %d, not a junction %d; junction exits forced %d, "
             "junctions without a plan %d\n", offRouteNoPlan, offRouteRejected, offRouteNotJunction, seqPlanApplied, seqNoPlan);
         for (int r = 0; r < 2; r++) {
