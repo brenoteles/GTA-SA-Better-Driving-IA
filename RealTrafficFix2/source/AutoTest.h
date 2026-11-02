@@ -1377,6 +1377,8 @@ void Update() {
         out << Format("turn model (measured in the game): steering and turn the same way %d, opposite %d; curves capped by what the steering can do %d; test car off the road %d\n",
             steerSignMatch, steerSignMismatch, steerLimitedCurves, offRoadCount);
         out << Format("steering rate limited at speed (frames, openpilot): %d\n", steerRateLimitedFrames);
+        out << Format("acceleration held to the jerk limit (frames, openpilot D): %d; queue starts held until the one ahead really went (frames, E): %d\n",
+            jerkLimitedFrames, queueHolds);
         for (const TripCar& c : tripCars) {
             if (!c.veh) continue;
             auto it = learnedSteer.find(c.veh->m_nModelIndex);

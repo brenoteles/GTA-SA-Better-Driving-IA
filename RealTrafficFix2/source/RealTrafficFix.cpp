@@ -227,6 +227,9 @@ public:
     float accelLimit = 0.0f;      // m/s2, 0 = no limit
     float closeUpTarget = -1.0f;  // m/s, creeping up to a stopped vehicle in a queue (< 0: not)
     float measAccel = 0.0f;       // m/s2 along the forward, smoothed
+    float jerkAccel = 0.0f;       // acceleration allowed now, growing at the jerk limit (openpilot D)
+    bool queueStopped = false;    // stopped in a queue: waits for the one ahead to really go (openpilot E)
+    unsigned int leaderMovingSince = 0;
     // The leader's acceleration (openpilot radard): its speed along ours, differentiated and smoothed
     CVehicle* accLeader = nullptr;
     float accLeaderSpeed = 0.0f, leaderAccel = 0.0f;
@@ -463,6 +466,12 @@ static bool cfgStabilityControl = true;
 static bool cfgCounterSteer = true;
 // Driving model
 static bool cfgPedalControl = true;
+// openpilot D: the acceleration builds up at a limited rate (jerk), so from braking to full gas isn't instant (the
+// accordion effect when the one ahead moves away). E: stopped in a queue it goes only when the one ahead has been moving
+// for 0.25 s and the gap opened 1 m (it lurched forward when the one ahead moved half a metre and stopped)
+static bool cfgJerkLimit = true;
+static bool cfgStopAndGo = true;
+static int jerkLimitedFrames = 0, queueHolds = 0;
 static bool cfgFrictionCircle = true;
 static bool cfgSlopeAware = true;
 static float cfgCrestFactor = 0.85f;
@@ -3466,15 +3475,27 @@ static void ApplyPedalControl(CVehicle* veh, ExtendedData& xdata, float speed, f
 // away from a light too, where the game's own full throttle is kept). The cap follows the measured acceleration
 static void ApplyAccelLimit(CVehicle* veh, ExtendedData& xdata, float speed, float* gas, float* brake) {
     float forwardSpeed = CVector::Dot(veh->m_vecMoveSpeed, veh->GetForward()) * GAME_SPEED_TO_MPS;
-    if (!cfgPedalControl || xdata.accelLimit <= 0.0f || *gas <= 0.0f || *brake > 0.05f || forwardSpeed < -0.5f) {
+    const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
+    // The acceleration allowed grows at the jerk limit (3 m/s3 standing, 2 at 25 m/s, more for aggressive drivers); off the
+    // gas or braking it starts again from what the car is really doing
+    float limit = xdata.accelLimit;
+    if (cfgJerkLimit && cfgPedalControl) {
+        if (*gas <= 0.0f || *brake > 0.05f) xdata.jerkAccel = std::max(xdata.measAccel, 0.0f);
+        else {
+            const float jerk = Lerp(3.0f, 2.0f, std::clamp(speed / 25.0f, 0.0f, 1.0f)) * (1.0f + 0.5f * xdata.aggression);
+            xdata.jerkAccel = std::min(xdata.jerkAccel + jerk * dt, 8.0f);
+        }
+        const float ceiling = xdata.accelLimit > 0.0f ? xdata.accelLimit : FULL_THROTTLE_ACCEL;
+        if (xdata.jerkAccel < ceiling) { limit = xdata.jerkAccel; jerkLimitedFrames++; }
+    }
+    if (!cfgPedalControl || limit <= 0.0f || *gas <= 0.0f || *brake > 0.05f || forwardSpeed < -0.5f) {
         xdata.accelLimiting = false;
         return;
     }
-    const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
     const float cruiseGas = CruiseGas(veh, speed);
-    if (!xdata.accelLimiting) xdata.gasTrim = 0.1f + 0.06f * xdata.accelLimit; // first guess, corrected below
+    if (!xdata.accelLimiting) xdata.gasTrim = 0.1f + 0.06f * limit; // first guess, corrected below
     xdata.accelLimiting = true;
-    float error = xdata.accelLimit - xdata.measAccel;
+    float error = limit - xdata.measAccel;
     xdata.gasTrim = std::clamp(xdata.gasTrim + error * 0.3f * dt, -cruiseGas, 1.0f);
     float cap = std::clamp(cruiseGas + xdata.gasTrim + error * 0.05f, 0.05f, 1.0f);
     if (*gas > cap) {
@@ -4150,6 +4171,8 @@ public:
         ReadIniFloat(ini, "LearnedDecelUse", cfgLearnedDecelUse);
         ReadIniBool(ini, "ABS", cfgABS);
         ReadIniBool(ini, "TractionControl", cfgTractionControl);
+        ReadIniBool(ini, "JerkLimit", cfgJerkLimit);
+        ReadIniBool(ini, "StopAndGo", cfgStopAndGo);
         ReadIniBool(ini, "SteerModel", cfgSteerModel);
         ReadIniBool(ini, "SteerRateLimit", cfgSteerRateLimit);
         ReadIniBool(ini, "RoadEdges", cfgRoadEdges);
@@ -4636,6 +4659,25 @@ public:
             // At most 2.5 m/s: at 4 m/s a car creeping up behind one that started and stopped again bumped into it
             xdata.closeUpTarget = room > 0.0f ? std::min(std::sqrt(2.0f * 1.2f * room), 2.5f) : 0.0f;
         }
+        // Stop and go (openpilot E): stopped close behind a vehicle, it stays stopped until the one ahead has been moving
+        // for 0.25 s and the gap opened 1 m past the minimum. The game set off as soon as the one ahead twitched
+        if (cfgStopAndGo) {
+            const unsigned int nowMs = CTimer::m_snTimeInMilliseconds;
+            const bool behindVehicle = xdata.obstacle == OBSTACLE_VEHICLE && xdata.gap < 12.0f;
+            if (behindVehicle && xdata.leaderSpeed > 1.0f) { if (!xdata.leaderMovingSince) xdata.leaderMovingSince = nowMs; }
+            else xdata.leaderMovingSince = 0;
+            if (speedNow < 0.3f && behindVehicle && xdata.gap < minGap + 2.0f) xdata.queueStopped = true;
+            if (xdata.queueStopped) {
+                const bool release = !behindVehicle ||
+                    (xdata.leaderMovingSince && nowMs - xdata.leaderMovingSince > 250 && xdata.gap > minGap + 1.0f);
+                if (release) xdata.queueStopped = false;
+                else if (xdata.leaderSpeed >= 1.0f) {
+                    xdata.closeUpTarget = 0.0f; // the one ahead is only just moving: hold
+                    queueHolds++;
+                }
+            }
+        }
+        else xdata.queueStopped = false;
 
         float traction = std::clamp(vehicle->m_pHandlingData->m_fTractionMultiplier, 0.5f, 1.5f);
         float grip = prof.cornerGrip * traction;
