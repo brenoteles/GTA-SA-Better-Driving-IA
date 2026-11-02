@@ -3473,13 +3473,16 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     // Turning: someone on the outside of the turn (beside us, or coming the other way on that side): turn tighter and ease
     // off. Cars swung wide in turns into the next lane and the oncoming one (long vehicles only ease off: tighter put their
     // rear wheels on the pavement)
-    if (cfgTurnSideGuard && speed > 3.0f && std::abs(xdata.filtYawRate) > 0.15f && veh->m_nVehicleSubClass != VEHICLE_BIKE) {
+    // Only real turns (radius under ~45 m: junctions, hairpins) or slow: from a yaw rate of 0.15 rad/s it fired in gentle
+    // freeway bends (186 m at 100 km/h) with a car in the next lane, braking at 35%, and the overtake never happened
+    const bool realTurn = std::abs(xdata.filtYawRate) > 0.15f && (std::abs(xdata.filtYawRate) / std::max(speed, 1.0f) > 1.0f / 45.0f || speed < 10.0f);
+    if (cfgTurnSideGuard && speed > 3.0f && realTurn && veh->m_nVehicleSubClass != VEHICLE_BIKE) {
         const int outside = xdata.filtYawRate > 0.0f ? 1 : -1; // turning left: the right side is the outside
         CVector mn, mx;
         GetEntityDimensions(veh, mn, mx);
         const CVector2D pos = veh->GetPosition().To2D(), fwd = veh->GetForward().To2D(), right = veh->GetRight().To2D();
         const float halfWidth = std::max(mx.x, -mn.x);
-        bool threat = false;
+        bool threat = false, intruding = false;
         for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize && !threat; i++) {
             CVehicle* o = CPools::ms_pVehiclePool->GetAt(i);
             if (!o || o == veh || std::abs(o->GetPosition().z - veh->GetPosition().z) > 3.0f) continue;
@@ -3496,12 +3499,14 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
             bool oncoming = lat > 0.0f && lat < halfWidth + oHalf + 4.0f && lon > 0.0f && lon < 25.0f && closing > 3.0f &&
                 CVector2D::Dot(o->GetForward().To2D(), fwd) < -0.3f;
             threat = beside || oncoming;
+            // Within ~0.6 m of our side: really in the way (a car merely in the next lane only makes us ease off)
+            intruding = threat && (oncoming || lat < halfWidth + oHalf + 0.6f);
         }
         if (threat) {
             float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh);
             if (!longVehicle) *steer = std::clamp(*steer - outside * 0.12f, -maxSteer, maxSteer); // towards the inside
-            *gas = std::min(*gas, 0.15f);
-            if (speed > 6.0f) *brake = std::max(*brake, 0.35f);
+            *gas = std::min(*gas, intruding ? 0.15f : 0.5f);
+            if (intruding && speed > 6.0f) *brake = std::max(*brake, 0.35f);
             if (CTimer::m_snTimeInMilliseconds - xdata.turnGuardTime > 2000) turnGuardCount++;
             xdata.turnGuardTime = CTimer::m_snTimeInMilliseconds;
         }
