@@ -1131,6 +1131,9 @@ void Update() {
                 // A mission vehicle, so the game never removes it (it deleted the one the player wasn't in, off screen, and
                 // its pool slot went to another car); the mod drives it anyway
                 c.veh->m_nCreatedBy = MISSION_VEHICLE;
+                // The game loads the map's collision around this car too, like around the player (left behind, the AI's car
+                // fell through the road: the per-frame request wasn't enough)
+                if (raceMode) Command<COMMAND_SET_LOAD_COLLISION_FOR_CAR_FLAG>(c.handle, 1);
                 if (raceMode && &c == &tripCars[1]) { // the player's: not driven by the mod
                     c.wp = 0;
                     c.lastPos = c.veh->GetPosition();
