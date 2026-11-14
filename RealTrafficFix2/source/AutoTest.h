@@ -270,6 +270,11 @@ static unsigned int raceLastRow[2] = {};
 // falls (8 m under it), lies on its roof or side, sinks, or hasn't moved for 8 s; and the place / gap on screen
 struct RaceSpot { CVector pos; float heading = 0.0f; unsigned int at = 0; };
 static RaceSpot raceGood[2];
+// The last 8 good spots (one a second): a respawn soon after another goes further back each time (a spot on a bridge
+// was retaken 44 times: the car kept dropping into the canal under it)
+static RaceSpot raceTrail[2][8];
+static int raceTrailHead[2] = {}, raceDepth[2] = {};
+static unsigned int raceLastRespawn[2] = {};
 static unsigned int raceBadSince[2] = {}, raceLastHud = 0;
 static int raceRespawns[2] = {};
 // Where the time goes: seconds moving with each speed limiter in charge, freeway / everything else (mod-driven, near the camera)
@@ -1238,15 +1243,24 @@ void Update() {
                                 const CVector2D f = c.veh->GetForward().To2D();
                                 raceGood[ci].heading = std::atan2(-f.x, f.y);
                                 raceGood[ci].at = now;
+                                raceTrail[ci][raceTrailHead[ci]] = raceGood[ci];
+                                raceTrailHead[ci] = (raceTrailHead[ci] + 1) % 8;
                             }
                             const bool bad = !upright || c.veh->bSubmergedInWater || (raceGood[ci].at && p.z < raceGood[ci].pos.z - 8.0f) ||
                                 c.still > 8.0f;
                             if (!bad) raceBadSince[ci] = 0;
                             else if (!raceBadSince[ci]) raceBadSince[ci] = now;
                             else if (raceGood[ci].at && now - raceBadSince[ci] > (c.still > 8.0f ? 0u : 2500u)) {
-                                const RaceSpot& g = raceGood[ci];
-                                c.veh->Teleport(CVector(g.pos.x, g.pos.y, g.pos.z + 0.5f), false);
+                                // Further back each time it's needed again within 15 s
+                                raceDepth[ci] = raceLastRespawn[ci] && now - raceLastRespawn[ci] < 15000 ? std::min(raceDepth[ci] + 1, 7) : 0;
+                                raceLastRespawn[ci] = now;
+                                const RaceSpot& t = raceTrail[ci][(raceTrailHead[ci] + 7 - raceDepth[ci]) % 8];
+                                const RaceSpot& g = t.at ? t : raceGood[ci];
+                                // Exactly there (Teleport looks for the ground under it: under a bridge, the canal)
+                                CWorld::Remove(c.veh);
                                 c.veh->SetHeading(g.heading);
+                                c.veh->SetPosn(CVector(g.pos.x, g.pos.y, g.pos.z + 0.3f));
+                                CWorld::Add(c.veh);
                                 c.veh->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
                                 c.veh->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
                                 c.still = 0.0f;

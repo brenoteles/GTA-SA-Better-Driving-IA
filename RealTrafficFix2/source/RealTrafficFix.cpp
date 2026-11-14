@@ -1334,7 +1334,8 @@ static void LoadLearnedLimits() {
     int model, samples;
     float grip, decel;
     while (file >> model >> grip >> decel >> samples) {
-        learnedLimits[model] = { std::clamp(grip, 0.4f, 1.6f), std::clamp(decel, 3.0f, 12.0f), samples };
+        // (up to 3 g: a player in the Infernus held 2.2-3 g through curves, race 173316; 1.6 was the old ceiling)
+        learnedLimits[model] = { std::clamp(grip, 0.4f, 3.0f), std::clamp(decel, 3.0f, 12.0f), samples };
     }
     lg << "Learned limits loaded for " << learnedLimits.size() << " models\n";
 }
@@ -1472,7 +1473,7 @@ static void UpdateLearnedLimits(CVehicle* veh, ExtendedData& xdata, float speed,
     }
 
     if (learned) {
-        limits.grip = std::clamp(limits.grip, 0.4f, 1.6f);
+        limits.grip = std::clamp(limits.grip, 0.4f, 3.0f);
         limits.decel = std::clamp(limits.decel, 3.0f, 12.0f);
         limits.samples++;
         learnedDirty = true;

@@ -129,6 +129,22 @@ candidates held 0.4 s, lighter wheel-change cost) are not measured yet.
 Infernus test (in progress at handoff): model 411, driver `maximo` (max performance: ignores road speed, 95% of the
 measured grip, racing line, runs red lights at speed), no traffic.
 
+## Race against the AI (learning from the player)
+
+`pythonw tools/AutoTestUI.pyw --car 411 --drivers maximo --notraffic --race --start` puts the player in a second
+Infernus beside the AI's (after MTA's race gamemode: grid, frozen 3-2-1 countdown with sounds, place/gap on screen,
+back on the road at the last good spot after a fall/roll/sink/8 s stuck, further back each time it repeats). Both cars
+are recorded every 0.1 s to `race.csv` in the test folder. The user chose this over installing MTA (MTA doesn't load
+ASI/modloader: the AI would have to be rewritten in Lua).
+
+`python tools/race_learn.py <race.csv> <model> <game scripts folder> --write` prints both drivers' curve speeds by
+radius and raises the model's learned grip to the player's median sideways g x 0.85 (game closed first: the mod
+rewrites `RealTrafficFix.limits.txt` every minute). The learned grip ceiling is now 3 g (was 1.6).
+
+First race (173316): the player arrived in 2.79 min (average 229 km/h, peaks 385, 2.2-3 g in curves); the AI took a
+ramp off a straight bridge at 203 km/h, fell into the canal and the old respawn (Teleport, which looks for the ground
+below) dropped it there 44 times. Infernus grip 1.18 -> 1.81 g from that race.
+
 ## Other recent changes (still to confirm in game)
 
 - Yellow lights: decided at 3.5 to 2.5 m/s2 by aggression (it was inverted: calm drivers went through from 60 m).
