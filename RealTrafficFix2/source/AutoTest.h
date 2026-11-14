@@ -237,6 +237,18 @@ static void RecordTurn(TripCar& c, unsigned int now) {
     }
     c.turn[c.turnHead] = t;
     c.turnHead = (c.turnHead + 1) % TURN_TRACE;
+    // The AI's own record, every 0.1 s (drive.csv): what it wanted, what held it back, what it did
+    if (&c == &tripCars[0]) {
+        static std::ofstream drive;
+        if (!drive.is_open()) {
+            drive.open(shotDir + "drive.csv", std::fstream::out | std::fstream::trunc);
+            drive << "t_min,x,y,speed_kmh,target_kmh,curve_kmh,limiter,steer,gas,brake,yaw,lat_g,off_path,dz\n";
+        }
+        const CVector p = v->GetPosition();
+        drive << Format("%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%.3f,%.2f,%.2f,%.3f,%.2f,%.1f,%.1f\n", Minutes(), p.x, p.y, t.speed * 3.6f,
+            t.target * 3.6f, t.curveSpeed * 3.6f, limiterNames[t.limiter], t.steer, v->m_fGasPedal, v->m_fBreakPedal, t.yaw, t.latG,
+            t.offPath, t.dz);
+    }
     c.turnCount = std::min(c.turnCount + 1, TURN_TRACE);
     // Off the road: 12 m off the route or 3 m below it for a second
     const bool off = t.offPath > 12.0f || t.dz < -3.0f;
