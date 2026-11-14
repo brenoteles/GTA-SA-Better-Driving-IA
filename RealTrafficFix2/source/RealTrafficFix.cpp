@@ -3431,20 +3431,28 @@ struct LaneLine {
 // Catmull-Rom spline through the lane point at every link, sampled every ~3 m (straight lines between the link points
 // cut inside the curves and turned at each point: the direction, and the D term, jumped there)
 static void BuildLaneLine(const ExtendedData& xdata, float laneF, LaneLine& line) {
-    CVector2D ctrl[MAX_LOOKAHEAD_NODES];
-    int m = 0;
+    CVector2D ctrl[MAX_LOOKAHEAD_NODES + 1];
+    int m = 1; // [0]: filled below
     for (int i = 0; i + 1 < xdata.pathCount && i < MAX_LOOKAHEAD_NODES; i++) {
         if (!xdata.pathLinkOk[i]) {
-            if (m) break;
+            if (m > 1) break;
             continue;
         }
         const CVector2D& d = xdata.pathLinkDir[i];
         const float lane = std::clamp(laneF, -0.5f, xdata.pathLanes[i] - 0.5f);
         const CVector2D pt = xdata.pathLinkPos[i] + CVector2D(d.y, -d.x) * ((xdata.pathLaneOffset[i] + lane) * LANE_WIDTH);
-        if (m && (pt - ctrl[m - 1]).Magnitude() < 0.5f) continue;
+        if (m > 1 && (pt - ctrl[m - 1]).Magnitude() < 0.5f) continue;
         ctrl[m++] = pt;
     }
+    // The link behind the car is rarely known (the previous node's link): the first known point is then often ahead of
+    // the car, and the line started in front of it (the controller was off 98% of the time, test 164321). It's extended
+    // 30 m back, straight
     line.n = 0;
+    if (m < 3) return;
+    {
+        const CVector2D d = ctrl[2] - ctrl[1];
+        ctrl[0] = ctrl[1] - d * (30.0f / std::max(d.Magnitude(), 0.001f));
+    }
     auto add = [&](const CVector2D& pt) {
         if (line.n >= MAX_LANE_LINE) return;
         line.cum[line.n] = line.n ? line.cum[line.n - 1] + (pt - line.pts[line.n - 1]).Magnitude() : 0.0f;

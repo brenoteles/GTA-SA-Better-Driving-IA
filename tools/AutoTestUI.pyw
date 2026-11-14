@@ -200,6 +200,7 @@ class App:
         self.stoposc = tk.BooleanVar(value=False)
         self.twocars = tk.BooleanVar(value=False)
         self.driver = tk.StringVar(value='rapido')
+        self.close_when_done = False
         self.pending_drivers = []  # tests still to run one after the other (--drivers normal,fast)
         self.build = tk.BooleanVar(value=True)
         self.useini = tk.BooleanVar(value=True)
@@ -284,6 +285,10 @@ class App:
                     if self.pending_drivers and not self.stop_requested:
                         self.driver.set(self.pending_drivers.pop(0))
                         self.root.after(3000, self.start)
+                    elif self.close_when_done:
+                        # Started from the command line: closes itself (open windows piled up, and a second launcher's
+                        # end put MixSets' pause back while another test ran)
+                        self.root.after(1000, self.root.destroy)
         except queue.Empty:
             pass
         self.root.after(200, self.pump)
@@ -506,18 +511,15 @@ class App:
         self.q.put(('status', 'ERRO: nao consegui salvar a planilha'))
 
     def set_nopause(self, on):
-        """MixSets NoPauseWhenUnfocus = 1 during the test (the game keeps running without focus), back afterwards"""
+        """MixSets NoPauseWhenUnfocus = 1: the game keeps running without focus (minimised), also after the test"""
         if not os.path.exists(MIXSETS_INI):
             return
         with open(MIXSETS_INI, encoding='latin-1') as f:
             content = f.read()
-        if on:
-            self.mixsets_backup = re.search(r'(?m)^NoPauseWhenUnfocus\s*=\s*(\d)', content)
-            content = re.sub(r'(?m)^(NoPauseWhenUnfocus\s*=\s*)\d', r'\g<1>1', content)
-        elif self.mixsets_backup:
-            content = re.sub(r'(?m)^(NoPauseWhenUnfocus\s*=\s*)\d', r'\g<1>' + self.mixsets_backup.group(1), content)
-        else:
+        # Left on afterwards (the user wants the game running when minimised)
+        if not on:
             return
+        content = re.sub(r'(?m)^(NoPauseWhenUnfocus\s*=\s*)\d', r'\g<1>1', content)
         with open(MIXSETS_INI, 'w', encoding='latin-1') as f:
             f.write(content)
 
@@ -543,6 +545,7 @@ if __name__ == '__main__':
                 app.scenario.set(name)
     if '--notraffic' in sys.argv:  # only the test car
         app.notraffic.set(True)
-    if '--start' in sys.argv:  # start a test right away (default options)
+    if '--start' in sys.argv:  # start a test right away (default options), close when done
+        app.close_when_done = True
         root.after(500, app.start)
     root.mainloop()
