@@ -3456,7 +3456,7 @@ static float GetSmoothLaneSteer(CVehicle* veh, const ExtendedData& xdata, float 
 static int laneKeepFrames = 0, laneKeepOff[4] = {}; // off: no road data, sharp turn ahead, out of the lane, data too short
 static double laneKeepErrSum = 0.0;
 static float laneKeepErrMax = 0.0f;
-static int weaveEvents = 0, weaveEventsWatched = 0, laneHoldCount = 0, understeerAidFrames = 0;
+static int weaveEvents = 0, weaveEventsWatched = 0, laneHoldCount = 0, understeerAidFrames = 0, forcedObstacleFrames = 0;
 static CVehicle* weaveWatch = nullptr; // the test car (AutoTest)
 
 static constexpr int MAX_LANE_LINE = 256;
@@ -3510,8 +3510,26 @@ static void UpdateGhost(CVehicle* veh, ExtendedData& xdata, float decel) {
     const float dl = dir.Magnitude();
     const CVector2D vel = veh->m_vecMoveSpeed.To2D();
     const bool along = dl > 0.1f && vel.Magnitude() > 0.02f && CVector2D::Dot(dir * (1.0f / dl), vel * (1.0f / vel.Magnitude())) > 0.7f;
-    xdata.onGhost = along && bestD < (xdata.onGhost ? 9.0f : 6.0f);
+    xdata.onGhost = along && bestD < (xdata.onGhost ? 20.0f : 12.0f); // on it within 12 m, kept to 20 m (to come back to it)
     if (!xdata.onGhost) return;
+    // Only where the player's line goes the way the route goes: 40 and 80 m ahead within 8 m of it (at a fork the player
+    // took another ramp; on the line the car followed it 160 m off its route and hit a wall)
+    auto nearRoute = [&](const CVector& at) {
+        for (int i = 0; i + 1 < xdata.pathCount; i++) {
+            const CVector2D a = xdata.path[i].To2D(), d = xdata.path[i + 1].To2D() - a;
+            const float l2 = d.MagnitudeSqr();
+            const float u = l2 > 0.01f ? std::clamp(CVector2D::Dot(at.To2D() - a, d) / l2, 0.0f, 1.0f) : 0.0f;
+            if ((a + d * u - at.To2D()).Magnitude() < 8.0f) return true;
+        }
+        return false;
+    };
+    for (int j = best; j < n; j++) {
+        const float ahead = g[j].cum - g[best].cum;
+        if ((ahead >= 40.0f && ahead < 43.0f) || (ahead >= 80.0f && ahead < 83.0f)) {
+            if (!nearRoute(g[j].pos)) { xdata.onGhost = false; return; }
+        }
+        if (ahead > 83.0f) break;
+    }
     // Its speed here and the braking for the slower points over the next 300 m
     float allowed = g[best].speed * 0.95f;
     const float b = std::max(decel * 0.85f, 4.0f);
@@ -3652,7 +3670,8 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     if (offsetOut) *offsetOut = y;
     // Off where it should be now (in a lane change: on the S, not the new lane: it handed every change back to the game)
     const float yOff = y - (refOffset ? refOffset(0.0f) : 0.0f);
-    if (std::abs(yOff) > 0.75f * LANE_WIDTH) { why = 2; return NAN; }
+    // (on the player's line it keeps steering back to it from up to 16 m: it lost the line and never came back)
+    if (std::abs(yOff) > (given && xdata.onGhost ? 16.0f : 0.75f * LANE_WIDTH)) { why = 2; return NAN; }
     laneKeepErrSum += std::abs(yOff);
     laneKeepErrMax = std::max(laneKeepErrMax, std::abs(yOff));
     why = -1;
@@ -3687,7 +3706,9 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
         }
     }
     const float grip = GetModelLimits(veh).grip * std::min(xdata.groundGrip, 1.0f) * GRAVITY; // m/s2 sideways at most
-    const float maxSteer = plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh);      // CCarCtrl::FindMaxSteerAngle
+    // CCarCtrl::FindMaxSteerAngle; racing drivers up to 0.45 rad at speed (the game holds its AI to 0.2 from 126 km/h; a
+    // player steered up to 0.5 at 130-170 km/h)
+    const float maxSteer = std::max(plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh), xdata.bRacer ? 0.45f : 0.0f);
     auto steadyYaw = [&](float d, float speedAt) {
         const float r = xdata.lkGain * speedAt * std::tan(d) / (L + K * speedAt * speedAt);
         const float cap = grip / std::max(speedAt, 1.0f);
@@ -3752,14 +3773,17 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
             const float ref = refAt(t);                                                // right-positive
             const float err = e + ref;
             const float latErr = v * std::sin(psi) + (ref - refAt(t - SIM_DT)) / SIM_DT; // speed across vs the S's
-            const float w = i == STEPS - 1 ? 4.0f : 1.0f;
+            // (racing drivers: the line 4x heavier, the wheel 4x freer: they steered ten times less than a player and lost
+            // his line)
+            const float w = (i == STEPS - 1 ? 4.0f : 1.0f) * (xdata.bRacer ? 4.0f : 1.0f);
             cost += w * (err * err + 0.09f * latErr * latErr);
         }
         const float change = d - prevSteer;
-        cost += 60.0f * change * change * (1.0f + v / 30.0f) * frameScale;
+        cost += (xdata.bRacer ? 15.0f : 60.0f) * change * change * (1.0f + v / 30.0f) * frameScale;
         if (cost < bestCost) { bestCost = cost; best = d; }
     };
-    for (int k = -8; k <= 8; k++) evaluate(dFF + k * 0.02f);
+    const float span = xdata.bRacer ? 0.04f : 0.02f; // racing drivers look at harder corrections too
+    for (int k = -8; k <= 8; k++) evaluate(dFF + k * span);
     for (int k = -6; k <= 6; k++) evaluate(prevSteer + k * 0.01f);
     // A finer look around the best
     const float coarse = best;
@@ -5942,11 +5966,25 @@ public:
         // A real drop/wall only: ground not found (not streamed in) is not an obstacle,
         // and up to a 35% grade over the line length is just a slope
         bool forceObstacle = false;
-        auto snapToGround = [&](CVector& coord, float dist, float height) {
+        // A drop/wall is only one on the way the car is going: the side rays reach past the edge of bridges and elevated
+        // roads (the ground far below, the water) and a point on the planned route is road. Both made "walls" that braked
+        // racers on bridges with nothing ahead
+        auto onRoute = [&](const CVector& coord) {
+            for (int i = 1; i + 1 < std::min(xdata.pathCount, 10); i++) {
+                const CVector2D a = xdata.path[i].To2D(), d = xdata.path[i + 1].To2D() - a;
+                const float l2 = d.MagnitudeSqr();
+                const float u = l2 > 0.01f ? std::clamp(CVector2D::Dot(coord.To2D() - a, d) / l2, 0.0f, 1.0f) : 0.0f;
+                if ((a + d * u - coord.To2D()).Magnitude() < 5.0f) return true;
+            }
+            return false;
+        };
+        auto snapToGround = [&](CVector& coord, float dist, float height, bool side = false) {
             bool found = false;
             float newZ = FindGroundZ({ coord.x, coord.y, coord.z + cfgCheckGroundHeight + 2.0f }, &found);
             if (!found) return;
-            if (std::abs(newZ - coord.z) > std::max(heightDiffLimit, dist * 0.35f)) forceObstacle = true;
+            if (std::abs(newZ - coord.z) > std::max(heightDiffLimit, dist * 0.35f)) {
+                if (!side && !onRoute(coord)) forceObstacle = true;
+            }
             else coord.z = newZ + height;
         };
 
@@ -5978,14 +6016,14 @@ public:
             float steerBackOffset = std::max(modelMax.y * vehicle->m_fSteerAngle, 0.0f);
             a[numRays] = GetWorldCoordWithOffset(vehicle, { modelMin.x, modelMax.y - steerBackOffset, frontHeight + frontHeightBonus });
             b[numRays] = GetWorldCoordWithOffset(vehicle, { modelMin.x - sideSpread + sideSteerOffset, modelMax.y + sideDist, frontHeight / 1.5f });
-            snapToGround(b[numRays], sideDist, cfgFinalGroundHeight);
+            snapToGround(b[numRays], sideDist, cfgFinalGroundHeight, true);
             numRays++;
 
             // R
             steerBackOffset = std::min(modelMax.y * vehicle->m_fSteerAngle, 0.0f);
             a[numRays] = GetWorldCoordWithOffset(vehicle, { modelMax.x, modelMax.y + steerBackOffset, frontHeight + frontHeightBonus });
             b[numRays] = GetWorldCoordWithOffset(vehicle, { modelMax.x + sideSpread + sideSteerOffset, modelMax.y + sideDist, frontHeight / 1.5f });
-            snapToGround(b[numRays], sideDist, cfgFinalGroundHeight);
+            snapToGround(b[numRays], sideDist, cfgFinalGroundHeight, true);
             numRays++;
         }
         xdata.numRays = numRays;
@@ -5998,6 +6036,7 @@ public:
         xdata.leaderVeh = nullptr;
 
         if (forceObstacle) {
+            forcedObstacleFrames++;
             xdata.obstacle = OBSTACLE_FORCED;
             xdata.gap = shortDist;
             for (int i = 0; i < numRays; i++) xdata.rayColor[i] = { 255, 0, 0, 255 };
