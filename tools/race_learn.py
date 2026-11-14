@@ -3,7 +3,10 @@ Learns from a race against the AI (AutoTest Race = 1, race.csv): the sideways gr
 to the mod's learned limits for that car model (RealTrafficFix.limits.txt), so the AI plans its curves with what a human
 did with the same car. Also prints the player's and the AI's curve speeds by radius.
 
-usage: python race_learn.py <race.csv> <car model id> <game scripts folder> [--write]
+usage: python race_learn.py <race.csv> <car model id> <game scripts folder> [--write] [--ghost]
+
+--ghost: also the player's line (x y z speed every ~3 m) to RealTrafficFix.ghost.<model>.txt, which racing drivers in
+that model follow (line and speeds) when they're on it. Only from a race the player finished
 
 The grip taken: the 75th percentile of the player's sideways g in curves of radius 30-250 m (over 40 km/h, no
 handbrake), x 0.85 (a margin: the AI has no feel for the tyres). Never lowered: only raised over what the mod already learned.
@@ -34,7 +37,7 @@ def curves(rows, car):
     return pts
 
 
-def main(csv_path, model, scripts, write=False):
+def main(csv_path, model, scripts, write=False, ghost=False):
     rows = load(csv_path)
     cars = sorted({r['car'] for r in rows})
     for car in cars:
@@ -69,6 +72,23 @@ def main(csv_path, model, scripts, write=False):
     if not found:
         print(f'model {model}: not in the learned limits yet -> {min(shown, 3.0):.2f} g')
         out.append(f'{model} {min(shown, 3.0):g} 9 1')
+    if ghost:
+        line = [r for r in rows if r['car'] == 'PLAYER']
+        if not line or float(line[-1]['left_m']) > 400.0:
+            print('no ghost: the player did not finish this race')
+        else:
+            pts, last = [], None
+            for r in line:
+                x, y, z, sp = float(r['x']), float(r['y']), float(r['z']), float(r['speed_kmh']) / 3.6
+                if sp < 1.0:
+                    continue
+                if last is None or ((x - last[0]) ** 2 + (y - last[1]) ** 2) ** 0.5 >= 3.0:
+                    pts.append((x, y, z, sp))
+                    last = (x, y)
+            gpath = os.path.join(scripts, f'RealTrafficFix.ghost.{model}.txt')
+            with open(gpath, 'w') as f:
+                f.write(''.join(f'{x:.1f} {y:.1f} {z:.1f} {sp:.2f}\n' for x, y, z, sp in pts))
+            print(f'ghost: {len(pts)} points, {line[-1]["t_s"]} s, to {gpath}')
     if write:
         with open(path, 'w') as f:
             f.write('\n'.join(out) + '\n')
@@ -76,5 +96,5 @@ def main(csv_path, model, scripts, write=False):
 
 
 if __name__ == '__main__':
-    args = [a for a in sys.argv[1:] if a != '--write']
-    main(args[0], int(args[1]), args[2], '--write' in sys.argv)
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    main(args[0], int(args[1]), args[2], '--write' in sys.argv, '--ghost' in sys.argv)

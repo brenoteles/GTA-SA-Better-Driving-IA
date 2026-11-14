@@ -234,6 +234,9 @@ public:
     float lkRoadCurv = 0.0f;        // the road's curvature over the next ~0.5 s (lane controller's line), 1/m
     unsigned int lkCurvFrame = 0;
     bool lkUndersteer = false;      // wheel at full lock and turning well under what the road asks
+    int ghostIdx = -1;              // the player's line (ghost): nearest point, on it, the speed it allows
+    bool onGhost = false;
+    float ghostSpeed = 1000.0f;
     float lkGain = 1.0f;            // lane controller: the yaw the car really makes over what its turn model says
     float lkPrevYaw = 0.0f, lkPrevSteer = 0.0f;
     unsigned int lkSteadySince = 0;
@@ -3465,6 +3468,73 @@ struct LaneLine {
 
 static void SplineInto(const CVector2D* ctrl, int m, LaneLine& line);
 
+// The player's line (ghost): a race against the AI recorded where the player drove and how fast (tools/race_learn.py
+// --ghost writes RealTrafficFix.ghost.<model>.txt: x y z speed, every ~3 m). A racing driver in that model, on that line
+// (6 m, same height, same direction), steers along it and takes its speeds (x 0.95, braking for the slower points ahead)
+// instead of its own curve estimates: it braked far more than the player in the same curves and lost ~20 s a race
+struct GhostPt { CVector pos; float speed; float cum; };
+static std::unordered_map<int, std::vector<GhostPt>> ghosts;
+static int ghostFrames = 0, ghostWatchedFrames = 0;
+static const std::vector<GhostPt>& GetGhost(int model) {
+    auto it = ghosts.find(model);
+    if (it != ghosts.end()) return it->second;
+    std::vector<GhostPt>& g = ghosts[model];
+    const std::string dir = learnedFile.substr(0, learnedFile.find_last_of("\\/") + 1);
+    std::ifstream f(dir + "RealTrafficFix.ghost." + std::to_string(model) + ".txt");
+    float x, y, z, sp;
+    while (f >> x >> y >> z >> sp) {
+        GhostPt pt{ CVector(x, y, z), sp, 0.0f };
+        if (!g.empty()) pt.cum = g.back().cum + (pt.pos - g.back().pos).Magnitude2D();
+        g.push_back(pt);
+    }
+    return g;
+}
+
+// Is the car on the ghost line, and what speed does it allow here (m/s)
+static void UpdateGhost(CVehicle* veh, ExtendedData& xdata, float decel) {
+    const std::vector<GhostPt>& g = GetGhost(veh->m_nModelIndex);
+    if (g.size() < 10) { xdata.onGhost = false; return; }
+    const CVector pos = veh->GetPosition();
+    const int n = static_cast<int>(g.size());
+    int best = -1;
+    float bestD = 1e9f;
+    const int from = xdata.ghostIdx >= 0 ? std::max(xdata.ghostIdx - 20, 0) : 0;
+    const int to = xdata.ghostIdx >= 0 ? std::min(xdata.ghostIdx + 80, n - 1) : n - 1;
+    for (int i = from; i <= to; i++) {
+        const float d = (g[i].pos - pos).Magnitude2D();
+        if (d < bestD && std::abs(g[i].pos.z - pos.z) < 4.0f) { bestD = d; best = i; }
+    }
+    if (best < 0 || best + 1 >= n) { xdata.onGhost = false; xdata.ghostIdx = -1; return; }
+    xdata.ghostIdx = bestD < 30.0f ? best : -1; // far from it: search the whole line next time
+    CVector2D dir = (g[best + 1].pos - g[best].pos).To2D();
+    const float dl = dir.Magnitude();
+    const CVector2D vel = veh->m_vecMoveSpeed.To2D();
+    const bool along = dl > 0.1f && vel.Magnitude() > 0.02f && CVector2D::Dot(dir * (1.0f / dl), vel * (1.0f / vel.Magnitude())) > 0.7f;
+    xdata.onGhost = along && bestD < (xdata.onGhost ? 9.0f : 6.0f);
+    if (!xdata.onGhost) return;
+    // Its speed here and the braking for the slower points over the next 300 m
+    float allowed = g[best].speed * 0.95f;
+    const float b = std::max(decel * 0.85f, 4.0f);
+    for (int j = best + 1; j < n && g[j].cum - g[best].cum < 300.0f; j++) {
+        const float vj = g[j].speed * 0.95f;
+        allowed = std::min(allowed, std::sqrt(vj * vj + 2.0f * b * (g[j].cum - g[best].cum)));
+    }
+    xdata.ghostSpeed = std::max(allowed, 5.0f);
+}
+
+static bool GhostLine(const ExtendedData& xdata, int model, LaneLine& line) {
+    const std::vector<GhostPt>& g = GetGhost(model);
+    line.n = 0;
+    if (xdata.ghostIdx < 0) return false;
+    for (int i = std::max(xdata.ghostIdx - 10, 0); i < static_cast<int>(g.size()) && line.n < MAX_LANE_LINE; i++) {
+        const CVector2D pt = g[i].pos.To2D();
+        line.cum[line.n] = line.n ? line.cum[line.n - 1] + (pt - line.pts[line.n - 1]).Magnitude() : 0.0f;
+        line.pts[line.n++] = pt;
+        if (line.cum[line.n - 1] > 400.0f) break;
+    }
+    return line.n >= 3;
+}
+
 // The centre line of lane laneF along the path ahead, from the first link with road data up to the next gap: a
 // Catmull-Rom spline through the lane point at every link, sampled every ~3 m (straight lines between the link points
 // cut inside the curves and turned at each point: the direction, and the D term, jumped there)
@@ -4050,6 +4120,10 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
                 xdata.changeArrived = true;
                 xdata.changeArriveMs = CTimer::m_snTimeInMilliseconds - xdata.changeStart;
             }
+        }
+        else if (keeping && xdata.onGhost) {
+            LaneLine gl;
+            if (GhostLine(xdata, veh->m_nModelIndex, gl)) laneCtrl = LaneControllerSteer(veh, xdata, speed, 0.0f, nullptr, why, nullptr, &gl);
         }
         else if (keeping) {
             // With the wheel in the controller's hands, the game's lane is the lane the car is in: something kept putting the
@@ -5482,6 +5556,14 @@ public:
         // On the racing line the corners are wider than in the lane center
         bool onRacingLine = racer && cfgRacingLine && xdata.lineCount >= 2 && xdata.lineBlend > 0.5f;
         float curveSpeed = onRacingLine ? xdata.lineCurveSpeed : xdata.curveSpeed;
+        // On the player's line: the player's speeds there instead of the curve estimates (see UpdateGhost)
+        if (racer) UpdateGhost(vehicle, xdata, decel);
+        else xdata.onGhost = false;
+        if (xdata.onGhost) {
+            curveSpeed = xdata.ghostSpeed;
+            ghostFrames++;
+            if (vehicle == weaveWatch) ghostWatchedFrames++;
+        }
         if (cfgCurveLookahead && curveSpeed < target) {
             target = curveSpeed;
             xdata.limiter = (!onRacingLine && xdata.curveIsJunction) ? LIMIT_JUNCTION : LIMIT_CURVE;
@@ -5495,7 +5577,7 @@ public:
             xdata.limiter = LIMIT_CREST;
         }
 
-        if (cfgHeadingLimiter && xdata.headingSpeed < target) {
+        if (cfgHeadingLimiter && xdata.headingSpeed < target && !xdata.onGhost) {
             target = xdata.headingSpeed;
             xdata.limiter = LIMIT_HEADING;
         }
