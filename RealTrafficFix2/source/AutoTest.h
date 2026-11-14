@@ -1214,8 +1214,13 @@ void Update() {
                         AudioEngine.ReportFrontendAudioEvent(45, 0.0f, 1.0f);
                     }
                 }
-                if (left > 0) return;
+                if (left > 0) {
+                    if (tripCars[0].veh) tripCars[0].veh->m_autoPilot.m_nTempAction = 0;
+                    return;
+                }
                 for (TripCar& c : tripCars) if (c.veh) Command<COMMAND_FREEZE_CAR_POSITION>(c.handle, 0);
+                // Held 4 s with the engine on, the game took the AI's car for stuck and started its reverse manoeuvre at GO
+                if (tripCars[0].veh) tripCars[0].veh->m_autoPilot.m_nTempAction = 0;
                 Command<COMMAND_SET_PLAYER_CONTROL>(0, 1);
                 raceGoAt = 0;
                 raceStart = now;

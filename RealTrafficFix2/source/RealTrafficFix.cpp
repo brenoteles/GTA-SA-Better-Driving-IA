@@ -2856,13 +2856,16 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             if (k == kTurn) {
                 const float cosT = CVector2D::Dot(p1 - p0, p2 - p1) / (a * b);
                 const float theta = std::acos(std::clamp(cosT, -1.0f, 1.0f));
-                if (theta > 0.35f) curvature = std::max(curvature, std::max(std::sin(theta * 0.5f) * 1.414f, 0.2f) / 10.0f);
+                // (racing drivers use the whole road: 16 m for 90 degrees; they slowed to 34 km/h where a player took 70-85)
+                const float base = xdata.bRacer ? 16.0f : 10.0f;
+                if (theta > 0.35f) curvature = std::max(curvature, std::max(std::sin(theta * 0.5f) * 1.414f, 0.2f) / base);
             }
             if (curvature < 0.002f) continue;            // radius > 500 m
             // Junction turns (the short window): less of the grip. Into them at the open-road share, cars swung wide across
             // the oncoming lanes
             // The fast-curve boost only for curves along the road (the long window), not junction/ramp turns
-            float cornerSpeed = k == kTurn ? std::sqrt(grip * cfgJunctionGripFactor * GRAVITY / curvature) : CurveSpeedFor(grip, curvature);
+            const float junctionShare = xdata.bRacer ? std::max(cfgJunctionGripFactor, 0.9f) : cfgJunctionGripFactor;
+            float cornerSpeed = k == kTurn ? std::sqrt(grip * junctionShare * GRAVITY / curvature) : CurveSpeedFor(grip, curvature);
             // Tight junction turns: a handbrake turn rotates the car, it goes in faster (and doesn't brake to a crawl)
             if (k == kTurn && xdata.handbrakeCapable && curvature > 1.0f / 30.0f) cornerSpeed *= cfgHandbrakeEntryBoost;
             applyLimit(cornerSpeed, sd[j], sn[j], false);
@@ -3298,7 +3301,7 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
     // Tight turns (under 40 m: junctions) with the junction share of the grip, as the route's limits do: the Infernus went
     // into a 25 m turn at 89 km/h and 2.3 g, ran 12 m wide and hit the wall (a player takes those at ~75 km/h, 2.0 g)
-    if (curvature > 1.0f / 40.0f) grip *= cfgJunctionGripFactor;
+    if (curvature > 1.0f / 40.0f) grip *= xdata.bRacer ? std::max(cfgJunctionGripFactor, 0.9f) : cfgJunctionGripFactor;
     return std::max(CurveSpeedFor(grip, curvature), 5.0f);
 }
 
