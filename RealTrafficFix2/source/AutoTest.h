@@ -279,6 +279,7 @@ static int raceTrailHead[2] = {}, raceDepth[2] = {};
 static unsigned int raceLastRespawn[2] = {};
 static unsigned int raceBadSince[2] = {}, raceLastHud = 0;
 static int raceRespawns[2] = {}, raceHolds = 0;
+static unsigned int raceLostSince[2] = {};
 // Where the time goes: seconds moving with each speed limiter in charge, freeway / everything else (mod-driven, near the camera)
 static double limiterTime[2][NUM_LIMITERS] = {};
 static int routeMaxMinutes = 35;
@@ -1259,8 +1260,27 @@ void Update() {
                             const float sp = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
                             const bool upright = c.veh->GetUp().z > 0.6f;
                             const bool onWheels = c.veh->GetNumContactWheels() >= 3;
+                            // The AI's car: on its route (6 m, same height), heading along it, at 30+ km/h for a good spot; lost
+                            // (12 m off the route or 3 m under it, for 4 s) means back too (after a crash it circled at full lock
+                            // and went off the bridge into the water; a spot taken while circling put it on the deck below)
+                            bool onRoute = true, lost = false;
+                            if (ci == 0 && c.turnCount > 0) {
+                                const TurnSample& last = c.turn[(c.turnHead + TURN_TRACE - 1) % TURN_TRACE];
+                                const ExtendedData& rx = vehExData.Get(c.veh);
+                                bool along = true;
+                                if (rx.pathCount >= 3) {
+                                    CVector2D d = rx.path[2].To2D() - rx.path[1].To2D();
+                                    const float dl = d.Magnitude();
+                                    if (dl > 0.5f) along = CVector2D::Dot(d * (1.0f / dl), c.veh->GetForward().To2D()) > 0.7f;
+                                }
+                                onRoute = last.offPath < 6.0f && std::abs(last.dz) < 3.0f && along && sp > 8.3f;
+                                const bool off = last.offPath > 12.0f || last.dz < -3.0f;
+                                if (!off) raceLostSince[ci] = 0;
+                                else if (!raceLostSince[ci]) raceLostSince[ci] = now;
+                                lost = raceLostSince[ci] && now - raceLostSince[ci] > 4000;
+                            }
                             // A good spot: on its wheels, upright, moving, not in water, every second
-                            if (upright && onWheels && sp > 4.0f && !c.veh->bSubmergedInWater && now - raceGood[ci].at > 1000) {
+                            if (upright && onWheels && sp > 4.0f && onRoute && !c.veh->bSubmergedInWater && now - raceGood[ci].at > 1000) {
                                 raceGood[ci].pos = p;
                                 const CVector2D f = c.veh->GetForward().To2D();
                                 raceGood[ci].heading = std::atan2(-f.x, f.y);
@@ -1269,10 +1289,11 @@ void Update() {
                                 raceTrailHead[ci] = (raceTrailHead[ci] + 1) % 8;
                             }
                             const bool bad = !upright || c.veh->bSubmergedInWater || (raceGood[ci].at && p.z < raceGood[ci].pos.z - 8.0f) ||
-                                c.still > 8.0f;
+                                c.still > 8.0f || lost;
                             if (!bad) raceBadSince[ci] = 0;
                             else if (!raceBadSince[ci]) raceBadSince[ci] = now;
-                            else if (raceGood[ci].at && now - raceBadSince[ci] > (c.still > 8.0f ? 0u : 2500u)) {
+                            else if (raceGood[ci].at && now - raceBadSince[ci] > (c.still > 8.0f || lost ? 0u : 2500u)) {
+                                raceLostSince[ci] = 0;
                                 // Further back each time it's needed again within 15 s
                                 raceDepth[ci] = raceLastRespawn[ci] && now - raceLastRespawn[ci] < 15000 ? std::min(raceDepth[ci] + 1, 7) : 0;
                                 raceLastRespawn[ci] = now;
