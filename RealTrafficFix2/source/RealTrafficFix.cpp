@@ -2978,7 +2978,9 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             // harder to stop, aggressive ones go through sooner. From the driver's comfortable braking it was inverted
             // (Gemini): calm 1.6 m/s2 went through from 60 m at 50 km/h, aggressive 5.6 m/s2 only from 17 m
             float yellowDecel = Lerp(3.5f, 2.5f, xdata.aggression);
-            if (xdata.runsRedLights && color != LIGHT_GREEN) lightApproachSpeed = std::min(lightApproachSpeed, RED_LIGHT_RUN_SPEED);
+            // (racing drivers go through at speed: the cross-traffic check still slows them for anyone crossing)
+            if (xdata.runsRedLights && color != LIGHT_GREEN && !profiles[xdata.profile].racingLogic)
+                lightApproachSpeed = std::min(lightApproachSpeed, RED_LIGHT_RUN_SPEED);
             bool mustStop = !xdata.runsRedLights && (color == LIGHT_RED ||
                 (color == LIGHT_YELLOW && speed * speed / (2.0f * yellowDecel) < std::max(dist, 0.0f)));
             float dz = linkPos.z - baseZ;
