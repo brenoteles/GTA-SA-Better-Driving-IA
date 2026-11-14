@@ -3733,7 +3733,8 @@ static void ApplyAccelLimit(CVehicle* veh, ExtendedData& xdata, float speed, flo
     float limit = xdata.accelLimit;
     const bool fullGasOvertake = cfgOvertakeFullThrottle && (xdata.laneState == LANE_SIGNAL_OVERTAKE || xdata.laneState == LANE_OVERTAKING ||
         (xdata.laneState == LANE_CHANGING && xdata.changeAfter == LANE_OVERTAKING));
-    if (cfgJerkLimit && cfgPedalControl && !fullGasOvertake) {
+    // (racing drivers: flat out, the traction control and stability control keep the wheels from spinning it out)
+    if (cfgJerkLimit && cfgPedalControl && !fullGasOvertake && !profiles[xdata.profile].racingLogic) {
         // Starting again from what the car does, but never below 0.8 m/s2 or what holds it on the slope (from 0 it crawled
         // off the line, rolled back on hills)
         if (*gas <= 0.0f || *brake > 0.05f)
@@ -5036,7 +5037,8 @@ public:
         // The ceiling falls with speed (openpilot's A_CRUISE_MAX): x1 up to 12 m/s, 0.75 at 25, 0.5 at 35, 0.35 at 45. The
         // edited Cadrona went past 150 km/h in seconds, faster than the sensors could react. Overtaking above 22 m/s: at
         // most 1.6 x that (3.5 m/s2), never flat out
-        if (cfgAccelBySpeed && speedNow > 12.0f) {
+        // (not for racing drivers: as hard as the car and its traction control allow)
+        if (cfgAccelBySpeed && speedNow > 12.0f && !prof.racingLogic) {
             const float f = speedNow < 25.0f ? Lerp(1.0f, 0.75f, (speedNow - 12.0f) / 13.0f) :
                 (speedNow < 35.0f ? Lerp(0.75f, 0.5f, (speedNow - 25.0f) / 10.0f) : Lerp(0.5f, 0.35f, std::min((speedNow - 35.0f) / 10.0f, 1.0f)));
             const float base = std::min(prof.accel, FULL_THROTTLE_ACCEL) * roadAccel;
