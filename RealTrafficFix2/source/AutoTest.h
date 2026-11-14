@@ -1437,6 +1437,7 @@ void Update() {
         out << Format("weaving (3 yaw-rate reversals > 0.15 rad/s within 4 s, above 54 km/h): test car %d, all cars %d\n",
             weaveEventsWatched, weaveEvents);
         out << Format("game lane put back to the lane the car is in (lane controller driving): %d\n", laneHoldCount);
+        out << Format("running wide at full lock, off the gas and braking (frames): %d\n", understeerAidFrames);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("route leader (mode %d): rays and route agree %d, route says other lane where the rays would brake %d, route says our lane where the rays would ignore it %d, not on the route %d\n",
             cfgRouteLeader, routeAgreeCount, routeOtherLaneRaysWouldBrake, routeInLaneRaysWouldIgnore, routeUnknownCount);

@@ -231,6 +231,9 @@ public:
     unsigned int weaveFlips[3] = {};
     unsigned int weaveSeen = 0;
     int lkMode = 0;                 // lane controller: 0 off, 1 keeping, 2 changing
+    float lkRoadCurv = 0.0f;        // the road's curvature over the next ~0.5 s (lane controller's line), 1/m
+    unsigned int lkCurvFrame = 0;
+    bool lkUndersteer = false;      // wheel at full lock and turning well under what the road asks
     float lkGain = 1.0f;            // lane controller: the yaw the car really makes over what its turn model says
     float lkPrevYaw = 0.0f, lkPrevSteer = 0.0f;
     unsigned int lkSteadySince = 0;
@@ -1886,6 +1889,9 @@ static float cfgHighwayGapFactor = 0.3f;
 static float cfgCityGapFactor = 0.7f;     // following time gap elsewhere, x the profile's  // following time gap on freeways/fast roads, x the profile's
 // Lateral g the vehicle being driven can take before it tips over (see GetRollGrip): the fast-curve boost never goes past it
 static float curRollGrip = 1000.0f;
+// Racing drivers already use the grip the model has shown: the fast-curve boost never takes them past it (it took the
+// Infernus to ~2.6 g in a 200 km/h curve that it could take at ~2.1: off a bridge, test 172005)
+static float curGripCeiling = 1000.0f;
 // The turn each model really makes, measured in the game (UpdateSteerModel): steering angle d gives the curvature
 // k = tan(d) / (L + K v^2), L the effective wheelbase (low speed), K the understeer gradient (the radius opening up with
 // speed). The geometric model (the wheelbase, no understeer) said a tall soft SUV could take an interchange loop at
@@ -1931,7 +1937,7 @@ static float CurveSpeedFor(float grip, float curvature) {
     float v = std::sqrt(grip * GRAVITY / curvature);
     float t = std::clamp((v - 60.0f / 3.6f) / ((110.0f - 60.0f) / 3.6f), 0.0f, 1.0f);
     float boosted = grip * (1.0f + (cfgFastCurveGripBoost - 1.0f) * t);
-    const float gripSpeed = std::sqrt(std::min(boosted, std::max(curRollGrip, grip)) * GRAVITY / curvature);
+    const float gripSpeed = std::sqrt(std::min({ boosted, std::max(curRollGrip, grip), std::max(curGripCeiling, grip) }) * GRAVITY / curvature);
     // Not faster than the steering can turn it (the grip boost knew nothing of understeer)
     if (cfgSteerModel && curSteerL > 0.0f) {
         const float steerSpeed = SteerSpeedFor(curvature);
@@ -3269,6 +3275,9 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
         steerCurvature *= 1.0f - w;
     }
     float curvature = std::max(steerCurvature, yawCurvature);
+    // The road's own curve where the car is (the lane controller's line): when it runs wide its yaw is small and the
+    // curve looked open, so it accelerated in the middle of it (off a bridge, test 172005)
+    if (xdata.lkCurvFrame + 3 >= frameCounter) curvature = std::max(curvature, xdata.lkRoadCurv);
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
     return std::max(CurveSpeedFor(grip, curvature), 5.0f);
 }
@@ -3418,7 +3427,7 @@ static float GetSmoothLaneSteer(CVehicle* veh, const ExtendedData& xdata, float 
 static int laneKeepFrames = 0, laneKeepOff[4] = {}; // off: no road data, sharp turn ahead, out of the lane, data too short
 static double laneKeepErrSum = 0.0;
 static float laneKeepErrMax = 0.0f;
-static int weaveEvents = 0, weaveEventsWatched = 0, laneHoldCount = 0;
+static int weaveEvents = 0, weaveEventsWatched = 0, laneHoldCount = 0, understeerAidFrames = 0;
 static CVehicle* weaveWatch = nullptr; // the test car (AutoTest)
 
 static constexpr int MAX_LANE_LINE = 256;
@@ -3603,6 +3612,15 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
             const float a = (p1 - p0).Magnitude(), b = (p2 - p1).Magnitude(), c = (p2 - p0).Magnitude();
             curvAt[i] = a > 1.0f && b > 1.0f && c > 1.0f ? 2.0f * CVector2D::Cross(p1 - p0, p2 - p1) / (a * b * c) : 0.0f;
         }
+    }
+    {
+        float c = 0.0f;
+        for (int i = 0; i < 10; i++) c = std::max(c, std::abs(curvAt[i]));
+        xdata.lkRoadCurv = c;
+        xdata.lkCurvFrame = frameCounter;
+        const float roadHere = std::abs(curvAt[1]), turning = std::abs(yawNow) / v;
+        xdata.lkUndersteer = v > 15.0f && roadHere > 0.003f && std::abs(prevSteer) > 0.95f * maxSteer && turning < 0.75f * roadHere &&
+            (prevSteer > 0.0f) == (curvAt[1] > 0.0f);
     }
     // Where the car should be across (> 0: right of the line), each step: 0, or the lane change's S
     auto refAt = [&](float t) { return refOffset ? refOffset(t) : 0.0f; };
@@ -4247,6 +4265,12 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     ApplyDriverAids(veh, xdata, speed, *steer, gas, brake);
     ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
+    // Running wide (full lock, turning under 75% of the road's curve): off the gas and on the brakes, as a driver does
+    if (xdata.lkUndersteer && xdata.lkCurvFrame + 3 >= frameCounter && !handbrakeTurn) {
+        *gas = 0.0f;
+        *brake = std::max(*brake, 0.5f);
+        understeerAidFrames++;
+    }
     // Steering smoothed at speed: the game steers from road node to road node, a 0.03-0.05 rad jolt at each, and at
     // 110 km/h that's 0.5-1.5 g sideways for an instant (the measured turn trace): tall cars were thrown about. A
     // first-order filter, 0 s at 10 m/s up to 0.15 s from 30 m/s: the jolts become ramps, and a big correction is only
@@ -5091,6 +5115,7 @@ public:
             grip = limits.grip * std::min(prof.cornerGrip, 0.98f);
             decel = limits.decel * std::min(cfgLearnedDecelUse * Lerp(0.92f, 1.08f, aggr), 0.95f);
         }
+        curGripCeiling = racer && cfgAdaptiveLimits ? grip * xdata.surfaceFactor * damageGrip : 1000.0f;
         // Dirt, grass, rain and burst tyres
         grip *= xdata.surfaceFactor * damageGrip;
         // Not past what tips it over
