@@ -3288,6 +3288,9 @@ static float GetHeadingLimit(CVehicle* veh, ExtendedData& xdata, const CVector& 
     // curve looked open, so it accelerated in the middle of it (off a bridge, test 172005)
     if (xdata.lkCurvFrame + 3 >= frameCounter) curvature = std::max(curvature, xdata.lkRoadCurv);
     if (curvature < 0.002f) return 1000.0f; // radius > 500 m
+    // Tight turns (under 40 m: junctions) with the junction share of the grip, as the route's limits do: the Infernus went
+    // into a 25 m turn at 89 km/h and 2.3 g, ran 12 m wide and hit the wall (a player takes those at ~75 km/h, 2.0 g)
+    if (curvature > 1.0f / 40.0f) grip *= cfgJunctionGripFactor;
     return std::max(CurveSpeedFor(grip, curvature), 5.0f);
 }
 
