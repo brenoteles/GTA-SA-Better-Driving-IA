@@ -16,6 +16,8 @@
 #include "CSprite2d.h"
 #include "CRect.h"
 #include "JPegCompress.h"
+#include "CMessages.h"
+#include "CAudioEngine.h"
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -256,6 +258,20 @@ static void RecordTurn(TripCar& c, unsigned int now) {
 }
 static int followed = 0;
 static int tripCarCount = 1; // TripCars = 2: also the aggressive driver
+// Race = 1: the second car is the player's, beside the AI's, both held for a 3-2-1 countdown. Both are recorded every
+// 0.1 s (race.csv: speed, steering, pedals, yaw, sideways g along the way) to compare a human with the AI
+static bool raceMode = false;
+static unsigned int raceGoAt = 0, raceStart = 0;
+static float raceStartMinutes = 0.0f;
+static int raceShown = -1;
+static std::ofstream raceCsv;
+static unsigned int raceLastRow[2] = {};
+// After MTA's race gamemode: back on the road at the last good spot (on its wheels, moving, on the route) when a racer
+// falls (8 m under it), lies on its roof or side, sinks, or hasn't moved for 8 s; and the place / gap on screen
+struct RaceSpot { CVector pos; float heading = 0.0f; unsigned int at = 0; };
+static RaceSpot raceGood[2];
+static unsigned int raceBadSince[2] = {}, raceLastHud = 0;
+static int raceRespawns[2] = {};
 // Where the time goes: seconds moving with each speed limiter in charge, freeway / everything else (mod-driven, near the camera)
 static double limiterTime[2][NUM_LIMITERS] = {};
 static int routeMaxMinutes = 35;
@@ -416,6 +432,11 @@ void Init(const std::string& moduleDir) {
     noTraffic = ini.ReadInteger("AutoTest", "NoTraffic", 0) != 0;
     if (noTraffic) cfgAmbientSpawn = false;
     tripCarCount = std::clamp(ini.ReadInteger("AutoTest", "TripCars", 1), 1, 2);
+    raceMode = ini.ReadInteger("AutoTest", "Race", 0) != 0;
+    if (raceMode) {
+        tripCarCount = 2;
+        tripCars[1].label = "PLAYER";
+    }
     // Driver of the (first) test car
     {
         static const struct { const char* key; eDriverProfile profile; const char* label; } drivers[] = {
@@ -1046,7 +1067,7 @@ void Update() {
         if (!testCar) { state = TELEPORT; return; }
         testCar->SetHeading(heading);
         Command<COMMAND_CREATE_RANDOM_CHAR_AS_DRIVER>(carHandle, &driverHandle);
-        Command<COMMAND_WARP_CHAR_INTO_CAR_AS_PASSENGER>(PlayerHandle(), carHandle, 0);
+        if (!raceMode) Command<COMMAND_WARP_CHAR_INTO_CAR_AS_PASSENGER>(PlayerHandle(), carHandle, 0);
         Command<COMMAND_SET_CAR_PROOFS>(carHandle, 1, 1, 1, 1, 1);
         Command<COMMAND_CAR_WANDER_RANDOMLY>(carHandle);
         Command<COMMAND_SET_CAR_DRIVING_STYLE>(carHandle, 0);
@@ -1062,12 +1083,30 @@ void Update() {
             bool ground = false;
             float gz = FindGroundZ({ back.x, back.y, back.z + 3.0f }, &ground);
             if (ground) back.z = gz;
+            if (raceMode) {
+                // Side by side: the lane to the right (or left) when there's ground at the same height, else 10 m behind
+                const CVector right(std::cos(heading), std::sin(heading), 0.0f);
+                bool placed = false;
+                for (float side : { 3.6f, -3.6f }) {
+                    CVector at = pos + right * side;
+                    bool g = false;
+                    float z = FindGroundZ({ at.x, at.y, at.z + 3.0f }, &g);
+                    if (g && std::abs(z - pos.z) < 1.5f) { back = CVector(at.x, at.y, z); placed = true; break; }
+                }
+                if (!placed) back = pos - CVector(-std::sin(heading), std::cos(heading), 0.0f) * 10.0f;
+            }
             if (tripCarCount > 1) {
                 Command<COMMAND_CREATE_CAR>(carModel, back.x, back.y, back.z + 1.0f, &tripCars[1].handle);
                 tripCars[1].veh = CPools::GetVehicle(tripCars[1].handle);
             }
             else { tripCars[1].done = true; tripCars[1].result = "(not used)"; }
-            if (tripCars[1].veh) {
+            if (tripCars[1].veh && raceMode) {
+                // The player drives it
+                tripCars[1].veh->SetHeading(heading);
+                Command<COMMAND_WARP_CHAR_INTO_CAR>(PlayerHandle(), tripCars[1].handle);
+                Command<COMMAND_SET_CAR_PROOFS>(tripCars[1].handle, 1, 1, 1, 1, 1);
+            }
+            else if (tripCars[1].veh) {
                 tripCars[1].veh->SetHeading(heading);
                 Command<COMMAND_CREATE_RANDOM_CHAR_AS_DRIVER>(tripCars[1].handle, &tripCars[1].driver);
                 Command<COMMAND_SET_CAR_PROOFS>(tripCars[1].handle, 1, 1, 1, 1, 1);
@@ -1086,6 +1125,12 @@ void Update() {
                 // A mission vehicle, so the game never removes it (it deleted the one the player wasn't in, off screen, and
                 // its pool slot went to another car); the mod drives it anyway
                 c.veh->m_nCreatedBy = MISSION_VEHICLE;
+                if (raceMode && &c == &tripCars[1]) { // the player's: not driven by the mod
+                    c.wp = 0;
+                    c.lastPos = c.veh->GetPosition();
+                    c.lastProgress = now;
+                    continue;
+                }
                 ExtendedData& x = vehExData.Get(c.veh);
                 x.forceDrive = true;
                 x.bInitialized = true;
@@ -1100,6 +1145,17 @@ void Update() {
                 c.lastProgress = now;
             }
             followed = 0;
+            if (raceMode) {
+                // Both held until GO
+                for (TripCar& c : tripCars) if (c.veh) Command<COMMAND_FREEZE_CAR_POSITION>(c.handle, 1);
+                Command<COMMAND_SET_PLAYER_CONTROL>(0, 0);
+                raceGoAt = now + 4000;
+                raceStart = 0;
+                raceShown = -1;
+                raceCsv.open(shotDir + "race.csv", std::fstream::out | std::fstream::trunc);
+                raceCsv << "car,t_s,x,y,z,speed_kmh,heading_deg,steer_rad,gas,brake,handbrake,yaw_rate,lat_g,driven_m,left_m\n";
+                out << "  RACE: the player in the second car, beside the AI; recorded to race.csv\n";
+            }
             out << Format("  route trip to (%.0f, %.0f), %.0f m in a straight line: %s and %s drivers, Left/Right arrow to switch\n",
                 l.destX, l.destY, TripLeft(l, 0, pos.To2D()), tripCars[0].label, tripCars[1].label);
             for (int i = 0; i < l.numWaypoints; i++)
@@ -1120,6 +1176,29 @@ void Update() {
         if (locations[locIndex].route) {
             // The trip: no resets. Each car arrives, gets lost or stuck on its own; the test ends when both are done
             const Location& l = locations[locIndex];
+            if (raceMode && raceGoAt) {
+                // 3, 2, 1, GO
+                const int left = now < raceGoAt ? static_cast<int>((raceGoAt - now + 999) / 1000) : 0;
+                if (left != raceShown) {
+                    raceShown = left;
+                    // (frontend sounds 44 = beep, 45 = go, as MTA's race countdown)
+                    if (left > 0 && left <= 3) {
+                        CMessages::AddBigMessage(left == 3 ? "3" : left == 2 ? "2" : "1", 1000, 0);
+                        AudioEngine.ReportFrontendAudioEvent(44, 0.0f, 1.0f);
+                    }
+                    else if (left == 0) {
+                        CMessages::AddBigMessage("GO!", 1500, 0);
+                        AudioEngine.ReportFrontendAudioEvent(45, 0.0f, 1.0f);
+                    }
+                }
+                if (left > 0) return;
+                for (TripCar& c : tripCars) if (c.veh) Command<COMMAND_FREEZE_CAR_POSITION>(c.handle, 0);
+                Command<COMMAND_SET_PLAYER_CONTROL>(0, 1);
+                raceGoAt = 0;
+                raceStart = now;
+                raceStartMinutes = Minutes();
+                out << Format("  RACE: GO at %.2f min\n", raceStartMinutes);
+            }
             const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
             bool allDone = true;
             for (TripCar& c : tripCars) {
@@ -1136,6 +1215,47 @@ void Update() {
                         const float before = c.still;
                         c.still = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS < 0.5f ? c.still + dt : 0.0f;
                         RecordTurn(c, now);
+                        const int ci = &c == &tripCars[0] ? 0 : 1;
+                        if (raceMode && raceStart && raceCsv.is_open() && now - raceLastRow[ci] >= 100) {
+                            raceLastRow[ci] = now;
+                            const CVector p = c.veh->GetPosition();
+                            const float sp = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+                            const float yaw = c.veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS;
+                            const CVector2D f = c.veh->GetForward().To2D();
+                            raceCsv << Format("%s,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.2f,%d,%.3f,%.2f,%.0f,%.0f\n", c.label,
+                                (now - raceStart) / 1000.0f, p.x, p.y, p.z, sp * 3.6f, std::atan2(-f.x, f.y) * 57.2958f, c.veh->m_fSteerAngle,
+                                c.veh->m_fGasPedal, c.veh->m_fBreakPedal, c.veh->bIsHandbrakeOn ? 1 : 0, yaw,
+                                std::abs(yaw) * sp / GRAVITY, c.driven, TripLeft(l, c.wp, p.To2D()));
+                        }
+                        if (raceMode && raceStart) {
+                            const CVector p = c.veh->GetPosition();
+                            const float sp = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
+                            const bool upright = c.veh->GetUp().z > 0.6f;
+                            const bool onWheels = c.veh->GetNumContactWheels() >= 3;
+                            // A good spot: on its wheels, upright, moving, not in water, every second
+                            if (upright && onWheels && sp > 4.0f && !c.veh->bSubmergedInWater && now - raceGood[ci].at > 1000) {
+                                raceGood[ci].pos = p;
+                                const CVector2D f = c.veh->GetForward().To2D();
+                                raceGood[ci].heading = std::atan2(-f.x, f.y);
+                                raceGood[ci].at = now;
+                            }
+                            const bool bad = !upright || c.veh->bSubmergedInWater || (raceGood[ci].at && p.z < raceGood[ci].pos.z - 8.0f) ||
+                                c.still > 8.0f;
+                            if (!bad) raceBadSince[ci] = 0;
+                            else if (!raceBadSince[ci]) raceBadSince[ci] = now;
+                            else if (raceGood[ci].at && now - raceBadSince[ci] > (c.still > 8.0f ? 0u : 2500u)) {
+                                const RaceSpot& g = raceGood[ci];
+                                c.veh->Teleport(CVector(g.pos.x, g.pos.y, g.pos.z + 0.5f), false);
+                                c.veh->SetHeading(g.heading);
+                                c.veh->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
+                                c.veh->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
+                                c.still = 0.0f;
+                                raceBadSince[ci] = 0;
+                                raceRespawns[ci]++;
+                                out << Format("  [RACE] %s back on the road at (%.0f, %.0f) at %.2f min (respawn %d)\n", c.label,
+                                    g.pos.x, g.pos.y, Minutes(), raceRespawns[ci]);
+                            }
+                        }
                         if (static_cast<int>(before / 40.0f) < static_cast<int>(c.still / 40.0f)) {
                             out << Format("  [%s] stuck %.0f s: shots of the scene from 6 angles (stuck_%02d_*)\n", c.label, c.still, orbitCount + 1);
                             StartOrbitShots(c.veh, Format("stuck_%02d", orbitCount + 1));
@@ -1157,7 +1277,7 @@ void Update() {
                         c.wp++;
                         c.snapped = false;
                         c.snapTry = 0;
-                        SetWaypointDestination(c.veh, l, c.wp);
+                        if (!(raceMode && &c == &tripCars[1])) SetWaypointDestination(c.veh, l, c.wp);
                     }
                     left = TripLeft(l, c.wp, carPos);
                     if (left < c.bestLeft - 100.0f) { c.bestLeft = left; c.lastProgress = now; }
@@ -1184,17 +1304,33 @@ void Update() {
                 if (*c.result) {
                     c.done = true;
                     c.doneMinutes = Minutes();
+                    if (raceMode && raceStart)
+                        out << Format("  [RACE] %s: %s in %.2f min from GO\n", c.label, c.result, c.doneMinutes - raceStartMinutes);
                     out << Format("  [%s] %s after %.2f min, %.2f km driven, %d collisions, %.0f m left\n", c.label, c.result,
                         c.doneMinutes, c.driven / 1000.0f, c.collisions, left);
                 }
                 else allDone = false;
+            }
+            if (raceMode && raceStart && now - raceLastHud > 1000 && tripCars[0].veh && tripCars[1].veh) {
+                // Place by what's left of the route, gap in seconds at the one behind's speed
+                raceLastHud = now;
+                const float leftAI = TripLeft(l, tripCars[0].wp, tripCars[0].veh->GetPosition().To2D());
+                const float leftMe = TripLeft(l, tripCars[1].wp, tripCars[1].veh->GetPosition().To2D());
+                const bool ahead = tripCars[1].done || leftMe < leftAI;
+                const TripCar& behind = ahead ? tripCars[0] : tripCars[1];
+                const float speedBehind = std::max(behind.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS, 10.0f);
+                static char hud[96];
+                snprintf(hud, sizeof(hud), "%s  %s %.1f s  (%.0f m)", ahead ? "1st" : "2nd", ahead ? "AI behind" : "AI ahead",
+                    std::abs(leftAI - leftMe) / speedBehind, leftMe);
+                CMessages::AddMessageJumpQ(hud, 1200, 0);
             }
             if (allDone || Minutes() > routeMaxMinutes) {
                 for (TripCar& c : tripCars) if (!c.done) { c.done = true; c.result = "FAIL: did not arrive in time"; c.doneMinutes = Minutes(); }
                 state = DONE;
                 break;
             }
-            // The player rides in the followed car: Left/Right arrow switch
+            // The player rides in the followed car: Left/Right arrow switch (not in a race: the player drives)
+            if (raceMode) break;
             static bool leftWas = false, rightWas = false;
             bool leftNow = KeyPressed(VK_LEFT), rightNow = KeyPressed(VK_RIGHT);
             int want = followed;

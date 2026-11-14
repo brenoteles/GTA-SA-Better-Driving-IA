@@ -2841,6 +2841,14 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             float cross = std::abs(CVector2D::Cross(p1 - p0, p2 - p0));
             if (a < 0.5f || b < 0.5f || c < 0.5f) continue;
             float curvature = 2.0f * cross / (a * b * c); // 1 / circumradius
+            // Junction turns: the nodes cut the corner from far away (a 90 degree turn read as a 50 m radius, the car needed
+            // ~10 m and went in at 76 km/h: off the road, test 172730). The radius by the turn's angle too: 90 degrees ~10 m,
+            // 45 ~18 m, 30 ~27 m; the tighter of both
+            if (k == kTurn) {
+                const float cosT = CVector2D::Dot(p1 - p0, p2 - p1) / (a * b);
+                const float theta = std::acos(std::clamp(cosT, -1.0f, 1.0f));
+                if (theta > 0.35f) curvature = std::max(curvature, std::max(std::sin(theta * 0.5f) * 1.414f, 0.2f) / 10.0f);
+            }
             if (curvature < 0.002f) continue;            // radius > 500 m
             // Junction turns (the short window): less of the grip. Into them at the open-road share, cars swung wide across
             // the oncoming lanes
