@@ -18,6 +18,7 @@
 #include "JPegCompress.h"
 #include "CMessages.h"
 #include "CAudioEngine.h"
+#include "CColStore.h"
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -1232,6 +1233,13 @@ void Update() {
                                 c.veh->m_fGasPedal, c.veh->m_fBreakPedal, c.veh->bIsHandbrakeOn ? 1 : 0, yaw,
                                 std::abs(yaw) * sp / GRAVITY, c.driven, TripLeft(l, c.wp, p.To2D()));
                         }
+                        // The game only loads the map's collision and road data around the player: the AI's car, left behind,
+                        // fell through the road (z -56, test 174139). Both asked for wherever the AI's car is, every frame
+                        if (raceMode && ci == 0) {
+                            const CVector at = c.veh->GetPosition();
+                            CColStore::RequestCollision(at, 0);
+                            ThePaths.SetPathsNeededAtPosition(at);
+                        }
                         if (raceMode && raceStart) {
                             const CVector p = c.veh->GetPosition();
                             const float sp = c.veh->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
@@ -1256,7 +1264,9 @@ void Update() {
                                 raceLastRespawn[ci] = now;
                                 const RaceSpot& t = raceTrail[ci][(raceTrailHead[ci] + 7 - raceDepth[ci]) % 8];
                                 const RaceSpot& g = t.at ? t : raceGood[ci];
-                                // Exactly there (Teleport looks for the ground under it: under a bridge, the canal)
+                                // Exactly there (Teleport looks for the ground under it: under a bridge, the canal), with the ground
+                                // loaded first
+                                CStreaming::LoadSceneCollision(&g.pos);
                                 CWorld::Remove(c.veh);
                                 c.veh->SetHeading(g.heading);
                                 c.veh->SetPosn(CVector(g.pos.x, g.pos.y, g.pos.z + 0.3f));
