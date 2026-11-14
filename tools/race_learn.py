@@ -5,8 +5,8 @@ did with the same car. Also prints the player's and the AI's curve speeds by rad
 
 usage: python race_learn.py <race.csv> <car model id> <game scripts folder> [--write]
 
-The grip taken: the median sideways g of the player's steady curves (radius 30-400 m, over 40 km/h, no handbrake),
-x 0.85 (a margin: the AI has no feel for the tyres). Never lowered: only raised over what the mod already learned.
+The grip taken: the 75th percentile of the player's sideways g in curves of radius 30-250 m (over 40 km/h, no
+handbrake), x 0.85 (a margin: the AI has no feel for the tyres). Never lowered: only raised over what the mod already learned.
 """
 import csv
 import os
@@ -46,11 +46,13 @@ def main(csv_path, model, scripts, write=False):
                 sp = sorted(p[1] for p in b)
                 g = sorted(p[2] for p in b)
                 print(f'  radius {lo:3d}-{hi:3d} m: {len(b):4d} samples, speed p50 {sp[len(sp) // 2]:.0f} km/h, sideways g p50 {g[len(g) // 2]:.2f}')
-    steady = sorted(p[2] for p in curves(rows, 'PLAYER') if 30.0 <= p[0] < 400.0)
-    if len(steady) < 50:
+    # Where grip matters (radius 30-250 m: in wider curves a player hardly needs it, and the median of all of them read
+    # 1.23 g for a Bullet taken through 60-120 m curves at 2.6 g): the 75th percentile
+    pushed = sorted(p[2] for p in curves(rows, 'PLAYER') if 30.0 <= p[0] < 250.0)
+    if len(pushed) < 50:
         print('not enough player curves to learn from')
         return
-    shown = steady[len(steady) // 2] * 0.85
+    shown = pushed[len(pushed) * 3 // 4] * 0.85
     path = os.path.join(scripts, 'RealTrafficFix.limits.txt')
     lines = open(path).read().splitlines() if os.path.exists(path) else []
     out, found = [], False
@@ -60,7 +62,7 @@ def main(csv_path, model, scripts, write=False):
             found = True
             old = float(c[1])
             new = max(old, min(shown, 3.0))
-            print(f'model {model}: learned grip {old:.2f} g -> {new:.2f} g (player median x 0.85 = {shown:.2f})')
+            print(f'model {model}: learned grip {old:.2f} g -> {new:.2f} g (player p75 x 0.85 = {shown:.2f})')
             c[1] = f'{new:g}'
             line = ' '.join(c)
         out.append(line)

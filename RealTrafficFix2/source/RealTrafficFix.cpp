@@ -3013,6 +3013,9 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             float allowed = mustStop ? BrakingSpeed(0.0f, dist, decel, dz) : BrakingSpeed(lightApproachSpeed, dist, decel, dz);
             // Green: through it at the road's speed (if it turns yellow, the yellow rule above decides in time)
             if (color == LIGHT_GREEN && cfgGreenLightFullSpeed) allowed = 1000.0f;
+            // Racing drivers that run red lights don't slow for any (they were held to 75 km/h at every light that wasn't
+            // green: 3% of a race braking for nothing); the cross-traffic check still slows them for anyone crossing
+            if (xdata.runsRedLights && profiles[xdata.profile].racingLogic) allowed = 1000.0f;
 
             xdata.lightSpeed = allowed;
             xdata.lightDist = std::max(dist, 0.0f);
