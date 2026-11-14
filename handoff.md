@@ -145,6 +145,13 @@ First race (173316): the player arrived in 2.79 min (average 229 km/h, peaks 385
 ramp off a straight bridge at 203 km/h, fell into the canal and the old respawn (Teleport, which looks for the ground
 below) dropped it there 44 times. Infernus grip 1.18 -> 1.81 g from that race.
 
+Later races: the AI fell through the map away from the player (the game only loads IPLs/collision around the player:
+fixed with SET_LOAD_COLLISION_FOR_CAR_FLAG, AddIplsNeededAtPosn, AddCollisionNeededAtPosn and a hold until loaded),
+crashed on the bridge at (-462, 596) and went into a junction turn too fast (tight turns now use the junction grip share
+in the heading limit). Bullet vs Bullet (175951): player 3.45 min (full gas 89% of the time, braking 1%), AI 4.25 min
+(full gas 51%, braking 18%): the route's curve radius near junction nodes was read from a 12 m window on the node
+corners (a 220 m freeway curve as ~100 m); gentle bends near junction nodes now use the long window. Racing line off.
+
 ## Other recent changes (still to confirm in game)
 
 - Yellow lights: decided at 3.5 to 2.5 m/s2 by aggression (it was inverted: calm drivers went through from 60 m).

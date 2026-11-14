@@ -2836,6 +2836,14 @@ static void UpdateRouteLimits(CVehicle* veh, ExtendedData& xdata, float speed, f
             if (sd[j] < -CURVE_STEP) continue; // behind us
             int k = kRoad;
             for (int q = std::max(j - kRoad, 0); q <= std::min(j + kRoad, n - 1) && k == kRoad; q++) if (sj[q]) k = kTurn;
+            // A junction node on a road that hardly bends over the long window (freeway merges and ramps join at junction
+            // nodes all along a curve) is still a road curve: the short window on the node corners read a 220 m curve as
+            // ~100 m and racers braked 200 -> 145 km/h for it (a player took it flat out, race 175951)
+            if (k == kTurn && j - kRoad >= 0 && j + kRoad < n) {
+                const CVector2D in = sp[j] - sp[j - kRoad], out = sp[j + kRoad] - sp[j];
+                const float il = in.Magnitude(), ol = out.Magnitude();
+                if (il > 1.0f && ol > 1.0f && CVector2D::Dot(in, out) / (il * ol) > 0.906f) k = kRoad; // under 25 degrees
+            }
             if (j - k < 0 || j + k >= n) k = kTurn;
             CVector2D p0 = sp[j - k], p1 = sp[j], p2 = sp[j + k];
             float a = (p1 - p0).Magnitude(), b = (p2 - p1).Magnitude(), c = (p2 - p0).Magnitude();
