@@ -1,7 +1,23 @@
 # Handoff: Real Traffic Fix (GTA SA Better Driving IA)
 
-State as of 2026-11-14. Read this first, then `docs/sensores.html` (the progress checklist, published as
-https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs).
+State at the end of the 2026-11-14 session. Read this first, then `docs/sensores.html` (the progress checklist,
+published as https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; it was last updated before the race work below).
+
+## Where things stand (read this first)
+
+The user's current goal: an AI that races like they do. They race the AI side by side (race mode below), and the AI
+should learn from their driving. Their verdict on the last versions:
+
+- "freia demais nas curvas, precisa aprender a manter a velocidade, seguir melhores linhas"
+- "nao consegue seguir a minha linha, nao e agressiva o suficiente e acaba perdendo a linha; quando perde, o carro vai
+  muito mal e nao consegue voltar a ela"
+
+The last commit (racer steering more aggressive + ghost only where it follows the route + FORCED fix) was tested once
+(183122, Bullet, AI alone): it went off the route at (2790, -413) and (1792, 891), spun at (1788, 900) (slip 0.8 rad,
+yaw 2 rad/s) and the game closed with no summary and no watchdog entry. Full gas 23% of the time (worse than 50%
+before). **Treat the last commit as unproven, possibly a regression.** Next step: rerun it, read `drive.csv` around
+those points, and if it's worse, revert the racer weights in `LaneControllerSteer` (line error x4, wheel cost 15,
+candidate span 0.04, maxSteer 0.45) one at a time.
 
 ## What this is
 
@@ -11,176 +27,138 @@ Grove Street to Bayside trip, proven by the in-game AutoTest.
 
 - Repo: https://github.com/brenoteles/GTA-SA-Better-Driving-IA (branch `main`; this folder is its own repo).
 - Game: `C:\Users\death\Games\GTA\GTA San Andreas`. The build copies `RealTrafficFix.SA.asi` to its `scripts` folder.
-- Main code: `RealTrafficFix2/source/RealTrafficFix.cpp` (~7,300 lines) and `AutoTest.h` (~1,700).
+- Main code: `RealTrafficFix2/source/RealTrafficFix.cpp` (~7,500 lines) and `AutoTest.h` (~1,900).
 - Settings: `RealTrafficFix2/RealTrafficFix.ini`. The test launcher copies it over the game's ini at every test start,
   so change the repo ini, not the game's.
 
 ## Working rules the user set
 
 - Commit and push after every change.
-- Keep `docs/sensores.html` as a checklist map grouped by area (CARLA, openpilot, SUMO/network, map/physics, tools,
-  open issues). Update items in place (status, result, commit). Do not append paragraphs. Republish the artifact.
+- Keep `docs/sensores.html` as a checklist map grouped by area. Update items in place (status, result, commit). Do not
+  append paragraphs. Republish the artifact.
 - Work with Gemini through the Antigravity CLI (read-only for Gemini). Check every Gemini claim in the code first:
   about 1 in 4 suggestions was wrong.
 - Study the code and game data before a long in-game test.
 - The traffic light poles added by the mod stay floating (5.5 m up) until the user says otherwise.
 - Never overwrite another mod's files; never use `--dangerously-skip-permissions`; never store the Gemini API key.
+- No MTA: the user chose local races over installing MTA (MTA doesn't load ASI/modloader).
 
 ## Build and test
-
-Build (VS 2026, MSBuild):
 
 ```
 MSBuild RealTrafficFix2/RealTrafficFix.vcxproj "-p:Configuration=Release GTA-SA" -p:Platform=Win32
 ```
 
-The game must be closed (it locks the ASI).
-
-Test (the launcher starts the game, keeps it focused until it loads, runs the trip, restores the config):
+The game must be closed (it locks the ASI; the post-build step kills a running game and then fails to copy).
 
 ```
-pythonw tools/AutoTestUI.pyw --car 495 --drivers rapido --start                  # Sandking, fast driver, with traffic
-pythonw tools/AutoTestUI.pyw --car 560 --drivers sozinho --notraffic --start     # Sultan, 'alone', no traffic
-pythonw tools/AutoTestUI.pyw --car 411 --drivers maximo --notraffic --start      # Infernus, fastest possible
+pythonw tools/AutoTestUI.pyw --car 495 --drivers rapido --start                        # Sandking, fast driver, traffic
+pythonw tools/AutoTestUI.pyw --car 560 --drivers sozinho --notraffic --start           # Sultan, 'alone', no traffic
+pythonw tools/AutoTestUI.pyw --car 541 --drivers maximo --notraffic --start            # Bullet, fastest, AI alone
+pythonw tools/AutoTestUI.pyw --car 541 --drivers maximo --notraffic --race --start     # the user races the AI
 ```
 
-- Started with `--start`, the launcher closes itself when the test ends. Never start a second one while a test runs:
-  two launchers once overlapped. Check with `tasklist` that `gta_sa.exe` isn't running first.
+- With `--start` the launcher closes itself when the test ends. Never start a second one while a test runs (two once
+  overlapped). Check `tasklist | grep gta_sa` first. If you kill a test, also delete
+  `scripts/RealTrafficFix.autotest.ini`.
+- Never chain a launcher after `git push` in one command: the push once hung, and the launcher started later on its
+  own and overlapped the next test.
 - MixSets `NoPauseWhenUnfocus = 1` stays on (the user wants the game running when minimised).
-- `--notraffic` sets the game's random car limit to 0 and the mod's spawner off every frame (the mod's own ini, read
-  after the test's, used to switch the spawner back on). The log's `[pulse]` lines show `random cars 0 ... ambient
-  created 0` when it works.
+- `--notraffic`: the game's random car limit 0 and the mod's spawner off, every frame. `[pulse]` lines show
+  `random cars 0 ... ambient created 0` when it works.
+- Logs in `scripts/autotest_<date>_<time>/`: `autotest.log` (summary at the end; `=== OFF ROAD` dumps a 15 s trace),
+  `drive.csv` (the AI test car every 0.1 s: speed, target, planned curve speed, limiter, pedals, yaw, g, off-route),
+  `race.csv` (race mode: both cars every 0.1 s).
 
-- Standard test: Sandking (495), fast driver, Grove Street to Bayside (~10.7 km).
-- Steering tests: Sultan (560), profile `alone` (fast driver at 2x the road speed, same curves), no traffic.
-- Logs: `scripts/autotest_<date>_<time>/autotest.log`. The summary at the end has one line per feature counter.
-  `=== OFF ROAD` dumps hold a 15 s trace (speed, steer, yaw, radius, slip). `=== OSCILLATION` means the car
-  went forwards/backwards (pedals), not weaving.
-
-### Git push
-
-The git credential stored for https expired. `gh` is logged in. Push without changing the config:
+Git push (the stored https credential expired; `gh` is logged in):
 
 ```
 git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin HEAD
 ```
 
-### Gemini (Antigravity)
+Gemini: `C:/Users/death/AppData/Local/agy/bin/agy -p "<prompt with file paths>" --model gemini-4-argon-high
+--print-timeout 400s` (pass paths, not code; write `git diff` to a file for reviews).
 
-```
-C:/Users/death/AppData/Local/agy/bin/agy -p "<prompt with file paths>" --model gemini-4-argon-high --print-timeout 400s
-```
+## Race mode and learning from the player
 
-Settings: `~/.gemini/antigravity-cli/settings.json` (read allowed for the GTA folder and the scratchpad; write and
-commands denied). Pass paths, not code. For a diff review, write `git diff` to a file and pass its path.
+- `--race`: the player in a second car beside the AI's (after MTA's race gamemode): frozen 3-2-1 countdown with sounds,
+  place/gap on screen, back on the road at the last good spot (AI: on its route, heading along it, 30+ km/h) after a
+  fall/roll/sink/8 s stuck/4 s lost, further back each time it repeats. The AI's reverse manoeuvre is cleared at GO.
+- Away from the player the game unloads the map: the AI's car gets `SET_LOAD_COLLISION_FOR_CAR_FLAG`, and every frame
+  `CIplStore::AddIplsNeededAtPosn`, `CColStore::AddCollisionNeededAtPosn`, `ThePaths.SetPathsNeededAtPosition`, and
+  is held (frozen) until the collision there is loaded. Before this it fell through elevated roads.
+- `tools/race_learn.py <race.csv> <model> <scripts> [--write] [--ghost]` (game closed: the mod rewrites the limits file
+  every minute):
+  - `--write`: the model's learned grip raised to the player's 75th percentile g in 30-250 m curves x 0.85 (never
+    lowered; ceiling 3 g). Now: Infernus 411 2.59 g, Bullet 541 2.30 g.
+  - `--ghost`: the player's line and speeds (every ~3 m) to `scripts/RealTrafficFix.ghost.<model>.txt`. Written from
+    the best races: Bullet 180612 (3.44 min), Infernus 175443 (2.71 min).
+- Ghost line (`UpdateGhost`, `GhostLine`): a racing driver on the player's line (within 12 m to start, 20 m to keep,
+  same direction, and the line 40/80 m ahead within 8 m of its route) steers along it with the predictive steering
+  and takes the player's speeds x 0.95 (braking for slower points ahead) instead of its own curve and heading limits.
+  Summary line: `on the player's line (ghost)`.
 
-## Steering and lane keeping (the latest work)
+Results:
 
-The user reported cars zig-zagging. Findings, in order:
-
-1. The game steers by the angle to its next point (steering = heading error, same gain at any speed). At 170 km/h,
-   11 degrees off was full lock (0.2 rad, about 3 g): lock-to-lock weaving.
-2. A steering rate limit (openpilot style) made it worse: its lag grows with the correction. Replaced by a short
-   low-pass filter (0 to 0.08 s by speed).
-3. A first PID measured the error per road segment, against a straight line through each link: the line stepped
-   sideways at every node and kicked the PID. It also handed the wheel back to the game at every junction node.
-4. The game itself moves every AI car one lane left or right at random every 4 to 7 nodes on straight stretches
-   (`PickNextNode*` at 0x427655, 0x42E962; 1 in 4 nodes at 0x427C7C). With the densified nodes that was a lane every
-   few seconds, and the mod's keep-right moved it back: 284 "back to the right" in 6 minutes on an empty map.
-
-5. A PID on that line (spring 1.2 rad/s) was soft in curves: the car went wide and took seconds to come back.
-6. The game's lane number kept dropping one lane (418 phantom "back to the right" changes in 7 minutes on an empty map,
-   the car not moving), and the controller followed it left while keep-right brought it back.
-
-Current design (commits d8dcc66 to the latest):
-
-- `NoRandomLaneChanges = 1`: the three `jne` are patched to `jmp`. The mod makes every lane change itself.
-- `LaneControllerSteer`: predictive steering on the car's own model, after
-  [ten-tenths](https://github.com/antoniooodev/ten-tenths) (single-track car in the road's frame: offset, heading
-  error, yaw rate, a curvature preview; no PID).
-  - Reference: a Catmull-Rom line through the lane point at every link (offset across the link's own direction, as
-    the game places lanes), sampled every ~3 m, extended 30 m back (`BuildLaneLine`, `SplineInto`).
-  - Each frame ~40 wheel angles are simulated 1.2 s ahead (24 steps of 0.05 s): yaw goes to
-    `gain * v tan(d) / (L + K v^2)` with a 0.2 s lag, capped by the grip the car has shown (`limits.txt`); heading
-    error and offset integrate against the line's curvature. A candidate is held 0.4 s, then follows the road's own
-    curvature. Cost: offset (and lateral speed) error, terminal x4, a small frame-rate-free wheel-change cost.
-  - `lkGain` (per vehicle) is learned while driving: the yaw the car really makes over what L/K say, on a steady wheel.
-  - A lane change uses the target lane's line with the S as where the car should be across over the 1.2 s.
-  - The racing line (racing drivers) is followed by the same predictive steering; pure pursuit only as a fallback.
-  - The game steers only into sharp turns (over 40 degrees within 1.5 s), without road data, or below 29 km/h
-    (blend to 47 km/h). Hand-overs are eased.
-  - While the controller drives, the game's lane is held to the lane the car is in (only the mod's lane changes move
-    it).
-- AutoTest counters: `lane controller ...` (frames, distance to the centre, why the game steered), `weaving (3 yaw-rate
-  reversals > 0.15 rad/s within 4 s, above 54 km/h)`, `game lane put back ...`.
-
-Results (Sultan, `alone`, Grove Street to Bayside):
-
-| Test | Steering | Result | Weaving (test car) | Off the centre (avg) |
+| Race / test | Car | Player | AI | Notes |
 |---|---|---|---|---|
-| 160701 | PID per segment | arrived 6.60 min, 0 collisions | (not measured) | 1.06 m |
-| 165953 | PID on the spline | arrived 6.85 min, 0 collisions | 3 | 0.78 m |
-| 170849 | predictive, first version | arrived 7.11 min, 0 collisions | 2 | 0.86 m |
+| 173316 | Infernus | 2.79 min | stuck | fell off a bridge, respawn loop under it |
+| 174918 | Infernus | 2.84 min | - | hit something on the SF bridge at 180 km/h, into the water |
+| 175951 | Bullet | 3.45 min | 4.25 min | player full gas 89% / braking 1%; AI 51% / 18% |
+| 180612 | Bullet | 3.44 min | 4.23 min | |
+| 181747 | Bullet, AI alone | | 4.06 min | junction turns + start fix |
+| 182318 | Bullet, AI alone | | 3.96 min | racers ignore lights; braking 13% (curve 9%) |
+| 183122 | Bullet, AI alone | | did not finish | aggressive steering + ghost gate; see the top |
 
-The user said the predictive version "already improved a lot". Test 170849 still had traffic by mistake (see below), so
-its "out of the lane" count (20,843 frames) includes other cars. Later fixes (lane changes measured against the S,
-candidates held 0.4 s, lighter wheel-change cost) are not measured yet.
+Where the AI loses to the player (race 180612, by 100 m bins): ~30 s in the first km (junction turns at 34 vs 70-85
+km/h; ~1 s of reverse at GO, both since fixed), then 2-3 s in many curves. The player steers ~10x more than the AI at
+130-220 km/h (p99 0.42 vs 0.043 rad at 130-170).
 
-Infernus test (in progress at handoff): model 411, driver `maximo` (max performance: ignores road speed, 95% of the
-measured grip, racing line, runs red lights at speed), no traffic.
+## Steering and lane keeping
 
-## Race against the AI (learning from the player)
+- The game steers by heading error with the same gain at every speed (lock-to-lock weaving at 170 km/h), and moved
+  every AI car a lane left/right at random every 4-7 nodes (`NoRandomLaneChanges = 1` patches 0x427655, 0x42E962,
+  0x427C7C `jne` -> `jmp`).
+- `LaneControllerSteer`: predictive steering on the car's own model, after
+  [ten-tenths](https://github.com/antoniooodev/ten-tenths): a Catmull-Rom lane-centre line (extended 30 m back), ~40
+  wheel angles simulated 1.2 s ahead (yaw lag 0.2 s, measured L/K, learned grip cap, curvature preview), held 0.4 s
+  then following the road's curvature; cost on offset and lateral speed plus a wheel-change cost. `lkGain` learned
+  while driving. Lane changes use the target lane's line with the S as the reference. The game steers only into sharp
+  turns (over 40 degrees within 1.5 s), without road data, or below 29 km/h. While the controller drives, the game's
+  lane is held to the lane the car is in.
+- Racing drivers (last commit, unproven): line error x4, wheel cost 15 (others 60), candidates +-0.32 rad, up to 0.45
+  rad of steering at speed (the game holds its AI to 0.2 from 126 km/h), ghost offset tolerated to 16 m.
+- Racing line (`RacingLine`) is off: it cut off the side of a bridge at 200 km/h twice.
+- Steering low-pass 0-0.08 s by speed (a rate limit made the weaving worse).
 
-`pythonw tools/AutoTestUI.pyw --car 411 --drivers maximo --notraffic --race --start` puts the player in a second
-Infernus beside the AI's (after MTA's race gamemode: grid, frozen 3-2-1 countdown with sounds, place/gap on screen,
-back on the road at the last good spot after a fall/roll/sink/8 s stuck, further back each time it repeats). Both cars
-are recorded every 0.1 s to `race.csv` in the test folder. The user chose this over installing MTA (MTA doesn't load
-ASI/modloader: the AI would have to be rewritten in Lua).
+## Speed (curves) for racing drivers
 
-`python tools/race_learn.py <race.csv> <model> <game scripts folder> --write` prints both drivers' curve speeds by
-radius and raises the model's learned grip to the player's median sideways g x 0.85 (game closed first: the mod
-rewrites `RealTrafficFix.limits.txt` every minute). The learned grip ceiling is now 3 g (was 1.6).
-
-First race (173316): the player arrived in 2.79 min (average 229 km/h, peaks 385, 2.2-3 g in curves); the AI took a
-ramp off a straight bridge at 203 km/h, fell into the canal and the old respawn (Teleport, which looks for the ground
-below) dropped it there 44 times. Infernus grip 1.18 -> 1.81 g from that race.
-
-Later races: the AI fell through the map away from the player (the game only loads IPLs/collision around the player:
-fixed with SET_LOAD_COLLISION_FOR_CAR_FLAG, AddIplsNeededAtPosn, AddCollisionNeededAtPosn and a hold until loaded),
-crashed on the bridge at (-462, 596) and went into a junction turn too fast (tight turns now use the junction grip share
-in the heading limit). Bullet vs Bullet (175951): player 3.45 min (full gas 89% of the time, braking 1%), AI 4.25 min
-(full gas 51%, braking 18%): the route's curve radius near junction nodes was read from a 12 m window on the node
-corners (a 220 m freeway curve as ~100 m); gentle bends near junction nodes now use the long window. Racing line off.
-
-## Other recent changes (still to confirm in game)
-
-- Yellow lights: decided at 3.5 to 2.5 m/s2 by aggression (it was inverted: calm drivers went through from 60 m).
-- Lane change timing: indicator 0.4 to 1.0 s, change 2.6 to 3.2 s, at most 9 degrees and 0.49 g.
-- The extra lanes (79 one-way stretches) are uninstalled: one in LS put cars on the pavement. The lane version of the
-  path files is kept in the scratchpad (`paths_lanes`); the backup without them is what's installed. To do: fix the
-  width measurement (pavement counted as asphalt?) before reinstalling.
-- `RealTrafficFix.steer.txt` (game scripts folder): learned turn model per car model. If a model learns a wrong
-  understeer (it happened with the old rate limit), edit its line back. Sandking: `495 3.22803 0.00010836 158 36`.
-
-## SUMO
-
-- `tools/sa_to_sumo.py` converts the game's road network; `tools/sumo_profiles.py` makes the mod's 5 driver profiles
-  x 5 car classes (handling.cfg, weighted by cargrp.dat) as a SUMO vTypeDistribution; `tools/sumo_compare.py`
-  compares runs. Install: `pip install eclipse-sumo`.
-- Result (3,000 identical trips): city time gap 1.5x gave the same time loss, -15% collisions and -40% emergency
-  braking. Keep-right, cooperation and junction gaps changed little. To do: try `CityGapFactor` 0.7 -> 1.05 in game.
+- Fast-curve grip boost capped at the learned grip; the road's curvature where the car is (from the lane line) in the
+  heading limit; an understeer aid (full lock, turning under 75% of the road: off the gas, braking).
+- Junction turns: radius also from the turn's angle (racers 16 m for 90 degrees, others 10 m), 90% of the grip for
+  racers (75% others), also for tight turns in the heading limit. Gentle bends near junction nodes use the long window
+  (a 12 m window on node corners read a 220 m curve as ~100 m).
+- Racers flat out (no jerk ramp, no speed-scaled ceiling; traction and stability control stay on), run red lights
+  without slowing for any light (cross traffic still slows them).
+- FORCED obstacle (a drop/wall from the ground under the sensors) only from the front rays and off the route: the side
+  rays past bridge edges made walls that braked racers on bridges.
 
 ## Open issues and next steps
 
-See the "a fazer" items in `docs/sensores.html`. The main ones:
+1. The last commit (see the top): rerun, check, revert parts if it's worse.
+2. The interchange at (2790, -413) and the junction at (1788-1792, 880-900): every test leaves the route there, and the
+   last one spun at (1788, 900). Look at the route and the lane line there.
+3. The AI should keep speed in curves like the player: compare `drive.csv` (AI) with `race.csv` (player) per 100 m;
+   where the ghost is on, the AI should be within ~5% of the player's speed.
+4. More races with the user, then `race_learn.py --write --ghost` from their best one per car.
+5. Traffic (non-racers): confirm the steering with traffic (Sandking test) and watch `weaving`, `lane controller`,
+   `game lane put back`. "Back to the right" fires hundreds of times per test, most phantom.
+6. From before: CityGapFactor 0.7 -> 1.05 (SUMO: -15% collisions at no cost), the extra lanes (uninstalled: one in LS
+   ran on the pavement; fix the width measurement), CARLA ideas 4-7, the FLA4 path format, dead-end "traps".
+7. `docs/sensores.html` is behind: add the race/ghost/steering items.
 
-1. Confirm the steering with traffic (Sandking test) and watch the `weaving`, `lane controller` and `game lane put back`
-   lines. Find what lowers the game's lane number (the hold hides it).
-2. Lane changes: "back to the right" fires hundreds of times per test; most are phantom (the car doesn't move).
-3. Off the route at (2803, -431) and (-997, 1275) in every Sultan test: the car takes a different way there.
-4. The Sultan hit something stopped on the road near (-486, 604) at 145 km/h with no traffic and fell off the bridge
-   (test 162908). Find what the "leader" at 9 km/h was.
-5. CityGapFactor 1.05 in game (SUMO says fewer crashes at no cost).
-6. Extra lanes: fix the measurement, reinstall.
-7. CARLA ideas 4-7 (path envelope, conflict point negotiation, leader lock, sensor rounds), the FLA4 path format,
-   and linking the dead-end "traps" in the network.
+## SUMO
+
+`tools/sa_to_sumo.py` (network), `tools/sumo_profiles.py` (the mod's driver profiles x car classes from
+handling.cfg/cargrp.dat), `tools/sumo_compare.py`. City time gap 1.5x: same time loss, -15% collisions, -40% emergency
+braking.
