@@ -19,6 +19,7 @@
 #include "CMessages.h"
 #include "CAudioEngine.h"
 #include "CColStore.h"
+#include "CIplStore.h"
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -277,7 +278,7 @@ static RaceSpot raceTrail[2][8];
 static int raceTrailHead[2] = {}, raceDepth[2] = {};
 static unsigned int raceLastRespawn[2] = {};
 static unsigned int raceBadSince[2] = {}, raceLastHud = 0;
-static int raceRespawns[2] = {};
+static int raceRespawns[2] = {}, raceHolds = 0;
 // Where the time goes: seconds moving with each speed limiter in charge, freeway / everything else (mod-driven, near the camera)
 static double limiterTime[2][NUM_LIMITERS] = {};
 static int routeMaxMinutes = 35;
@@ -1238,10 +1239,20 @@ void Update() {
                         }
                         // The game only loads the map's collision and road data around the player: the AI's car, left behind,
                         // fell through the road (z -56, test 174139). Both asked for wherever the AI's car is, every frame
+                        // The map's objects themselves (the IPLs: an elevated road isn't there at all away from the player) and
+                        // their collision; and until they are, the car is held (else it drops through the road)
                         if (raceMode && ci == 0) {
                             const CVector at = c.veh->GetPosition();
-                            CColStore::RequestCollision(at, 0);
+                            CIplStore::AddIplsNeededAtPosn(at);
+                            CColStore::AddCollisionNeededAtPosn(at);
                             ThePaths.SetPathsNeededAtPosition(at);
+                            static bool held = false;
+                            const bool loaded = CColStore::HasCollisionLoaded(at, 0);
+                            if (raceStart && !loaded != held) {
+                                held = !loaded;
+                                Command<COMMAND_FREEZE_CAR_POSITION>(c.handle, held ? 1 : 0);
+                                if (held) raceHolds++;
+                            }
                         }
                         if (raceMode && raceStart) {
                             const CVector p = c.veh->GetPosition();
@@ -1269,6 +1280,8 @@ void Update() {
                                 const RaceSpot& g = t.at ? t : raceGood[ci];
                                 // Exactly there (Teleport looks for the ground under it: under a bridge, the canal), with the ground
                                 // loaded first
+                                CIplStore::EnsureIplsAreInMemory(g.pos);
+                                CColStore::EnsureCollisionIsInMemory(g.pos);
                                 CStreaming::LoadSceneCollision(&g.pos);
                                 CWorld::Remove(c.veh);
                                 c.veh->SetHeading(g.heading);
@@ -1331,6 +1344,8 @@ void Update() {
                 if (*c.result) {
                     c.done = true;
                     c.doneMinutes = Minutes();
+                    if (raceMode && raceStart && &c == &tripCars[0])
+                        out << Format("  [RACE] AI held waiting for the map to load around it: %d times\n", raceHolds);
                     if (raceMode && raceStart)
                         out << Format("  [RACE] %s: %s in %.2f min from GO\n", c.label, c.result, c.doneMinutes - raceStartMinutes);
                     out << Format("  [%s] %s after %.2f min, %.2f km driven, %d collisions, %.0f m left\n", c.label, c.result,
