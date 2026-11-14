@@ -1053,6 +1053,7 @@ void Update() {
             tripCars[0].handle = carHandle;
             tripCars[0].driver = driverHandle;
             tripCars[0].veh = testCar;
+            weaveWatch = testCar;
             CVector back = pos - CVector(-std::sin(heading), std::cos(heading), 0.0f) * 14.0f;
             bool ground = false;
             float gz = FindGroundZ({ back.x, back.y, back.z + 3.0f }, &ground);
@@ -1426,8 +1427,11 @@ void Update() {
         out << Format("actuated lights: switched by the safety valve (a road red too long with someone waiting) %d\n", signalForcedCount);
         out << Format("joined signals (divided avenues, close junctions as one controller): %d, links inside them %d\n", signalClusterCount, (int)signalInternalLinks.size());
         out << Format("smooth lanes: steering on %d vehicle-frames\n", smoothLaneFrames);
-        out << Format("lane keeping at speed (PID to the lane centre): %d vehicle-frames, off the centre avg %.2f m, max %.2f m\n",
-            laneKeepFrames, laneKeepFrames ? laneKeepErrSum / laneKeepFrames : 0.0, laneKeepErrMax);
+        out << Format("lane controller (PID to the lane centre, keeping and changes): %d vehicle-frames, off the centre avg %.2f m, max %.2f m; the game's steering instead: no road data %d, sharp turn ahead %d, out of the lane %d, road data too short %d\n",
+            laneKeepFrames, laneKeepFrames ? laneKeepErrSum / laneKeepFrames : 0.0, laneKeepErrMax, laneKeepOff[0], laneKeepOff[1],
+            laneKeepOff[2], laneKeepOff[3]);
+        out << Format("weaving (3 yaw-rate reversals > 0.15 rad/s within 4 s, above 54 km/h): test car %d, all cars %d\n",
+            weaveEventsWatched, weaveEvents);
         out << Format("sensor hits on a car in another lane, not taken as the one ahead: %d\n", otherLaneHitCount);
         out << Format("route leader (mode %d): rays and route agree %d, route says other lane where the rays would brake %d, route says our lane where the rays would ignore it %d, not on the route %d\n",
             cfgRouteLeader, routeAgreeCount, routeOtherLaneRaysWouldBrake, routeInLaneRaysWouldIgnore, routeUnknownCount);
