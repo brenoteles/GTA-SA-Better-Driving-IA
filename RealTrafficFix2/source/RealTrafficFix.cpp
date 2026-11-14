@@ -232,7 +232,8 @@ public:
     unsigned int weaveSeen = 0;
     int lkMode = 0;                 // lane controller: 0 off, 1 keeping, 2 changing
     float lkGain = 1.0f;            // lane controller: the yaw the car really makes over what its turn model says
-    float lkPrevYaw = 0.0f;
+    float lkPrevYaw = 0.0f, lkPrevSteer = 0.0f;
+    unsigned int lkSteadySince = 0;
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
     unsigned char aidFlags = 0;   // eAidFlags
 
@@ -3425,6 +3426,8 @@ struct LaneLine {
     int n = 0;
 };
 
+static void SplineInto(const CVector2D* ctrl, int m, LaneLine& line);
+
 // The centre line of lane laneF along the path ahead, from the first link with road data up to the next gap: a
 // Catmull-Rom spline through the lane point at every link, sampled every ~3 m (straight lines between the link points
 // cut inside the curves and turned at each point: the direction, and the D term, jumped there)
@@ -3451,6 +3454,12 @@ static void BuildLaneLine(const ExtendedData& xdata, float laneF, LaneLine& line
         const CVector2D d = ctrl[2] - ctrl[1];
         ctrl[0] = ctrl[1] - d * (30.0f / std::max(d.Magnitude(), 0.001f));
     }
+    SplineInto(ctrl, m, line);
+}
+
+// A Catmull-Rom spline through the points, sampled every ~3 m
+static void SplineInto(const CVector2D* ctrl, int m, LaneLine& line) {
+    line.n = 0;
     auto add = [&](const CVector2D& pt) {
         if (line.n >= MAX_LANE_LINE) return;
         line.cum[line.n] = line.n ? line.cum[line.n - 1] + (pt - line.pts[line.n - 1]).Magnitude() : 0.0f;
@@ -3498,9 +3507,10 @@ static void ProjectOnLine(const LaneLine& line, const CVector2D& pos, float& alo
 // Steering (> 0: left) to follow lane laneF; refRate / refAccel: the lane's own sideways speed and acceleration (m/s,
 // m/s2, > 0 to the right) while it moves in a lane change. NAN where the game steers (why: see laneKeepOff)
 static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed, float laneF,
-    const std::function<float(float)>& refOffset, int& why, float* offsetOut = nullptr) {
-    LaneLine line;
-    BuildLaneLine(xdata, laneF, line);
+    const std::function<float(float)>& refOffset, int& why, float* offsetOut = nullptr, const LaneLine* given = nullptr) {
+    LaneLine own;
+    if (!given) BuildLaneLine(xdata, laneF, own);
+    const LaneLine& line = given ? *given : own;
     if (line.n < 3) { why = 0; return NAN; }
     const CVector2D pos = veh->GetPosition().To2D();
     float s0, offset;
@@ -3519,9 +3529,11 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     if (s0 < 0.1f && CVector2D::Dot(pos - line.pts[0], dir) < -3.0f) { why = 0; return NAN; } // the line starts ahead of it
     const float y = CVector2D::Dot(pos - LinePointAt(line, s0), rightDir);
     if (offsetOut) *offsetOut = y;
-    if (std::abs(y) > 0.75f * LANE_WIDTH) { why = 2; return NAN; }
-    laneKeepErrSum += std::abs(y);
-    laneKeepErrMax = std::max(laneKeepErrMax, std::abs(y));
+    // Off where it should be now (in a lane change: on the S, not the new lane: it handed every change back to the game)
+    const float yOff = y - (refOffset ? refOffset(0.0f) : 0.0f);
+    if (std::abs(yOff) > 0.75f * LANE_WIDTH) { why = 2; return NAN; }
+    laneKeepErrSum += std::abs(yOff);
+    laneKeepErrMax = std::max(laneKeepErrMax, std::abs(yOff));
     why = -1;
 
     // Predictive steering on the car's own model (after ten-tenths: a single-track car in the road's frame, driven from
@@ -3565,8 +3577,12 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     // Learning the gain: steady, not sliding, well inside the grip
     {
         const float model = v * std::tan(prevSteer) / (L + K * v * v);
-        if (std::abs(model) > 0.05f && GetSlipAngle(veh) < 0.1f && std::abs(model * v) < 0.6f * grip &&
-            std::abs(yawNow - xdata.lkPrevYaw) < 0.5f * dt && (model > 0.0f) == (yawNow > 0.0f)) {
+        // (the wheel steady 0.3 s: while it turns the yaw lags it and the ratio read low; up to hard curves, where the
+        // tyres give less)
+        if (std::abs(prevSteer - xdata.lkPrevSteer) > 0.004f) xdata.lkSteadySince = CTimer::m_snTimeInMilliseconds;
+        xdata.lkPrevSteer = prevSteer;
+        if (std::abs(model) > 0.05f && GetSlipAngle(veh) < 0.12f && std::abs(model * v) < 0.9f * grip &&
+            CTimer::m_snTimeInMilliseconds - xdata.lkSteadySince > 300 && (model > 0.0f) == (yawNow > 0.0f)) {
             const float ratio = std::clamp(yawNow / model, 0.4f, 1.3f);
             xdata.lkGain += (ratio - xdata.lkGain) * std::min(dt / 1.0f, 1.0f);
         }
@@ -3593,24 +3609,32 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     const float ffCurv = curvAt[5];
     const float dFF = std::atan(ffCurv * (L + K * v * v) / std::max(xdata.lkGain, 0.4f));
     float best = prevSteer, bestCost = 1e30f;
+    // A candidate is held 0.4 s, then the wheel follows the road's own curvature: 'correct now, then drive on' (one angle
+    // held 1.2 s only allowed small corrections that just met the line at the end: it went wide in curves, Gemini)
+    float ffAt[STEPS];
+    for (int i = 0; i < STEPS; i++)
+        ffAt[i] = std::clamp(std::atan(curvAt[i] * (L + K * v * v) / std::max(xdata.lkGain, 0.4f)), -maxSteer, maxSteer);
+    const float frameScale = std::clamp(dt / 0.033f, 0.3f, 3.0f); // the wheel-change cost per second, not per frame
     auto evaluate = [&](float d) {
         d = std::clamp(d, -maxSteer, maxSteer);
         float e = -y, psi = headErr, r = yawNow, cost = 0.0f;     // e: > 0 left of the line
         for (int i = 0; i < STEPS; i++) {
-            const float rss = steadyYaw(d, v);
-            r += (rss - r) * (SIM_DT / 0.2f);
+            const float t = SIM_DT * (i + 1);
+            r += (steadyYaw(t <= 0.4f ? d : ffAt[i], v) - r) * (SIM_DT / 0.2f);
             psi += (r - v * curvAt[i]) * SIM_DT;
             e += v * std::sin(psi) * SIM_DT;
-            const float err = e + refAt(SIM_DT * (i + 1));                  // ref is right-positive
+            const float ref = refAt(t);                                                // right-positive
+            const float err = e + ref;
+            const float latErr = v * std::sin(psi) + (ref - refAt(t - SIM_DT)) / SIM_DT; // speed across vs the S's
             const float w = i == STEPS - 1 ? 4.0f : 1.0f;
-            cost += w * (err * err + 0.15f * (v * psi) * (v * psi) * SIM_DT * SIM_DT * 25.0f);
+            cost += w * (err * err + 0.09f * latErr * latErr);
         }
         const float change = d - prevSteer;
-        cost += 400.0f * change * change * (1.0f + v / 20.0f);
+        cost += 60.0f * change * change * (1.0f + v / 30.0f) * frameScale;
         if (cost < bestCost) { bestCost = cost; best = d; }
     };
     for (int k = -8; k <= 8; k++) evaluate(dFF + k * 0.02f);
-    for (int k = -3; k <= 3; k++) evaluate(prevSteer + k * 0.006f);
+    for (int k = -6; k <= 6; k++) evaluate(prevSteer + k * 0.01f);
     // A finer look around the best
     const float coarse = best;
     for (int k = -4; k <= 4; k++) evaluate(coarse + k * 0.005f);
@@ -3905,7 +3929,21 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     float step = CTimer::ms_fTimeStep;
     xdata.lineBlend = useLine ? std::min(xdata.lineBlend + 0.05f * step, 1.0f) : std::max(xdata.lineBlend - 0.25f * step, 0.0f);
     if (xdata.lineBlend > 0.0f) {
-        float lineSteer = GetRacingLineSteer(veh, xdata, speed);
+        // The racing line with the predictive steering as well (pure pursuit 30 m ahead at most was under half a second at
+        // racing speeds: weaving); pure pursuit only where it can't
+        float lineSteer = NAN;
+        if (xdata.lineCount >= 3) {
+            CVector2D ctrl[MAX_LINE_POINTS + 1];
+            const int m = std::min(xdata.lineCount, MAX_LINE_POINTS);
+            for (int i = 0; i < m; i++) ctrl[i + 1] = xdata.line[i].To2D();
+            const CVector2D d0 = ctrl[2] - ctrl[1];
+            ctrl[0] = ctrl[1] - d0 * (30.0f / std::max(d0.Magnitude(), 0.001f)); // 30 m back: the car may be past its start
+            LaneLine racing;
+            SplineInto(ctrl, m + 1, racing);
+            int why = -1;
+            if (racing.n >= 3) lineSteer = LaneControllerSteer(veh, xdata, speed, 0.0f, nullptr, why, nullptr, &racing);
+        }
+        if (!std::isfinite(lineSteer)) lineSteer = GetRacingLineSteer(veh, xdata, speed);
         *steer += (lineSteer - *steer) * xdata.lineBlend;
     }
 
@@ -3962,8 +4000,9 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
             // test 165953), and the controller followed it left while keep-right brought it back. Only the mod's own
             // lane changes move it now
             const int lanesHere = xdata.pathCount > 2 && xdata.pathLinkOk[1] ? xdata.pathLanes[1] : 0;
-            if (lanesHere > 0 && xdata.lkWeight >= 1.0f) {
-                const int held = std::clamp(static_cast<int>(std::floor(xdata.lkLaneF + 0.5f)), 0, lanesHere - 1);
+            const float nearest = std::floor(xdata.lkLaneF + 0.5f);
+            if (lanesHere > 0 && xdata.lkWeight >= 1.0f && std::abs(xdata.lkLaneF - nearest) < 0.15f) { // settled in a lane
+                const int held = std::clamp(static_cast<int>(nearest), 0, lanesHere - 1);
                 if (held != veh->m_autoPilot.m_nNextLane) {
                     veh->m_autoPilot.m_nNextLane = static_cast<char>(held);
                     laneHoldCount++;
@@ -7244,7 +7283,8 @@ public:
     // The watched vehicle also gets its sensors, route and a second line
     static void DrawCompactDebug(CVehicle* vehicle, ExtendedData& xdata, bool focus) {
         static const CRGBA profileColors[NUM_PROFILES] = { CRGBA(110, 200, 255, 255), CRGBA(120, 255, 120, 255), CRGBA(255, 255, 255, 255),
-            CRGBA(255, 230, 60, 255), CRGBA(255, 150, 40, 255), CRGBA(255, 60, 60, 255), CRGBA(230, 90, 255, 255) };
+            CRGBA(255, 230, 60, 255), CRGBA(255, 150, 40, 255), CRGBA(255, 60, 60, 255), CRGBA(230, 90, 255, 255),
+            CRGBA(255, 140, 200, 255), CRGBA(60, 255, 210, 255) }; // wheelspin, alone (they were left black: unreadable)
         const unsigned int now = CTimer::m_snTimeInMilliseconds;
         CVector modelMin, modelMax;
         GetEntityDimensions(vehicle, modelMin, modelMax);

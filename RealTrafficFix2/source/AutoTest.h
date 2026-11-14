@@ -422,7 +422,7 @@ void Init(const std::string& moduleDir) {
             { "calm", PROFILE_CALM, "CALM" }, { "safe", PROFILE_SAFE, "SAFE" }, { "normal", PROFILE_NORMAL, "NORMAL" },
             { "fast", PROFILE_FAST, "FAST" }, { "aggressive", PROFILE_AGGRESSIVE, "AGGRESSIVE" },
             { "fleeing", PROFILE_FLEEING, "FLEEING" }, { "wheelspin", PROFILE_WHEELSPIN, "WHEELSPIN" },
-            { "alone", PROFILE_ALONE, "ALONE" } };
+            { "alone", PROFILE_ALONE, "ALONE" }, { "max", PROFILE_MAX_PERFORMANCE, "MAX" } };
         std::string want = ini.ReadString("AutoTest", "TripProfile", "normal");
         for (const auto& d : drivers) if (want == d.key) { tripCars[0].profile = d.profile; tripCars[0].label = d.label; }
     }
@@ -977,8 +977,12 @@ void Update() {
     }
 
     if (noTraffic) {
-        // No cars made by the game; the random ones there are removed (off screen, the way the game does) every 2 s
+        // No cars made by the game nor by the mod's spawner (every frame: the mod's ini, read after the test's, switched the
+        // spawner back on and it made ~40 cars a minute, removed again off screen); the random ones there are removed (off
+        // screen, the way the game does) every 2 s. The test car is a mission car: not counted in the limit
         Command<COMMAND_SET_CAR_DENSITY_MULTIPLIER>(0.0f);
+        cfgAmbientSpawn = false;
+        CCarCtrl::MaxNumberOfCarsInUse = 0;
         static unsigned int lastCarClear = 0;
         if (now - lastCarClear > 2000) {
             lastCarClear = now;
