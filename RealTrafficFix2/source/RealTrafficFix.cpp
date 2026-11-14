@@ -3530,6 +3530,20 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     const float lf = std::clamp(0.5f * v, 8.0f, 30.0f), lp = std::clamp(1.5f * v, 25.0f, 80.0f);
     const float end = line.cum[line.n - 1];
     if (s0 + 2.0f * lf > end) { why = 3; return NAN; }
+    // The road's curve over the next ~0.5 s, kept for the speed limit even where the game steers (junction turns: the
+    // yaw-based limit came late there and the car sped up mid-turn)
+    {
+        const float h = std::clamp(0.4f * v, 4.0f, 12.0f);
+        float c = 0.0f;
+        for (int i = 1; i <= 10; i++) {
+            const float sAt = std::min(s0 + v * 0.05f * i, end - h);
+            const CVector2D p0 = LinePointAt(line, sAt - h), p1 = LinePointAt(line, sAt), p2 = LinePointAt(line, sAt + h);
+            const float a = (p1 - p0).Magnitude(), b = (p2 - p1).Magnitude(), cc = (p2 - p0).Magnitude();
+            if (a > 1.0f && b > 1.0f && cc > 1.0f) c = std::max(c, std::abs(2.0f * CVector2D::Cross(p1 - p0, p2 - p1) / (a * b * cc)));
+        }
+        xdata.lkRoadCurv = c;
+        xdata.lkCurvFrame = frameCounter;
+    }
     // The line's direction here (over +-3 m: no jump at its corners) and further on: a sharp turn is the game's
     const CVector2D t0 = LinePointAt(line, s0 + 3.0f) - LinePointAt(line, s0 - 3.0f);
     const CVector2D tFar = LinePointAt(line, std::min(s0 + lp, end)) - LinePointAt(line, std::min(s0 + lp, end) - 6.0f);
@@ -3614,10 +3628,6 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
         }
     }
     {
-        float c = 0.0f;
-        for (int i = 0; i < 10; i++) c = std::max(c, std::abs(curvAt[i]));
-        xdata.lkRoadCurv = c;
-        xdata.lkCurvFrame = frameCounter;
         const float roadHere = std::abs(curvAt[1]), turning = std::abs(yawNow) / v;
         xdata.lkUndersteer = v > 15.0f && roadHere > 0.003f && std::abs(prevSteer) > 0.95f * maxSteer && turning < 0.75f * roadHere &&
             (prevSteer > 0.0f) == (curvAt[1] > 0.0f);
