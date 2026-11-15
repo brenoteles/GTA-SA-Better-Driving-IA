@@ -87,6 +87,9 @@ struct Settings {
     // mode gt4: how hard the speed profile accelerates (g); mode mpc: how far ahead it simulates (s), the weight of the
     // heading at the horizon
     float gtAccel = 0.6f, mpcHorizon = 0.8f, mpcWeight = 1.0f;
+    // rpp: how much a bend ahead shortens the look-ahead; blend: the share of pursuit (the rest the kinematic law);
+    // gap: how much its own line ahead pulls the chosen gap
+    float rppCurv = 2.0f, blendW = 0.5f, gapBias = 0.5f;
     std::vector<float> nn;                            // mode neural: its weights (the GA's genome)
     // ABS: the pedal at AbsMargin of the wheels' lock point, x the friction circle's share by AbsCircle (0 = ignore the
     // curve, 1 = all of it); a lock takes AbsDrop off, AbsRecover a frame back
@@ -208,6 +211,9 @@ static void ReadSettings() {
     f(st, "MpcHorizon", s.mpcHorizon);
     f(st, "MpcWeight", s.mpcWeight);
     f(sp, "GtAccel", s.gtAccel);
+    f(st, "RppCurv", s.rppCurv);
+    f(st, "BlendW", s.blendW);
+    f(st, "GapBias", s.gapBias);
     f(sp, "AbsMargin", s.absMargin);
     f(sp, "AbsDrop", s.absDrop);
     f(sp, "AbsRecover", s.absRecover);
@@ -290,6 +296,8 @@ struct Course {
     std::vector<float> vcap, vsud; // m/s at each point: a posted limit (planned for), a sudden one (seen only there)
     std::vector<float> wind;       // m/s2 of crosswind at each point (> 0: pushing to the course's left)
     std::vector<std::pair<float, std::string>> sections; // track: where each named part starts (m)
+    struct Obstacle { int i, model; float lat; };
+    std::vector<Obstacle> obst;    // track piece O: a bump or a kicker at point i, lat x the half width to the left
     bool closed = false;
     float length = 0.0f;
     float halfWidth = 0.0f;        // the corridor: its edges this far each side of the points (0: none)
@@ -361,6 +369,7 @@ struct Runner {
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake)
+    std::vector<int> obstacles;     // its lane's obstacle objects (handles)
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
     float tcBand[5] = { 1, 1, 1, 1, 1 };  // ... the gas its TC lets through in each kind of curve
     float absLearn = 1.0f;                // ... and the brake pedal its ABS allows
@@ -459,7 +468,7 @@ static void Geometry(Course& c) {
 static void OwnLine() {
     const int n = static_cast<int>(course.p.size());
     if (course.halfWidth <= 0.0f || n < 50 || (cfg.lineBias == 0.0f && cfg.lineCut == 0.0f) || (human && R == runners)) return;
-    const float room = std::max(course.halfWidth - R->bodyHalfW - 0.1f, 0.0f);
+    const float room = std::max(course.halfWidth - R->bodyHalfW - 0.05f, 0.0f);
     std::vector<float> o(n), t(n);
     for (int i = 0; i < n; i++) {
         float k = 0.0f;
@@ -607,6 +616,8 @@ static void BuildCourse(const TestDef& d) {
         //   B km/h m                    a sudden brake: down to km/h over the next m, unseen until the car is there
         //   X m/s2 m                    crosswind over the next m: a sideways push (> 0 to the left) the steering must
         //                               correct, like a gust on a motorway
+        //   O bump|kicker lateral       an obstacle: a one-side bump (a wheel goes over it) or a kicker across the
+        //                               road (the car hops), lateral x the half width to the left
         //   N name                      the name of the part that starts here (HUD, logs)
         CVector2D at(0.0f, 0.0f);
         float h = 0.0f;
@@ -635,6 +646,14 @@ static void BuildCourse(const TestDef& d) {
             if (kind == 'N') {
                 const size_t a = rest.find_first_not_of(" \t"), b = rest.find_last_not_of(" \t");
                 if (a != std::string::npos) names.emplace_back(static_cast<int>(local.size()) - 1, rest.substr(a, b - a + 1));
+            }
+            else if (kind == 'O') {
+                // O bump|kicker lateral: an obstacle here (tools/make_gridmap.py's models), across the road at lateral
+                // x the half width (> 0 left)
+                const auto w = ParseWords(rest);
+                if (!w.empty())
+                    course.obst.push_back({ static_cast<int>(local.size()) - 1, w[0] == "kicker" ? 19402 : 19401,
+                        w.size() > 1 ? static_cast<float>(atof(w[1].c_str())) : 0.0f });
             }
             else if ((kind == 'V' || kind == 'B' || kind == 'X') && nums.size() >= 2)
                 zones.push_back({ static_cast<int>(local.size()) - 1, nums[1], nums[0], kind });
@@ -775,6 +794,29 @@ static void Log(const std::string& s) {
     if (summary.is_open()) { summary << s << "\n"; summary.flush(); }
 }
 
+// The road's obstacles on this car's lane, once (static objects, the same on every lane)
+static void SpawnObstacles() {
+    const Course& rd = R->road;
+    const int n = static_cast<int>(rd.p.size());
+    if (!R->obstacles.empty() || rd.obst.empty() || n < 2) return;
+    for (int m : { 19401, 19402 })
+        if (!Command<COMMAND_HAS_MODEL_LOADED>(m)) { Command<COMMAND_REQUEST_MODEL>(m); Command<COMMAND_LOAD_ALL_MODELS_NOW>(); }
+    for (const auto& o : rd.obst) {
+        const int i = std::clamp(o.i, 0, n - 1);
+        const float h = rd.head[i];
+        const CVector2D q = rd.p[i] + CVector2D(-std::sin(h), std::cos(h)) * (o.lat * rd.halfWidth);
+        int handle = -1;
+        Command<COMMAND_CREATE_OBJECT>(o.model, q.x, q.y, R->baseZ, &handle);
+        if (handle < 0) continue;
+        Command<COMMAND_SET_OBJECT_HEADING>(handle, h * 180.0f / 3.14159265f - 90.0f);
+        R->obstacles.push_back(handle);
+    }
+}
+static void RemoveObstacles() {
+    for (int h : R->obstacles) Command<COMMAND_DELETE_OBJECT>(h);
+    R->obstacles.clear();
+}
+
 static void RemoveCar() {
     if (carHandle >= 0 && car && CPools::ms_pVehiclePool->IsObjectValid(car)) {
         CPlayerPed* player = FindPlayerPed();
@@ -802,7 +844,7 @@ static void OpenRunDir() {
 }
 
 static void Restart() {
-    forRunners { RemoveCar(); if (csv.is_open()) csv.close(); }
+    forRunners { RemoveCar(); RemoveObstacles(); if (csv.is_open()) csv.close(); }
     R = runners;
     if (trace.is_open()) trace.close();
     courseWritten = false;
@@ -1062,6 +1104,56 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
             if (cost < bestCost) { bestCost = cost; d = dc; lookPoint = x; }
         }
     }
+    else if (cfg.mode == "rpp" || cfg.mode == "blend" || cfg.mode == "gap") {
+        // Three relatives of pure pursuit (the one that won so far: they start from its genes)
+        const float ld0 = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
+        auto pursuitTo = [&](float ld) {
+            const CVector2D tp = course.p[Advance(i, ld)], rel = tp - pos;
+            lookPoint = tp;
+            return std::atan2(2.0f * L * std::sin(std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd))), ld);
+        };
+        if (cfg.mode == "rpp") {
+            // Regulated Pure Pursuit (ROS 2 Nav2): the look-ahead shortened where the line bends within it (RppCurv)
+            float kMax = 0.0f;
+            for (float a = 0.0f; a <= ld0; a += 2.0f) kMax = std::max(kMax, std::abs(course.curv[Advance(i, a)]));
+            d = pursuitTo(std::max(0.5f * cfg.lookMin, ld0 / (1.0f + cfg.rppCurv * kMax * ld0))) * cfg.gain;
+        }
+        else if (cfg.mode == "blend") {
+            // pursuit and the kinematic law (feedforward of the curvature, the error as a damped spring) together
+            const float dp = pursuitTo(ld0) * cfg.gain;
+            const CVector2D rear = pos + fwd * rearAxleY;
+            const OnCourse oc = Project(rear, NearestIndex(rear, i, 40));
+            const int ahead = Advance(oc.i, cfg.preview * vv + oc.frac * 0.5f);
+            const float wn = cfg.bandwidth;
+            const float k = course.curv[ahead] - wn * wn / (vv * vv) * oc.offset - 2.0f * cfg.damping * wn / vv * std::sin(WrapPi(carHead - oc.head));
+            d = cfg.blendW * dp + (1.0f - cfg.blendW) * std::atan(L * k);
+        }
+        else {
+            // Follow-the-Gap (F1TENTH): rays every 5 degrees over +-60, each as far as the road goes before an edge;
+            // the deepest, pulled towards its own line ahead by GapBias, is where it steers (the whole width is its)
+            const CVector2D tp = course.p[Advance(i, ld0)], rel = tp - pos;
+            const float aLine = std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd));
+            const Course& rd = R->road;
+            const float half = rd.halfWidth > 0.0f ? rd.halfWidth : 2.0f;
+            float bestScore = -1e9f, bestA = aLine, bestD = ld0;
+            for (float deg = -60.0f; deg <= 60.0f; deg += 5.0f) {
+                const float a = deg * 3.14159265f / 180.0f, ha = carHead + a;
+                const CVector2D dir(std::cos(ha), std::sin(ha));
+                float dist = 60.0f;
+                int hint = nearIdx;
+                for (float t = 2.0f; t <= 60.0f; t += 2.0f) {
+                    const CVector2D pt = pos + dir * t;
+                    hint = NearestIndexIn(rd, pt, hint, 10);
+                    if (std::abs(ProjectIn(rd, pt, hint).offset) > half - 0.5f * R->bodyHalfW) { dist = t; break; }
+                }
+                const float score = dist / 60.0f - cfg.gapBias * std::abs(a - aLine);
+                if (score > bestScore) { bestScore = score; bestA = a; bestD = dist; }
+            }
+            const float ld = std::max(std::min(bestD, 1.5f * ld0), cfg.lookMin);
+            d = std::atan2(2.0f * L * std::sin(bestA), ld);
+            lookPoint = pos + CVector2D(std::cos(carHead + bestA), std::sin(carHead + bestA)) * ld;
+        }
+    }
     else { // pure pursuit
         const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
         const CVector2D tp = course.p[Advance(i, ld)];
@@ -1187,7 +1279,12 @@ static void Control(CVehicle* v) {
         if (e < -1.0f) brake = std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f);
     }
     // mode neural: its own pedal (the speed plan is not its)
-    if (!openLoop && cfg.mode == "neural") { gas = std::max(R->nnPedal, 0.0f); brake = std::max(-R->nnPedal, 0.0f); }
+    if (!openLoop && cfg.mode == "neural") {
+        gas = std::max(R->nnPedal, 0.0f);
+        brake = std::max(-R->nnPedal, 0.0f);
+        // (below 18 km/h a launch: its teachers had nothing slower, and it never left the start)
+        if (speed < 5.0f) { gas = std::max(gas, 0.8f); brake = 0.0f; }
+    }
     const float brakeAsked = brake;
     if (!openLoop && cfg.abs && brake > 0.0f) {
         // No ABS in GTA: a wheel whose brake (brakeDecel x pedal x 2 x bias) passes its adhesion (adhesive x tractionMult
@@ -1431,24 +1528,27 @@ namespace GA {
 // (uses: the modes that read the gene, empty = all: only those genes mutate)
 struct GeneDef { const char* sec; const char* key; float Settings::* field; float lo, hi; const char* uses; };
 static const GeneDef kGenes[] = {
-    { "Steer", "Bandwidth", &Settings::bandwidth, 0.5f, 4.0f, "kinematic gt4" },
-    { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f, "kinematic gt4" },
-    { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley gt4" },
+    { "Steer", "Bandwidth", &Settings::bandwidth, 0.5f, 4.0f, "kinematic gt4 blend" },
+    { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f, "kinematic gt4 blend" },
+    { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley gt4 blend" },
     // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
-    { "Steer", "LookaheadTime", &Settings::lookTime, 0.0f, 1.5f, "pursuit mod" }, // (mod: its fallback)
-    { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
+    { "Steer", "LookaheadTime", &Settings::lookTime, 0.0f, 1.5f, "pursuit mod rpp blend gap" }, // (mod: its fallback)
+    { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod rpp blend gap" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
-    { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod" },
+    { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod rpp blend" },
     { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f, "" },
     { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f, "" }, // curve speeds: share of the AI grip formula
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
     { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
     { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "" },  // its own line: to one side of the road
-    { "Steer", "LineCut", &Settings::lineCut, -0.5f, 1.0f, "" },    // ... into the inside of the curves
+    { "Steer", "LineCut", &Settings::lineCut, -1.0f, 1.0f, "" },    // ... into the inside of the curves (< 0: wide)
     { "Steer", "MpcHorizon", &Settings::mpcHorizon, 0.3f, 2.0f, "mpc" }, // mpc: how far ahead it simulates (s)
     { "Steer", "MpcWeight", &Settings::mpcWeight, 0.0f, 5.0f, "mpc" },   // ... the weight of the heading there
     { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4" },      // gt4: its profile's acceleration (g)
+    { "Steer", "RppCurv", &Settings::rppCurv, 0.0f, 10.0f, "rpp" },     // rpp: a bend ahead shortens the look-ahead
+    { "Steer", "BlendW", &Settings::blendW, 0.0f, 1.0f, "blend" },      // blend: the share of pursuit
+    { "Steer", "GapBias", &Settings::gapBias, 0.0f, 3.0f, "gap" },      // gap: the pull of its own line
     { "Speed", "GripTight", &Settings::gripTight, 0.35f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this (from 0.35: 24 of 60 at 0.6)
     { "Speed", "GripFast", &Settings::gripFast, 0.6f, 1.6f, "" },   // ... in fast ones (>= 150 m)
     { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns curves, ABS and TC itself
@@ -1495,6 +1595,8 @@ static float N01() { return std::normal_distribution<float>(0.0f, 1.0f)(rng); }
 static int Pick(int n) { return std::uniform_int_distribution<int>(0, std::max(n - 1, 0))(rng); }
 static int ModeIndex(const std::string& m) {
     for (size_t i = 0; i < modes.size(); i++) if (modes[i] == m) return static_cast<int>(i);
+    // (an algorithm taken out of Modes: pursuit if there)
+    for (size_t i = 0; i < modes.size(); i++) if (modes[i] == "pursuit") return static_cast<int>(i);
     return 0;
 }
 static bool Uses(int gene, int mode) {
@@ -2135,7 +2237,7 @@ void Update() {
         return;
 
     case NEXT_CAR:
-        forRunners RemoveCar();
+        forRunners { RemoveCar(); RemoveObstacles(); }
         R = runners;
         carIdx++;
         testIdx = 0;
@@ -2163,6 +2265,7 @@ void Update() {
             BuildCourse(*curTest);
             car = MakeCar(curModel);
             if (!car) { Log(Format("model %d: could not create the car", curModel)); state = NEXT_CAR; return; }
+            SpawnObstacles();
         }
         R = runners;
         state = START_RUN;
@@ -2503,7 +2606,10 @@ static void DrawHud() {
         Box(x, y, 6.0f, 404.0f, CRGBA(175, 110, 255, 255));
         Text(x + 20.0f, y + 8.0f, "ALGORITMO GENETICO", 1.0f, kWhite, 0, FONT_MENU);
         Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
-        if (course.halfWidth > 0.0f)
+        if (course.halfWidth > 0.0f && GA::edgePenalty <= 0.0f)
+            Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x s fora da pista (%.0f m): dentro dela, qualquer linha", GA::offPenalty,
+                2.0f * course.halfWidth), 0.66f, kDim);
+        else if (course.halfWidth > 0.0f)
             Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x m.s a menos de %.1f m da borda + %.0f x s fora da pista (%.0f m)",
                 GA::edgePenalty, edgeComfortGA, GA::offPenalty, 2.0f * course.halfWidth), 0.66f, kDim);
         else Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x desvio medio + %.0f x s fora de %.0f m", GA::meanPenalty, GA::offPenalty, offLimitGA), 0.68f, kDim);

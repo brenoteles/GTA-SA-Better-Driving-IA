@@ -46,12 +46,13 @@ RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3),
           'GripTight': (0.35, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4), 'CruiseGas': (0.0, 0.4),
           'AbsMargin': (0.5, 1.2), 'AbsDrop': (0.02, 0.4), 'AbsRecover': (0.01, 0.2), 'AbsCircle': (0.0, 1.0),
           'TcSlip': (0.03, 1.0), 'TcMinGas': (0.0, 1.0), 'TcDrop': (0.0, 0.3), 'TcRecover': (0.01, 0.1),
-          'TcCircle': (0.0, 1.0), 'LineBias': (-1.0, 1.0), 'LineCut': (-0.5, 1.0),
-          'MpcHorizon': (0.3, 2.0), 'MpcWeight': (0.0, 5.0), 'GtAccel': (0.2, 1.2)}
+          'TcCircle': (0.0, 1.0), 'LineBias': (-1.0, 1.0), 'LineCut': (-1.0, 1.0),
+          'MpcHorizon': (0.3, 2.0), 'MpcWeight': (0.0, 5.0), 'GtAccel': (0.2, 1.2), 'RppCurv': (0.0, 10.0),
+          'BlendW': (0.0, 1.0), 'GapBias': (0.0, 3.0)}
 # (genes a generation did not have yet: the value they had before they were genes)
 DEFAULTS = {'GripTight': 1.0, 'GripFast': 1.0, 'LearnRate': 0.0, 'CruiseGas': 0.15, 'AbsMargin': 0.9, 'AbsDrop': 0.15,
             'AbsRecover': 0.05, 'AbsCircle': 1.0, 'TcSlip': 0.08, 'TcMinGas': 0.15, 'TcDrop': 0.1, 'TcRecover': 0.03,
-            'TcCircle': 1.0, 'LineBias': 0.0, 'LineCut': 0.0, 'MpcHorizon': 0.8, 'MpcWeight': 1.0, 'GtAccel': 0.6}
+            'TcCircle': 1.0, 'LineBias': 0.0, 'LineCut': 0.0, 'MpcHorizon': 0.8, 'MpcWeight': 1.0, 'GtAccel': 0.6, 'RppCurv': 2.0, 'BlendW': 0.5, 'GapBias': 0.5}
 GENES = list(RANGES)
 
 SCHEMA = """
@@ -277,9 +278,9 @@ def ask_gemini(c, g0, g1):
         'Voce revisa um algoritmo genetico que ajusta o controle de direcao/velocidade de carros da IA do GTA San Andreas '
         'numa pista de testes (40 carros por geracao no mesmo circuito de 5,1 km). A pista e uma faixa de mao unica de 4 m (transito): '
         'o carro deve manter a carroceria inteira entre as duas bordas, a linha central so guia; o objetivo nao e o mais '
-        'rapido, e o que fica com folga dentro da pista e ainda assim e rapido. Pontuacao (menor e melhor): tempo + 5 x '
-        'm.s com a carroceria a menos de 0,3 m da borda + 40 x segundos com a carroceria fora da pista (o desvio do centro '
-        'nao conta). Cada cerebro tem a propria linha dentro da faixa (genes LineBias, LineCut); ABS e TC ficam fixos durante a volta. Algoritmos: kinematic, stanley, pursuit, mod, gt4 (linha e perfil de velocidade calculados antes, estilo Gran Turismo 4), mpc (simula 15 angulos de volante a frente); cada um tem ao menos 8 carros (ilhas, MinPerMode) e evolui entre os seus. NAO altere nenhum arquivo: so leia e '
+        'rapido, e o que fica com folga dentro da pista e ainda assim e rapido. Pontuacao (menor e melhor, como na F1): tempo + 40 x '
+        'segundos com a carroceria fora da pista; dentro dela qualquer linha vale, aberta ou fechada (o desvio do centro '
+        'nao conta). Cada cerebro tem a propria linha dentro da faixa (genes LineBias, LineCut); ABS e TC ficam fixos durante a volta. Algoritmos: kinematic, stanley, pursuit, mod, neural (rede 18-10-2, pesos evoluidos, iniciada por imitacao), rpp (Regulated Pure Pursuit), blend (pursuit + lei cinematica), gap (Follow-the-Gap entre as bordas); gt4 e mpc foram retirados (lentos/ruins); cada algoritmo tem ao menos 6 carros (ilhas, MinPerMode) e evolui entre os seus. A pista tem lombadas de um lado e rampas (O no ini). NAO altere nenhum arquivo: so leia e '
         'responda no terminal, em portugues.\n'
         f'Leia: {rep} (geracoes {g0}-{g1}: ranking, genes, e tempos por trecho da ultima), {HISTORY} (todas as geracoes), '
         f'{os.path.join(REPO, "RealTrafficFix2", "source", "ProvingGround.h")} (namespace GA: genes, faixas, pontuacao, '
