@@ -13,6 +13,11 @@
 #pragma once
 
 #include <random>
+#include <map>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 #include "CSprite2d.h"
 
 namespace ProvingGround {
@@ -367,12 +372,13 @@ struct Runner {
     float aiGripG = 1.0f, aiAdhesive = 1.0f;       // the AI's sideways grip limit (g) on tarmac, from the game's formula
     float absScale = 1.0f, tcScale = 1.0f;
     float playerSteerFactor = 1.0f;                // what the game keeps of a player's wheel at this speed (logged)
-    std::vector<CVector> trail;
+    std::deque<CVector> trail;
     CVector2D lookPoint;
     std::string abortWhy;
     Stats stats;
     std::ofstream csv;
     Course road;                    // the road itself (course is then the car's own line on it: OwnLine)
+    std::string roadKey;            // ... the test and lane it was built for (a new brain on the lane: only its own line again)
     std::vector<float> profile;     // mode gt4: the speed at every point of its line, worked out before the run (m/s)
     // the run so far (HUD, GA)
     std::string result;             // how its run ended ("" while it runs)
@@ -555,6 +561,16 @@ static void BuildCourse(const TestDef& d) {
         const float a = frameHeading * 3.14159265f / 180.0f;
         frameOrigin += CVector2D(std::sin(a), -std::cos(a)) * R->laneShift;
     }
+    // the same road as the lane's last run: only the new brain's own line and speeds (the whole road again took 15-65 ms
+    // each new brain, and hundreds of cars spun out together at the start: 13 fps)
+    const std::string key = Format("%s|%s|%s|%.2f|%.2f|%.1f", d.name.c_str(), d.shape.c_str(), d.segments.c_str(), d.width, R->laneShift, frameHeading);
+    if (key == R->roadKey && !R->road.p.empty()) {
+        course = R->road;
+        OwnLine();
+        SpeedProfile(d);
+        return;
+    }
+    R->roadKey = key;
     std::vector<CVector2D> local;
     struct Zone { int i; float len, value; char kind; };
     std::vector<Zone> zones;
@@ -803,6 +819,10 @@ static float clockT = 0.0f;            // s of running, every lane together
 static const TestDef* curTest = nullptr;
 static int curModel = 0;
 static std::ofstream trace;            // (Trace)
+// (Trace, steady state: a file per generation still running, its rows kept here and handed to Disk 1 MB at a time)
+struct TraceBuf { std::string data; bool started = false; };
+static std::map<int, TraceBuf> traceGen;
+static void CloseTrace(int g);
 static float traceNext[kMaxRunners];
 static bool courseWritten = false;
 static float firstHome = -1.0f;        // the run's first car at the end (s; -1: none yet)
@@ -813,8 +833,98 @@ static int camOn = 0;                  // the car the camera is on
 static unsigned int Now() { return CTimer::m_snTimeInMilliseconds; }
 
 static void Log(const std::string& s) {
-    if (summary.is_open()) { summary << s << "\n"; summary.flush(); }
+    if (summary.is_open()) summary << s << "\n"; // (flushed every 10 s: Perf::Frame)
 }
+
+// --- Disk: files written on a thread of their own --------------------------------------------------------------------
+// (opening and closing a file, with the antivirus looking at it, can take tens of ms, and the game's one thread waited:
+// the stutters when a generation ended, its history, state and trace files). A whole file goes to .tmp first, then over
+// the old one: a state file is never half-written when the game is closed
+namespace Disk {
+struct Job { std::string path, data; bool append; };
+static std::mutex mtx;
+static std::condition_variable cv;
+static std::deque<Job> jobs;
+static bool started = false;
+static void Loop() {
+    for (;;) {
+        Job j;
+        {
+            std::unique_lock<std::mutex> l(mtx);
+            cv.wait(l, [] { return !jobs.empty(); });
+            j = std::move(jobs.front());
+            jobs.pop_front();
+        }
+        const std::string to = j.append ? j.path : j.path + ".tmp";
+        if (FILE* f = std::fopen(to.c_str(), j.append ? "ab" : "wb")) {
+            std::fwrite(j.data.data(), 1, j.data.size(), f);
+            std::fclose(f);
+            if (!j.append) MoveFileExA(to.c_str(), j.path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+}
+static void Write(const std::string& path, std::string data, bool append = false) {
+    {
+        std::lock_guard<std::mutex> l(mtx);
+        if (!started) { started = true; std::thread(Loop).detach(); }
+        jobs.push_back({ path, std::move(data), append });
+    }
+    cv.notify_one();
+}
+static int Pending() { std::lock_guard<std::mutex> l(mtx); return static_cast<int>(jobs.size()); }
+} // namespace Disk
+
+// --- Perf: where a frame's time goes (the summary every 10 s, "perf:"; a frame over 150 ms on its own line) ----------
+// GTA runs on one thread: the CPU meter shows the machine's cores together, so a game stuck on one core reads ~10%
+namespace Perf {
+enum { UPDATE, CONTROL, DRAW, REPLACE, ENDBATCH, TRACE, HUD, N };
+static const char* const kNames[N] = { "update", "controle", "desenho", "troca de cerebro", "fim de geracao", "trace", "hud" };
+static double cur[N] = {}, sum[N] = {}, peak[N] = {}, shown[N] = {};
+static double last = 0.0, windowStart = 0.0, frameSum = 0.0, frameMax = 0.0;
+static int frames = 0;
+static float fps = 0.0f, frameMs = 0.0f, modMs = 0.0f;
+static double Now() {
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return 1000.0 * static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
+}
+struct Scope { int i; double t0; explicit Scope(int k) : i(k), t0(Now()) {} ~Scope() { cur[i] += Now() - t0; } };
+static void Frame(bool running) {
+    const double t = Now();
+    if (last <= 0.0) windowStart = t;
+    else {
+        const double f = t - last;
+        frames++;
+        frameSum += f;
+        frameMax = std::max(frameMax, f);
+        if (f > 150.0 && running) {
+            std::string s = Format("perf: a frame of %.0f ms:", f);
+            for (int i = 0; i < N; i++) if (cur[i] > 1.0) s += Format(" %s %.0f", kNames[i], cur[i]);
+            Log(s);
+        }
+    }
+    for (int i = 0; i < N; i++) { sum[i] += cur[i]; peak[i] = std::max(peak[i], cur[i]); cur[i] = 0.0; }
+    last = t;
+    if (t - windowStart >= 10000.0 && frames > 0) {
+        fps = static_cast<float>(1000.0 * frames / (t - windowStart));
+        frameMs = static_cast<float>(frameSum / frames);
+        std::string s = Format("perf: %.0f fps, frame %.1f ms (max %.0f); the mod (ms a frame):", fps, frameMs, frameMax);
+        for (int i = 0; i < N; i++) {
+            shown[i] = sum[i] / frames;
+            s += Format(" %s %.2f (max %.0f)", kNames[i], shown[i], peak[i]);
+            sum[i] = peak[i] = 0.0;
+        }
+        // (troca, fim de geracao and trace are inside update; hud inside desenho)
+        modMs = static_cast<float>(shown[UPDATE] + shown[CONTROL] + shown[DRAW]);
+        Log(s + Format("; in all %.1f of %.1f; disk queue %d", modMs, frameMs, Disk::Pending()));
+        if (running && summary.is_open()) summary.flush();
+        frames = 0;
+        frameSum = frameMax = 0.0;
+        windowStart = t;
+    }
+}
+} // namespace Perf
 
 // The road's obstacles on this car's lane, once (static objects, the same on every lane)
 static void SpawnObstacles() {
@@ -869,6 +979,7 @@ static void Restart() {
     forRunners { RemoveCar(); RemoveObstacles(); if (csv.is_open()) csv.close(); }
     R = runners;
     if (trace.is_open()) trace.close();
+    while (!traceGen.empty()) CloseTrace(traceGen.begin()->first);
     courseWritten = false;
     if (camOn) Command<COMMAND_RESTORE_CAMERA_JUMPCUT>();
     camOn = 0;
@@ -1074,7 +1185,8 @@ static void Neural2Inputs(CVehicle* v, float* in) {
     in[k++] = contact == 0 ? 1.0f : 0.0f;
     // the grip in use, the crosswind
     in[k++] = std::clamp(std::abs(R->latGNow) / std::max(aiGripG, 0.1f), 0.0f, 2.0f);
-    in[k++] = R->windNow / 3.0f;
+    // (the wind was a 64th input, written past the end of in[63]: Gemini's neural2 review; it stays out until the
+    // network grows an input for it)
     while (k < kNn2In) in[k++] = 0.0f;
 }
 
@@ -1498,6 +1610,7 @@ static void __cdecl SteerAiHook(CVehicle* v) {
         R = &runners[k];
         if (R->finished) { v->m_fSteerAngle = 0.0f; v->m_fGasPedal = 0.0f; v->m_fBreakPedal = 1.0f; return; }
         if (k == 0 && (cfg.driver == "player" || cfg.driver == "human")) break; // (the player's car: after its inputs / the human)
+        Perf::Scope perf(Perf::CONTROL);
         Control(v); // ai, cjai, and car B
         return;
     }
@@ -1724,6 +1837,14 @@ static float nn2Sigma = 0.02f, nn2Alpha = 0.03f, nn2Noise = 0.01f;
 static int nn2Cars = 20;
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
 static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
+// DevWeight: the time made longer by the mean deviation from the car's own line, in proportion (0.3: 0.1 m -> +3%): the
+// user, "o desvio deve ser levado em consideracao sempre, de maneira proporcional"; the line itself is free (any line in the lane)
+static float devWeight = 0.3f, loadedDev = -1.0f;
+// steady state: parents from the best ParentTop of their algorithm's archive; sigma wider when stuck (SigmaMax)
+static float parentTop = 0.2f, sigmaMax = 0.15f;
+static int stall = 0;
+static double stallRef = 1e18;
+static std::vector<double> history10; // steady state: each generation's mean of its 10 best runs
 // CutoffFactor: once the first car is home, a car still running at that time x this is stopped (CUT) and scored by
 // the time it was heading for (its time x the course / how far it got) + CutPenalty (0: no cutoff)
 static float cutoffFactor = 1.3f, cutPenalty = 20.0f;
@@ -1786,6 +1907,9 @@ static void Read(CIniReader& ini, const Settings& s) {
     modeMutation = ini.ReadFloat("GA", "ModeMutation", modeMutation);
     offLimitGA = ini.ReadFloat("GA", "OffLimit", offLimitGA);
     meanPenalty = ini.ReadFloat("GA", "MeanPenalty", meanPenalty);
+    devWeight = ini.ReadFloat("GA", "DevWeight", devWeight);
+    parentTop = std::clamp(ini.ReadFloat("GA", "ParentTop", parentTop), 0.01f, 1.0f);
+    sigmaMax = ini.ReadFloat("GA", "SigmaMax", sigmaMax);
     offPenalty = ini.ReadFloat("GA", "OffPenalty", offPenalty);
     cutoffFactor = ini.ReadFloat("GA", "CutoffFactor", cutoffFactor);
     cutPenalty = ini.ReadFloat("GA", "CutPenalty", cutPenalty);
@@ -1921,7 +2045,7 @@ static void Apply() {
 }
 
 static void Save() {
-    std::ofstream f(StatePath(), std::ios::trunc);
+    std::ostringstream f;
     f << "genes";
     for (const auto& gd : kGenes) f << " " << gd.key;
     f << "\ngeneration " << generation << "\nsigma " << sigma << "\n";
@@ -1929,7 +2053,9 @@ static void Save() {
                         << "bestrun " << bestRes.time << " " << bestRes.mean << " " << bestRes.maxE << " " << bestRes.out << "\n";
     f << "history";
     for (double h : history) f << " " << h;
-    f << "\n";
+    f << "\nhistory10";
+    for (double h : history10) f << " " << h;
+    f << "\nscoring " << devWeight << "\n";
     // (steady state: the archive's brains, best first; they start the lanes on a resume)
     std::vector<const Genome*> out;
     if (steady && !archive.empty()) {
@@ -1949,6 +2075,7 @@ static void Save() {
             f << "\n";
         }
     }
+    Disk::Write(StatePath(), f.str());
 }
 
 static bool Load() {
@@ -1971,6 +2098,8 @@ static bool Load() {
         else if (key == "generation") is >> generation;
         else if (key == "sigma") is >> sigma;
         else if (key == "history") { double h; while (is >> h) history.push_back(h); }
+        else if (key == "history10") { double h; while (is >> h) history10.push_back(h); }
+        else if (key == "scoring") is >> loadedDev;
         else if (key == "bestrun") is >> bestRes.time >> bestRes.mean >> bestRes.maxE >> bestRes.out;
         else if (key == "nn" && n > 0) for (int i = 0; i < kNN; i++) is >> pop[n - 1].nn[i];
         else if (key == "best" || key == "ind") {
@@ -2003,6 +2132,15 @@ static bool Load() {
             else if (n < numRunners) pop[n++] = g;
         }
     }
+    if (std::abs(loadedDev - devWeight) > 1e-4f) {
+        // scored another way: the old best and history are not comparable (the brains are kept)
+        Log(Format("GA: the score changed (DevWeight %.2f -> %.2f): best ever and history start over", loadedDev, devWeight));
+        bestScore = 1e18;
+        bestGen = -1;
+        bestRes = Result();
+        history.clear();
+        history10.clear();
+    }
     // a bigger population than the saved one: copies of the saved brains, a little mutated (not random: no abrupt
     // changes); none saved: random
     const int saved = n;
@@ -2020,21 +2158,28 @@ static bool Load() {
 }
 
 static void WriteBest() {
-    std::ofstream f(baseDir + "proving\\ga_best.ini", std::ios::trunc);
+    std::ostringstream f;
     f << Format("; GA best ever: generation %d, score %.2f (lower is better)\n", bestGen, bestScore);
     for (const char* sec : { "Steer", "Speed" }) {
         f << "[" << sec << "]\n";
         if (!strcmp(sec, "Steer")) f << "Mode = " << modes[best.mode] << "\n";
         for (int i = 0; i < kNumGenes; i++) if (!strcmp(kGenes[i].sec, sec)) f << kGenes[i].key << " = " << Format("%.4g", best.g[i]) << "\n";
     }
+    Disk::Write(baseDir + "proving\\ga_best.ini", f.str());
 }
 
+static void ResetBatches();
 static void Start() {
     if (!on) return;
     rng.seed(seed ? seed : GetTickCount());
     generation = 0;
     sigma = sigma0;
     history.clear();
+    history10.clear();
+    loadedDev = -1.0f;
+    stall = 0;
+    stallRef = 1e18;
+    ResetBatches();
     bestScore = 1e18;
     bestGen = -1;
     bestRes = Result();
@@ -2064,8 +2209,11 @@ static void Score(int k, const std::string& why, float time, double mean, double
     // (CUT: too slow to wait for, scored by the time it was heading for, its outside time so far and CutPenalty)
     const bool cut = why == "CUT" && sMax > 50.0f;
     const double t = cut ? time * length / sMax : time;
-    r.score += done || cut ? t + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms + (cut ? cutPenalty : 0.0)
-                           : 1000.0 + 0.5 * std::max(length - sMax, 0.0f) + offPenalty * out;
+    r.score += done || cut ? t * (1.0 + devWeight * mean) + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms + (cut ? cutPenalty : 0.0)
+                           : 1000.0 + 0.5 * std::max(length - sMax, 0.0f);
+    // (not home: by how far it got only; the time outside the lane counted too, so crashing at 1.4 km scored better
+    // than driving on, outside, to 2.9 km; a CUT car, which drove on, always better than one that crashed)
+    if (cut) r.score = std::min(r.score, 999.0);
     r.mean = std::max(r.mean, mean);
     r.deficit += deficit;
     r.minMargin = std::min(r.minMargin, minMargin);
@@ -2243,8 +2391,18 @@ static void NextGeneration() {
 // elite again (its score the average of its runs), neural2's perturbations come in +- pairs and theta takes a step
 // every Nn2Cars of them. Every 'cars' runs make a "generation" for the logs (history, trace, Gemini).
 struct Done { Genome g; Result r; std::string id; };
-static std::vector<Done> batch;
-static float batchStart = 0.0f;    // the clock when the generation began
+// A generation = Runners brains in the order they were made (each runs once); it closes when all of its runs ended,
+// while the next ones already drive (the user: exactly Runners runs a generation, its slow cars and its quick
+// failures alike; by count of runs ended the quick failures filled it, by time it had 650-750)
+static std::map<int, std::vector<Done>> batches;
+static int birthGen = -1, birthCount = 0;
+static void ResetBatches() { batches.clear(); birthGen = -1; birthCount = 0; }
+static int NextBirth() {
+    if (birthGen < 0) birthGen = generation;
+    const int g = birthGen;
+    if (++birthCount >= numRunners) { birthGen++; birthCount = 0; }
+    return g;
+}
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
 static std::vector<float> pendingEps;   // a pair's + waiting for its -
@@ -2253,6 +2411,11 @@ static int ArchiveTournament(int mode) {
     std::vector<int> pool;
     for (int i = 0; i < static_cast<int>(archive.size()); i++) if (mode < 0 || archive[i].g.mode == mode) pool.push_back(i);
     if (pool.empty()) return -1;
+    // only the best ParentTop of them (a tournament of 3 among all 500 picked, on average, a parent of the top quarter
+    // of a pool full of failures: the best stayed at 138-140 s for 8 generations)
+    std::sort(pool.begin(), pool.end(), [](int a, int b) { return archive[a].avg() < archive[b].avg(); });
+    const size_t keep = std::max<size_t>(std::min<size_t>(pool.size(), 3), static_cast<size_t>(std::ceil(pool.size() * parentTop)));
+    pool.resize(std::min(pool.size(), keep));
     int bestI = pool[Pick(static_cast<int>(pool.size()))];
     for (int t = 1; t < tournament; t++) {
         const int i = pool[Pick(static_cast<int>(pool.size()))];
@@ -2295,11 +2458,20 @@ static Genome Child(int k) {
     std::vector<int> order(archive.size());
     for (int i = 0; i < static_cast<int>(order.size()); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [](int a, int b) { return archive[a].avg() < archive[b].avg(); });
-    if (own < 0 && U() < reevalChance) {
-        const Entry& e = archive[order[Pick(std::min(std::max(elite, 1), static_cast<int>(order.size())))]];
-        Genome c = e.g;
-        c.archiveId = e.id;
-        return c;
+    if (U() < reevalChance) {
+        // an elite again (of the algorithm under its quota, if one is): of the Elite best, the one run the fewest times,
+        // so a lucky single run is checked before it breeds much (own was almost never -1: no elite had been re-run)
+        int pickI = -1, seen = 0;
+        for (int i : order) {
+            if (own >= 0 && archive[i].g.mode != own) continue;
+            if (pickI < 0 || archive[i].runs < archive[pickI].runs) pickI = i;
+            if (++seen >= std::max(elite, 1)) break;
+        }
+        if (pickI >= 0) {
+            Genome c = archive[pickI].g;
+            c.archiveId = archive[pickI].id;
+            return c;
+        }
     }
     const int ia = ArchiveTournament(own);
     if (ia < 0) {
@@ -2355,20 +2527,27 @@ static void ApplyOne(int k) {
 }
 
 // A "generation" of the steady state: its runs logged as one (history, the best ever, sigma, the state file)
-static void EndBatch() {
+static void EndBatch(int g) {
+    Perf::Scope perf(Perf::ENDBATCH);
+    std::vector<Done>& batch = batches[g];
     std::sort(batch.begin(), batch.end(), [](const Done& a, const Done& b) { return a.r.score < b.r.score; });
     int bestA = 0;
     for (int i = 1; i < static_cast<int>(archive.size()); i++) if (archive[i].avg() < archive[bestA].avg()) bestA = i;
     const Entry& top = archive[bestA];
-    history.push_back(top.avg());
+    // the generation's own runs: its best and the mean of its 10 best (what the HUD's chart shows)
+    double top10 = 0.0;
+    const int n10 = std::min<int>(10, static_cast<int>(batch.size()));
+    for (int i = 0; i < n10; i++) top10 += batch[i].r.score / std::max(n10, 1);
+    history.push_back(batch.empty() ? 0.0 : batch[0].r.score);
+    history10.push_back(top10);
     if (top.avg() < bestScore) {
         bestScore = top.avg();
         best = top.g;
         bestRes = top.last;
-        bestGen = generation;
+        bestGen = g;
         WriteBest();
     }
-    Log(Format("\n=== Generation %d (steady state, %d runs): best run %s %.2f, archive best %.2f (%d runs), best ever %.2f (gen %d)", generation,
+    Log(Format("\n=== Generation %d (steady state, %d runs): best run %s %.2f, archive best %.2f (%d runs), best ever %.2f (gen %d)", g,
         static_cast<int>(batch.size()), batch[0].id.c_str(), batch[0].r.score, top.avg(), top.runs, bestScore, bestGen));
     const std::string histPath = baseDir + "proving\\ga_history.csv";
     std::string header = "stamp,generation,rank,car,mode,score,result,time_s,mean_m,rms_m,max_m,out_s,reached_m,sigma";
@@ -2377,7 +2556,8 @@ static void EndBatch() {
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
-    {
+    static bool histChecked = false; // (the file's header looked at once: the disk thread may still be appending)
+    if (!histChecked) {
         std::ifstream old(histPath);
         std::string first;
         if (old && std::getline(old, first) && first != header) {
@@ -2385,8 +2565,9 @@ static void EndBatch() {
             MoveFileA(histPath.c_str(), (baseDir + "proving\\ga_history_" + stamp + ".csv").c_str());
         }
     }
-    const bool fresh = GetFileAttributesA(histPath.c_str()) == INVALID_FILE_ATTRIBUTES;
-    std::ofstream h(histPath, std::ios::app);
+    const bool fresh = !histChecked && GetFileAttributesA(histPath.c_str()) == INVALID_FILE_ATTRIBUTES;
+    histChecked = true;
+    std::ostringstream h;
     if (fresh) h << header << "\n";
     for (int r = 0; r < static_cast<int>(batch.size()); r++) {
         const Done& d = batch[r];
@@ -2394,16 +2575,30 @@ static void EndBatch() {
         if (r < 10)
             Log(Format("  %2d. %-7s %-9s score %8.2f  %-7s %6.1f s  room min %.2f m  out %5.1f s  | %s", r + 1, d.id.c_str(), modes[d.g.mode].c_str(),
                 x.score, x.why.c_str(), x.time, x.minMargin < 1e8 ? x.minMargin : 0.0, x.out, ShortText(d.g).c_str()));
-        h << Format("%s,%d,%d,%s,%s,%.3f,%s,%.2f,%.3f,%.3f,%.3f,%.2f,%.0f,%.4f,", stamp, generation, r + 1, d.id.c_str(), modes[d.g.mode].c_str(),
+        h << Format("%s,%d,%d,%s,%s,%.3f,%s,%.2f,%.3f,%.3f,%.3f,%.2f,%.0f,%.4f,", stamp, g, r + 1, d.id.c_str(), modes[d.g.mode].c_str(),
             x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, x.reached, sigma) << GenesText(d.g, ",") << "," << d.g.label
           << Format(",%.3f,%d,%.3f,%.3f", x.score, 1, x.deficit, x.minMargin < 1e8 ? x.minMargin : 0.0) << "\n";
     }
-    batch.clear();
-    batchStart = clockT;
-    generation++;
-    sigma = std::max(sigma * sigmaDecay, sigmaMin);
+    Disk::Write(histPath, h.str(), true);
+    batches.erase(g);
+    generation = std::max(generation, g + 1);
+    // sigma by progress: the archive's 10 best better than before -> narrower (refine); 3 generations without -> wider
+    // (out of a local peak); it only shrank before, to 0.025, and the GA stood still
+    std::vector<double> av;
+    for (const auto& e : archive) av.push_back(e.avg());
+    std::sort(av.begin(), av.end());
+    double a10 = 0.0;
+    const int na = std::min<int>(10, static_cast<int>(av.size()));
+    for (int i = 0; i < na; i++) a10 += av[i] / std::max(na, 1);
+    if (a10 < stallRef - 0.3) { stallRef = a10; stall = 0; sigma = std::max(sigma * 0.9f, sigmaMin); }
+    else if (++stall >= 3) {
+        sigma = std::min(sigma * 1.5f, sigmaMax);
+        stall = 0;
+        stallRef = a10;
+        Log(Format("GA: no progress in 3 generations (archive top 10 %.2f): sigma up to %.3f", a10, sigma));
+    }
     Save();
-    OpenTrace();
+    CloseTrace(g);
 }
 
 // A run ended on lane k: its score into the archive, the next brain onto the lane
@@ -2431,15 +2626,13 @@ static void Replace(int k) {
             archive.erase(archive.begin() + worst);
         }
     }
-    batch.push_back({ g, r, id });
+    const int bg = runners[k].bornGen;
+    batches[bg].push_back({ g, r, id });
     if (IsNeural2(g) && nn2Es && !nn2Eps[k].empty()) {
         esBatch.push_back({ r.score, nn2Eps[k] });
         if (static_cast<int>(esBatch.size()) >= nn2Cars) StepThetaBatch();
     }
-    // (a generation by time: 1.3 x the best lap, so every good car's run is in it; by count it closed on the quick
-    // failures before any car got home: Gemini's 10th review)
-    const float window = bestLapTime > 0.0f ? bestLapTime * std::max(cutoffFactor, 1.0f) : 200.0f;
-    if (clockT - batchStart >= window && !batch.empty()) EndBatch();
+    if (static_cast<int>(batches[bg].size()) >= numRunners) EndBatch(bg);
     Genome c = Child(k);
     AssignNn2Lane(c, k);
     pop[k] = c;
@@ -2508,7 +2701,7 @@ static void ResetLane() {
     runT = 0.0f;
     traceNext[R->index] = 0.0f;
     R->runId = ++GA::runIds;
-    R->bornGen = GA::generation;
+    R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
     nearIdx = 0;
     steerOut = steerCmd = 0.0f;
     stats = Stats();
@@ -2556,22 +2749,46 @@ static CVector2D ToLane(const CVector2D& world) {
     return CVector2D(CVector2D::Dot(world - o, dir), CVector2D::Dot(world - o, left));
 }
 
+static void TraceHeader(std::ostream& f) {
+    f << "generation,car,mode,t,x,y,speed_kmh,target_kmh,offset,steer,gas,brake,s,lat_g,slip,abs,tc,margin";
+    for (int i = 0; i < kNnIn; i++) f << ",in" << i;
+    for (int i = 0; i < kNn2In; i++) f << ",n" << i;
+    f << ",teacher_steer,teacher_pedal\n";
+}
+// steady state: the file of generation g (begun when its first brain drives, ended when its last run ended)
+static std::string TracePath(int g) { return baseDir + "proving\\ga_trace\\" + Format("gen_%04d.csv", g); }
+static void TraceAppend(int g, const std::string& row) {
+    TraceBuf& b = traceGen[g];
+    if (!b.started && b.data.empty()) {
+        CreateDirectoryA((baseDir + "proving\\ga_trace").c_str(), nullptr);
+        std::ostringstream h;
+        TraceHeader(h);
+        b.data = h.str();
+    }
+    b.data += row;
+    if (b.data.size() > (1u << 20)) { Disk::Write(TracePath(g), std::move(b.data), b.started); b.started = true; b.data.clear(); }
+}
+static void CloseTrace(int g) {
+    auto it = traceGen.find(g);
+    if (it == traceGen.end()) return;
+    if (!it->second.data.empty()) Disk::Write(TracePath(g), std::move(it->second.data), it->second.started);
+    traceGen.erase(it);
+}
+
 static void OpenTrace() {
     const std::string dir = GA::on ? baseDir + "proving\\ga_trace\\" : runDir;
     CreateDirectoryA(dir.c_str(), nullptr);
     if (trace.is_open()) trace.close();
-    trace.open(dir + (GA::on ? Format("gen_%04d.csv", GA::generation) : std::string("trace.csv")), std::ios::trunc);
-    trace << "generation,car,mode,t,x,y,speed_kmh,target_kmh,offset,steer,gas,brake,s,lat_g,slip,abs,tc,margin";
-    for (int i = 0; i < kNnIn; i++) trace << ",in" << i;
-    for (int i = 0; i < kNn2In; i++) trace << ",n" << i;
-    trace << ",teacher_steer,teacher_pedal";
-    trace << "\n";
-    for (float& t : traceNext) t = 0.0f;
+    if (!(GA::on && GA::steady)) {
+        trace.open(dir + (GA::on ? Format("gen_%04d.csv", GA::generation) : std::string("trace.csv")), std::ios::trunc);
+        TraceHeader(trace);
+        for (float& t : traceNext) t = 0.0f;
+    }
     if (courseWritten || !curTest) return;
     courseWritten = true;
     Runner* keep = R;
     R = runners;
-    std::ofstream c(dir + "R->road.csv", std::ios::trunc);
+    std::ofstream c(dir + "course.csv", std::ios::trunc);
     c << "x,y,s,curv,vcap_kmh,vsud_kmh,wind,half_width\n";
     for (size_t i = 0; i < R->road.p.size(); i += 2) {
         const CVector2D q = ToLane(R->road.p[i]);
@@ -2589,10 +2806,13 @@ static void OpenTrace() {
 }
 
 static void Trace(CVehicle* v) {
-    if (!trace.is_open() || runT < traceNext[R->index]) return;
+    const bool perGen = GA::on && GA::steady;
+    if ((!perGen && !trace.is_open()) || runT < traceNext[R->index]) return;
+    Perf::Scope perf(Perf::TRACE);
+    std::string row;
     traceNext[R->index] = runT + (numRunners > 100 ? 0.5f : 0.25f); // (2 a second above 100 cars: the file grows with them)
     const CVector2D q = ToLane(v->GetPosition().To2D());
-    trace << Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d,%.2f", GA::on ? GA::generation : runCount,
+    row = Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d,%.2f", perGen ? R->bornGen : GA::on ? GA::generation : runCount,
         GA::steady ? Format("%s.%d", R->tag, R->runId).c_str() : R->tag, human && R == runners ? "human" : cfg.mode.c_str(), runT, q.x, q.y, R->speedNow, targetKmh, offsetNow, v->m_fSteerAngle, gasOut, brakeOut, R->sMax,
         R->latGNow, R->slipNow, R->absOn ? 1 : 0, R->tcOn ? 1 : 0, course.halfWidth > 0.0f ? R->marginNow : 0.0f);
     float in[kNnIn];
@@ -2608,12 +2828,42 @@ static void Trace(CVehicle* v) {
         tail += cfg.mode == "neural2" ? Format(",%.4f,%.3f", R->teacherSteer, R->teacherPedal) : Format(",%.4f,%.3f", v->m_fSteerAngle, gasOut - brakeOut);
     }
     else tail += std::string(kNn2In + 2, ',');
-    trace << tail << "\n";
+    row += tail;
+    row += "\n";
+    if (perGen) TraceAppend(R->bornGen, row);
+    else trace << row;
 }
 
 // --- Camera ----------------------------------------------------------------------------------------------------------
-// On the leading car (Home), or the one picked with PageUp / PageDown; car A is CJ's, the game's own camera
-static unsigned int camSince = 0;
+// Auto (Home): the standout of the newest generation on the road: of the cars of the youngest generation driving (past
+// 300 m), the one heading for the best time; held until its run ends (and 2.5 s more: home or out), or until another
+// of them heads for a lap 3 s better (not sooner than 15 s). PageUp / PageDown: those cars one by one, best first.
+// (It was on the leader: it got home, the lane started a new brain, the camera jumped to the next leader.) Car A is
+// CJ's: the game's own camera
+static unsigned int camSince = 0, camEndAt = 0;
+static int camRun = -1;        // the run followed (a lane's next brain is another run)
+static int camGen = -1;        // its generation (the HUD)
+
+// the lap time car k is heading for (s; 1e9: too early to tell, or not running)
+static float PaceOf(int k) {
+    Runner* keep = R;
+    R = &runners[k];
+    const float p = R->result.empty() && R->sMax > 300.0f && course.length > 1.0f ? runT * course.length / R->sMax : 1e9f;
+    R = keep;
+    return p;
+}
+// the cars of the youngest generation driving, best pace first
+static std::vector<int> CamCandidates() {
+    int young = -1;
+    for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && runners[k].sMax > 300.0f) young = std::max(young, runners[k].bornGen);
+    std::vector<std::pair<float, int>> c;
+    for (int k = 0; k < numRunners; k++)
+        if (runners[k].bornGen == young) { const float pc = PaceOf(k); if (pc < 1e8f) c.push_back({ pc, k }); }
+    std::sort(c.begin(), c.end());
+    std::vector<int> o;
+    for (const auto& e : c) o.push_back(e.second);
+    return o;
+}
 
 // The order of the cars: the finished ones by time, then the ones running by how far they got, then the rest
 static std::vector<int> Standings() {
@@ -2635,21 +2885,55 @@ static void PointCamera(int k) {
     camOn = CarOf(k) ? k : 0;
 }
 
+static void FollowCar(int k, unsigned int now) {
+    if (k != camOn) PointCamera(k);
+    camRun = runners[k].runId;
+    camGen = runners[k].bornGen;
+    camSince = now;
+    camEndAt = 0;
+}
+
 static void UpdateCamera(unsigned int now) {
     if (human) { if (camOn) PointCamera(0); return; } // (the human's own camera)
     static bool prevUp = false, prevDown = false, prevHome = false;
     const bool up = KeyPressed(VK_PRIOR) != 0, down = KeyPressed(VK_NEXT) != 0, home = KeyPressed(VK_HOME) != 0;
-    int want = camOn;
-    if (down && !prevDown) camPick = want = (camOn + 1) % numRunners;
-    if (up && !prevUp) camPick = want = (camOn + numRunners - 1) % numRunners;
-    if (home && !prevHome) camPick = -1;
+    const bool stepUp = up && !prevUp, stepDown = down && !prevDown, goHome = home && !prevHome;
     prevUp = up; prevDown = down; prevHome = home;
-    if (camPick < 0) {
-        // the first car still running (no more than one change every 4 s)
-        for (int k : Standings()) if (runners[k].result.empty()) { want = k; break; }
-        if (want != camOn && now - camSince < 4000) want = camOn;
+    if (goHome) { camPick = -1; camRun = -1; }
+    if (stepUp || stepDown) {
+        const std::vector<int> c = CamCandidates();
+        if (!c.empty()) {
+            const int n = static_cast<int>(c.size());
+            int at = static_cast<int>(std::find(c.begin(), c.end(), camOn) - c.begin());
+            at = at >= n ? 0 : (at + (stepDown ? 1 : n - 1)) % n;
+            camPick = c[at];
+            FollowCar(c[at], now);
+        }
+        return;
     }
-    if (want != camOn) { PointCamera(want); camSince = now; }
+    // the run followed: still on, or ended a moment ago
+    const Runner& f = runners[std::clamp(camOn, 0, numRunners - 1)];
+    bool keep = camRun >= 0 && f.runId == camRun;
+    if (keep && !f.result.empty()) {
+        if (!camEndAt) camEndAt = now;
+        if (now - camEndAt > 2500) keep = false;
+    }
+    if (keep && camPick >= 0) return; // (picked by hand: held to its end)
+    if (keep && (!f.result.empty() || now - camSince < 15000)) return;
+    static unsigned int lastLook = 0;
+    if (keep && now - lastLook < 1000) return;
+    lastLook = now;
+    camPick = -1;
+    const std::vector<int> c = CamCandidates();
+    if (c.empty()) {
+        if (keep) return;
+        // nobody past 300 m yet: the one furthest on
+        int lead = -1;
+        for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && (lead < 0 || runners[k].sMax > runners[lead].sMax)) lead = k;
+        if (lead >= 0) FollowCar(lead, now);
+        return;
+    }
+    if (!keep || PaceOf(c[0]) < PaceOf(camOn) - 3.0f) FollowCar(c[0], now);
 }
 
 // --- Per frame -------------------------------------------------------------------------------------------------------
@@ -2670,6 +2954,8 @@ void Init(const std::string& moduleDir) {
 
 void Update() {
     if (!enabled) return;
+    Perf::Frame(state == RUNNING);
+    Perf::Scope perf(Perf::UPDATE);
     CPlayerPed* player = FindPlayerPed();
     if (!player) return;
     const unsigned int now = Now();
@@ -2827,6 +3113,7 @@ void Update() {
             if (R->result != "end") { car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f); car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f); }
             if (GA::on && GA::steady && clockT - R->doneAt > 0.5f) {
                 // steady state: this run into the archive, a new brain on the lane, from the start again
+                Perf::Scope perf(Perf::REPLACE);
                 GA::Replace(R->index);
                 // (curTest points into car A's settings, which a new brain on lane A replaces: the old pointer read freed
                 // memory, d.speeds empty -> null, and the game crashed; the crash logs of 15:31 and 15:36)
@@ -2858,7 +3145,7 @@ void Update() {
         Trace(car);
         if (trail.empty() || (car->GetPosition() - trail.back()).Magnitude() > 1.0f) {
             trail.push_back(car->GetPosition());
-            if (trail.size() > 1500) trail.erase(trail.begin());
+            if (trail.size() > 1500) trail.pop_front();
         }
         const float speed = car->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS;
         if (curTest->pedal == "brake" && runT >= curTest->pedalStart && !brakeDone) stats.stopDist += speed * dt;
@@ -3020,6 +3307,163 @@ static std::string StatusText(const Runner& r) {
     return r.result;
 }
 
+// F9: compact (0, the default), the full HUD of before (1), none (2)
+static int hudMode = 0;
+
+// The compact HUD: the GA's generations and how they evolve (top right), the car followed (bottom left), the course
+// strip (bottom)
+static void DrawHudCompact() {
+    const float W = hudW, H = hudH;
+    const CRGBA kGood(120, 230, 120, 255), kBad(255, 110, 110, 255), kGold(255, 214, 10, 255);
+    if (GA::on) {
+        const float gw = 420.0f, x = W - 20.0f - gw;
+        float y = 20.0f;
+        const int nb = static_cast<int>(GA::batches.size());
+        const float ph = 300.0f + 18.0f * std::min(nb, 3);
+        Box(x, y, gw, ph, kPanel);
+        Box(x, y, 4.0f, ph, CRGBA(175, 110, 255, 255));
+        Text(x + 16.0f, y + 6.0f, Format("GERACAO %d", GA::generation), 0.9f, kWhite, 0, FONT_MENU);
+        Text(x + gw - 12.0f, y + 8.0f, Perf::fps > 0.0f ? Format("%.0f fps  mod %.1f ms", Perf::fps, Perf::modMs) : std::string(""), 0.58f, kDim, 2);
+        y += 34.0f;
+        // each generation still running: born of Runners (light) and runs ended (solid); the oldest closes next
+        int shown = 0;
+        for (const auto& bg : GA::batches) {
+            if (shown++ >= 3) break;
+            const int g = bg.first;
+            const int born = g < GA::birthGen ? numRunners : g == GA::birthGen ? GA::birthCount : 0;
+            const int done = static_cast<int>(bg.second.size());
+            const char* what = shown == 1 && nb > 1 ? "fechando" : g == GA::birthGen ? "nascendo" : "rodando";
+            Text(x + 16.0f, y, Format("g%d %s", g, what), 0.6f, kWhite);
+            Box(x + 150.0f, y + 5.0f, 170.0f, 9.0f, CRGBA(255, 255, 255, 30));
+            Box(x + 150.0f, y + 5.0f, 170.0f * born / std::max(numRunners, 1), 9.0f, CRGBA(175, 110, 255, 90));
+            Box(x + 150.0f, y + 5.0f, 170.0f * done / std::max(numRunners, 1), 9.0f, CRGBA(175, 110, 255, 255));
+            Text(x + gw - 12.0f, y, Format("%d/%d", done, numRunners), 0.6f, kDim, 2);
+            y += 18.0f;
+        }
+        y += 4.0f;
+        // the last generation closed and the record
+        const auto& h = GA::history;
+        const auto& h10 = GA::history10;
+        if (!h10.empty())
+            Text(x + 16.0f, y, Format("ultima (g%d): melhor %.1f   media dos 10 melhores %.1f", GA::generation - 1, h.back(), h10.back()), 0.6f, kWhite);
+        else Text(x + 16.0f, y, "nenhuma geracao fechada ainda", 0.6f, kDim);
+        y += 18.0f;
+        if (GA::bestGen >= 0)
+            Text(x + 16.0f, y, Format("recorde %.1f (g%d, %s)   %.1f s, desvio %.2f m", GA::bestScore, GA::bestGen, GA::modes[GA::best.mode].c_str(),
+                GA::bestRes.time, GA::bestRes.mean), 0.6f, kGold);
+        y += 22.0f;
+        // the evolution: the mean of each generation's 10 best (bars, taller = better) and its best (white tick)
+        {
+            const float bx = x + 16.0f, bw = gw - 32.0f, bh = 70.0f;
+            Box(bx, y, bw, bh, CRGBA(255, 255, 255, 16));
+            const int n = std::min<int>(static_cast<int>(h10.size()), 30);
+            if (n > 0) {
+                double lo = 1e18, hi = -1e18;
+                for (int i = static_cast<int>(h10.size()) - n; i < static_cast<int>(h10.size()); i++) {
+                    if (h10[i] < 1000.0) { lo = std::min(lo, h10[i]); hi = std::max(hi, h10[i]); }
+                    if (i < static_cast<int>(h.size()) && h[i] < 1000.0) { lo = std::min(lo, h[i]); hi = std::max(hi, h[i]); }
+                }
+                if (hi <= lo) hi = lo + 1.0;
+                const float step = bw / 30.0f;
+                auto hgt = [&](double v) { return static_cast<float>(0.15 + 0.85 * (hi - std::min(v, hi)) / (hi - lo)) * bh; };
+                for (int i = 0; i < n; i++) {
+                    const int j = static_cast<int>(h10.size()) - n + i;
+                    const float f = hgt(h10[j]);
+                    Box(bx + step * i + 1.0f, y + bh - f, step - 2.0f, f, CRGBA(120, 200, 255, 200));
+                    if (j < static_cast<int>(h.size()) && h[j] < 1000.0) Box(bx + step * i + 1.0f, y + bh - hgt(h[j]) - 1.0f, step - 2.0f, 3.0f, kWhite);
+                }
+                Text(bx + 4.0f, y + 2.0f, Format("%.1f", lo), 0.5f, kDim);
+                Text(bx + 4.0f, y + bh - 16.0f, Format("%.1f", hi), 0.5f, kDim);
+            }
+            y += bh + 4.0f;
+            if (h10.size() >= 6) {
+                const double d = h10.back() - h10[h10.size() - 6];
+                Text(x + 16.0f, y, Format("10 melhores: %+.1f s em 5 geracoes   %s", d, d < -0.2 ? "evoluindo" : d > 0.2 ? "piorou" : "parado"), 0.6f,
+                    d < -0.2 ? kGood : d > 0.2 ? kBad : kDim);
+            }
+            else Text(x + 16.0f, y, "barras: media dos 10 melhores   traco: o melhor", 0.56f, kDim);
+            y += 18.0f;
+            Text(x + 16.0f, y, Format("sigma %.3f%s   arquivo %d", GA::sigma, GA::stall > 0 ? Format(" (sem melhora %d)", GA::stall).c_str() : "",
+                static_cast<int>(GA::archive.size())), 0.56f, kDim);
+            y += 18.0f;
+            Text(x + 16.0f, y, Format("pontos = tempo x (1 + %.2f x desvio medio) + %.0f x s fora", GA::devWeight, GA::offPenalty), 0.56f, kDim);
+            y += 20.0f;
+        }
+        // the closing generation's 5 best so far
+        if (!GA::batches.empty()) {
+            std::vector<const GA::Done*> top;
+            for (const auto& dn : GA::batches.begin()->second) top.push_back(&dn);
+            const int nt = std::min<int>(5, static_cast<int>(top.size()));
+            std::partial_sort(top.begin(), top.begin() + nt, top.end(), [](const GA::Done* a, const GA::Done* b) { return a->r.score < b->r.score; });
+            for (int i = 0; i < nt; i++) {
+                const GA::Done& d = *top[i];
+                Text(x + 16.0f, y, Format("%d. %s %s", i + 1, d.id.c_str(), GA::modes[d.g.mode].c_str()), 0.56f, kWhite);
+                Text(x + gw - 12.0f, y, d.r.why == "end" ? Format("%.1f  (%.1f s, %.2f m)", d.r.score, d.r.time, d.r.mean) : d.r.why, 0.56f,
+                    d.r.why == "end" ? kGood : kBad, 2);
+                y += 16.0f;
+            }
+        }
+        Text(x + 16.0f, 20.0f + ph - 18.0f, "F9 HUD   PgUp/PgDn carros   Home auto", 0.5f, kDim);
+    }
+
+    // the car followed
+    R = &runners[std::clamp(camOn, 0, numRunners - 1)];
+    if (car) {
+        const float pw = 470.0f, ph = 100.0f, x = 20.0f, y = H - 40.0f - ph;
+        Box(x, y, pw, ph, kPanel);
+        Box(x, y, pw, 3.0f, ColorOf(R->index));
+        const std::string who = GA::on && GA::steady ? Format("%s.%d  %s  g%d", R->tag, R->runId, cfg.mode.c_str(), R->bornGen)
+                                                     : Format("%s  %s", R->tag, cfg.mode.c_str());
+        Text(x + 12.0f, y + 6.0f, who, 0.75f, ColorOf(R->index), 0, FONT_MENU);
+        Text(x + pw - 12.0f, y + 8.0f, camPick >= 0 ? "camera: escolhida" : "camera: destaque da geracao nova", 0.52f, kDim, 2);
+        Text(x + 100.0f, y + 30.0f, Format("%.0f", R->speedNow), 1.8f, kWhite, 2, FONT_PRICEDOWN);
+        Text(x + 104.0f, y + 44.0f, "km/h", 0.6f, kDim);
+        const float pace = PaceOf(R->index);
+        if (!R->result.empty())
+            Text(x + 160.0f, y + 32.0f, R->result == "end" ? Format("chegou: %.1f s", R->endTime) : R->result, 0.7f, R->result == "end" ? kGood : kBad);
+        else if (pace < 1e8f)
+            Text(x + 160.0f, y + 32.0f, GA::bestLapTime > 0.0f ? Format("ritmo %.1f s  (%+.1f do recorde)", pace, pace - GA::bestLapTime) : Format("ritmo %.1f s", pace), 0.7f,
+                GA::bestLapTime > 0.0f && pace < GA::bestLapTime ? kGood : kWhite);
+        else Text(x + 160.0f, y + 32.0f, Format("t %.0f s", runT), 0.7f, kDim);
+        Text(x + pw - 12.0f, y + 32.0f, SectionAt(course, course.s.empty() ? 0.0f : course.s[nearIdx]), 0.6f, kDim, 2);
+        // across the road (the bar is the lane, edge to edge), the pedals, ABS / TC
+        const float bx = x + 160.0f;
+        if (course.halfWidth > 0.0f)
+            Bar(bx, y + 58.0f, 180.0f, 9.0f, -offsetNow / course.halfWidth,
+                R->marginNow < 0.0f ? CRGBA(255, 90, 90, 230) : R->marginNow < edgeComfortGA ? CRGBA(255, 200, 60, 230) : CRGBA(120, 230, 120, 230), true);
+        Text(bx + 186.0f, y + 54.0f, Format("desvio %.2f m", stats.time > 0.0 ? stats.absE / stats.time : 0.0), 0.52f, kDim);
+        Bar(bx, y + 76.0f, 85.0f, 8.0f, gasOut, CRGBA(76, 217, 100, 230));
+        Bar(bx + 95.0f, y + 76.0f, 85.0f, 8.0f, brakeOut, CRGBA(255, 89, 94, 230));
+        Text(bx + 186.0f, y + 72.0f, Format("%s%s%s", R->absOn ? "ABS " : "", R->tcOn ? "TC " : "", R->skidFNow || R->skidRNow ? "DERRAPANDO" : ""), 0.52f, kGold);
+        Text(x + 12.0f, y + 72.0f, Format("%.2f g", std::abs(R->latGNow)), 0.55f, kDim);
+    }
+
+    // the course strip: its parts and every car on it (the newest generation's brighter)
+    R = runners;
+    if (course.length > 1.0f) {
+        const float x0 = 40.0f, x1 = W - 40.0f, y = H - 18.0f;
+        Box(x0 - 12.0f, y - 12.0f, x1 - x0 + 24.0f, 24.0f, kPanel);
+        Box(x0, y - 1.0f, x1 - x0, 2.0f, CRGBA(255, 255, 255, 90));
+        for (const auto& sec : course.sections) {
+            const float sx = x0 + (x1 - x0) * sec.first / course.length;
+            Box(sx - 1.0f, y - 6.0f, 2.0f, 12.0f, CRGBA(255, 255, 255, 120));
+        }
+        int young = -1;
+        for (int k = 0; k < numRunners; k++) young = std::max(young, runners[k].bornGen);
+        for (int k = numRunners - 1; k >= 0; k--) {
+            if (!runners[k].result.empty()) continue;
+            const float sx = x0 + (x1 - x0) * std::clamp(runners[k].sMax / course.length, 0.0f, 1.0f);
+            const bool hot = runners[k].bornGen == young;
+            Box(sx - 3.0f, y - 3.0f, 6.0f, 6.0f, hot ? ColorOf(k) : CRGBA(255, 255, 255, 60));
+        }
+        if (camOn >= 0 && camOn < numRunners) {
+            const float sx = x0 + (x1 - x0) * std::clamp(runners[camOn].sMax / course.length, 0.0f, 1.0f);
+            Box(sx - 1.0f, y - 11.0f, 2.0f, 22.0f, kGold);
+        }
+    }
+    R = runners;
+}
+
 static void DrawHud() {
     hudU = static_cast<float>(RsGlobal.maximumHeight) / 1080.0f;
     hudH = 1080.0f;
@@ -3030,6 +3474,12 @@ static void DrawHud() {
         Text(40.0f, 38.0f, state == DONE ? "PROVING GROUND - fim: edite o ini para rodar de novo" : "PROVING GROUND - preparando", 1.0f, kWhite);
         return;
     }
+    static bool prevF9 = false;
+    const bool f9 = KeyPressed(VK_F9) != 0;
+    if (f9 && !prevF9) hudMode = (hudMode + 1) % 3;
+    prevF9 = f9;
+    if (hudMode == 2) { Text(W - 20.0f, H - 30.0f, "F9: HUD", 0.5f, kDim, 2); return; }
+    if (hudMode == 0) { DrawHudCompact(); return; }
     const std::vector<int> order = Standings();
     if (human && runT < countdownS + 1.0f) {
         // the countdown
@@ -3109,9 +3559,13 @@ static void DrawHud() {
         Box(x, y, gw, 404.0f, kPanel);
         Box(x, y, 6.0f, 404.0f, CRGBA(175, 110, 255, 255));
         Text(x + 20.0f, y + 8.0f, "ALGORITMO GENETICO", 1.0f, kWhite, 0, FONT_MENU);
-        if (GA::steady)
-            Text(x + 20.0f, y + 38.0f, Format("geracao %d  (%d voltas nela, %d no total)  arquivo %d  sigma %.3f", GA::generation,
-                static_cast<int>(GA::batch.size()), GA::runIds - numRunners, static_cast<int>(GA::archive.size()), GA::sigma), 0.74f, kDim);
+        if (GA::steady) {
+            // the generations still running: how many of their Runners runs ended
+            std::string open;
+            int shown = 0;
+            for (const auto& bg : GA::batches) if (shown++ < 3) open += Format("g%d %d/%d   ", bg.first, static_cast<int>(bg.second.size()), numRunners);
+            Text(x + 20.0f, y + 38.0f, Format("%sarquivo %d  sigma %.3f", open.c_str(), static_cast<int>(GA::archive.size()), GA::sigma), 0.74f, kDim);
+        }
         else Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
         if (course.halfWidth > 0.0f && GA::edgePenalty <= 0.0f)
             Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x s fora da pista (%.0f m): dentro dela, qualquer linha", GA::offPenalty,
@@ -3137,9 +3591,10 @@ static void DrawHud() {
         for (int k = 0; k < numRunners; k++)
             if (runners[k].result == "end" && (bestNow < 0 || GA::res[k].score < GA::res[bestNow].score)) bestNow = k;
         const GA::Done* bestDone = nullptr;
-        for (const auto& dn : GA::batch) if (dn.r.why == "end" && (!bestDone || dn.r.score < bestDone->r.score)) bestDone = &dn;
+        const int oldest = GA::batches.empty() ? -1 : GA::batches.begin()->first;
+        if (oldest >= 0) for (const auto& dn : GA::batches.begin()->second) if (dn.r.why == "end" && (!bestDone || dn.r.score < bestDone->r.score)) bestDone = &dn;
         if (GA::steady && bestDone)
-            card(y + 88.0f, Format("MELHOR DESTA GERACAO (%d corridas)", static_cast<int>(GA::batch.size())).c_str(), -1,
+            card(y + 88.0f, Format("MELHOR DA GERACAO %d (%d de %d)", oldest, static_cast<int>(GA::batches.begin()->second.size()), numRunners).c_str(), -1,
                 bestDone->id + "  " + GA::modes[bestDone->g.mode], bestDone->r.score, bestDone->r.time, bestDone->r.mean, bestDone->r.maxE);
         else if (bestNow >= 0) {
             const GA::Result& b = GA::res[bestNow];
@@ -3252,6 +3707,7 @@ static void DrawHud() {
 
 void Draw() {
     if (!enabled || state == WAIT_GAME) return;
+    Perf::Scope perf(Perf::DRAW);
     RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nullptr);
     RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
@@ -3355,6 +3811,7 @@ void Draw() {
     RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
     RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(uintptr_t)zWrite);
     R = runners;
+    Perf::Scope perfHud(Perf::HUD);
     DrawHud();
 }
 
