@@ -1995,6 +1995,7 @@ static float nnSigma = 0.05f;  // mode neural: the mutation of a weight
 static bool nn2Es = false;
 static float nn2Sigma = 0.02f, nn2Alpha = 0.03f, nn2Noise = 0.01f;
 static int nn2Cars = 20;
+static int nn2Min = 0;   // Nn2Min: at least this many neural2 brains in every generation (the user: 25, so it evolves)
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
 static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
 // DevWeight: the time made longer by the mean deviation from the car's own line, in proportion (0.3: 0.1 m -> +3%): the
@@ -2063,6 +2064,7 @@ static void Read(CIniReader& ini, const Settings& s) {
     nn2Alpha = ini.ReadFloat("GA", "Nn2Alpha", nn2Alpha);
     nn2Noise = ini.ReadFloat("GA", "Nn2Noise", nn2Noise);
     nn2Cars = ini.ReadInteger("GA", "Nn2Cars", nn2Cars);
+    nn2Min = ini.ReadInteger("GA", "Nn2Min", nn2Min);
     tournament = std::max(ini.ReadInteger("GA", "Tournament", tournament), 1);
     immigrants = ini.ReadInteger("GA", "Immigrants", immigrants);
     maxGenerations = ini.ReadInteger("GA", "Generations", maxGenerations);
@@ -2807,7 +2809,23 @@ static Genome Breed(const Genome& a, const Genome& b, int own) {
     return c;
 }
 
+static int forceMode = -1; // (Child: the algorithm the next brain must be, Nn2Min)
+static Genome ChildOf(int k);
+// The next brain for lane k; neural2 forced when the generation would end with fewer than Nn2Min of them
 static Genome Child(int k) {
+    static int nnGen = -1, nnBorn = 0;
+    const int g = birthGen < 0 ? generation : birthGen;
+    if (g != nnGen) { nnGen = g; nnBorn = 0; }
+    int nn2Mode = -1;
+    for (int m = 0; m < static_cast<int>(modes.size()); m++) if (modes[m] == "neural2") nn2Mode = m;
+    const int left = numRunners - birthCount; // births left in this generation, this one too
+    forceMode = nn2Mode >= 0 && nnBorn < nn2Min && left <= nn2Min - nnBorn ? nn2Mode : -1;
+    Genome c = ChildOf(k);
+    forceMode = -1;
+    if (IsNeural2(c)) nnBorn++;
+    return c;
+}
+static Genome ChildOf(int k) {
     if (archive.empty()) {
         Genome c = pop[k];
         for (int g = 0; g < kNumGenes; g++)
@@ -2825,6 +2843,7 @@ static Genome Child(int k) {
         const int quota = modes[m] == "neural2" ? std::max(minPerMode, nn2Cars) : minPerMode;
         if (quota - count[m] > lack) { lack = quota - count[m]; own = m; }
     }
+    if (forceMode >= 0) own = forceMode;
     std::vector<int> order(archive.size());
     for (int i = 0; i < static_cast<int>(order.size()); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [](int a, int b) { return archive[a].avg() < archive[b].avg(); });
