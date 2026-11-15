@@ -1,9 +1,64 @@
 # Handoff: Real Traffic Fix (GTA SA Better Driving IA)
 
-State at the end of the 2026-11-14 session. Read this first, then `docs/sensores.html` (the progress checklist,
-published as https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; it was last updated before the race work below).
+State at the end of the 2026-11-15 sessions. Read the GA section first (the latest work), then the Cadrona section
+(the traffic regression, still open), then `docs/sensores.html` (the progress checklist, published as
+https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; behind: it predates the race, proving ground and GA work).
 
-## 2026-11-15 session: Cadrona with traffic regressed - read this first
+## 2026-11-15 (second session): proving ground genetic algorithm - read this first
+
+The user's goal now: an AI that drives the proving ground's circuit fast AND close to the line, found by a genetic
+algorithm (GA) the user watches in the game. Stopped by the user at the end of generation 8 (game closed, the state
+saved); resume with `python tools/proving.py start` (it copies `RealTrafficFix2/RealTrafficFix.proving.ini`) and
+`python tools/ga_review.py wait --every 5` in the background.
+
+What runs (all in `ProvingGround.h`, settings in `RealTrafficFix.proving.ini`, `[GA]` and `[Test.circuit]`):
+- 40 Infernus at once (`Runners = 40`), 10 lanes 115 m apart on each of 4 decks of the proving grid (z 300/380/460/540;
+  `tools/make_gridmap.py` DECKS, platform now x -100..2900, y -2950..-1750). 60 FPS with 40.
+- One 5.1 km circuit with every test (track pieces: S, L/R, W slalom, J lane change/moose, B sudden brake, X
+  crosswind, V posted limit (not used: the user wants no speed per section), N section name): slalom, moose, tight
+  chicane, brake in a curve, fast straight with 1200 m bends + a lane change at 300+ km/h + crosswind gusts, a double
+  spiral (Debian swirl, 45 m down to 7 m and out), 7 m U-turn, zig-zag, tight Z, double 90, fast chicane, brake in a
+  tight curve, variable slalom. Standing start.
+- Score (lower is better, the user's rule: precise first, still fast): time + 100 x mean offset (m) + 5 x s beyond
+  2 m; not finished: 1000 + 0.5/m short. A genome's rank is its average over the generations it drove (physics noise:
+  the same genome scored 156.8 and 158.2).
+- Genome: Mode (kinematic / stanley / pursuit / mod) + 25 genes: steering (Bandwidth, Damping, Preview,
+  LookaheadTime/Min, StanleyK, Gain, Smoothing), speed (GripFactor, GripTight, GripFast, BrakeG, Kp, BrakeKp,
+  CruiseGas), learning (LearnRate), ABS (AbsMargin, AbsDrop, AbsRecover, AbsCircle), TC (TcSlip, TcMinGas, TcDrop,
+  TcRecover, TcCircle; up to no TC: sliding may be faster). Only the genes the car's mode reads mutate; crossover takes
+  each gene from the parent whose mode reads it. Elite 4, tournament 3, 3 immigrants, the best finisher of every other
+  mode kept + one child of its own a generation.
+- Learning by result while driving (`LearnByResult`): per kind of curve (5 radius bands) the car tries a step of its
+  grip or its TC's gas, keeps it if speed/tyre limit - 0.67 x mean offset beat its average for that kind; ABS the same
+  per braking. The user's point: no rules against sliding, judge by the result.
+- HUD: standings by score (24 rows), GA panel (best of this generation / best ever: score, time, mean, max offset),
+  telemetry of the followed car with what it learned; camera on the leader (PageUp/PageDown/Home).
+- Pilot profiles from the runs (`python tools/ga_review.py pilots [--seed]`): Equilibrado, Preciso, Veloz, Agressivo,
+  best of each mode -> `RealTrafficFix2/RealTrafficFix.pilots.ini`, names kept by elites.
+
+Gemini reviews, our validation (the user's request): `tools/ga_review.py wait --every 5` (in the background) asks
+Gemini (agy, gemini-4-argon-high) after generation 0 and every 5th: (A) is the score making cars faster AND closer to
+the line, (B) is the evolution healthy or stuck on a local peak; it reads a report with the "Evolution" table. Then we
+check each claim in the data and store the verdict: `python tools/ga_review.py show <id>`, `validate <id> --verdict
+valid|partial|rejected --notes ... --claim "n|ok|evidence"`. 4 reviews so far (3 partial, 1 valid); typical: numbers
+right, inferences from 3 samples or counts off by one; accepted suggestions are in the commits.
+
+Data: `scripts/proving/ga.sqlite` (generations, individuals, trace, sections, reviews, claims, pilots),
+`ga_history*.csv` (a new file when the genes change), `ga_trace/gen_NNNN.csv`, `ga_state.txt`, `ga_best.ini`; older
+runs in `ga_archive_*`. Viewer: `docs/ga_viewer.html` (`python tools/ga_review.py html`): course, every car's line,
+playback, section times, reviews.
+
+Where it stands (generation 8, the first with learning by result and averaged elites): best average 159.3 (152.6 s,
+mean offset 0.066 m, the most precise yet), best ever 156.8 (gen 3, single runs then). Diversity up 0.08 -> 0.17,
+kinematic 3 -> 13 of 40. Pursuit led every generation.
+
+Next:
+1. Resume, let generations 9+ run; validate Gemini's review of 5-9 (the first with the learning by result): is
+   learning by result helping (trials kept, learned values), does sliding pay (TC genes loosening)?
+2. The best brain into the mod's own driving (LaneControllerSteer is kinematic; pursuit won here) - not started.
+3. Port the learned per-curve-kind grip idea to the traffic AI.
+
+## 2026-11-15 session: Cadrona with traffic regressed
 
 Report page: `docs/avancos.html` (published https://claude.ai/artifact/5P8pM1RmV3BGzL4974qwYt): physics findings, what was
 ported, every test since 25/10 (data: `docs/test_history.json`, from `python tools/test_history.py`, written by Gemini).
