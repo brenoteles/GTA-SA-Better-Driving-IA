@@ -389,6 +389,7 @@ struct Runner {
     float runT = 0.0f;              // s since its run started (steady state: every lane on its own clock)
     float doneAt = 0.0f;            // the clock when its run ended
     int runId = 0;                  // its run's number (steady state: the name of the run in the logs, tag.runId)
+    int bornGen = 0;                // the generation its brain was made in (HUD: cars of several generations together)
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
     float tcBand[5] = { 1, 1, 1, 1, 1 };  // ... the gas its TC lets through in each kind of curve
     float absLearn = 1.0f;                // ... and the brake pedal its ABS allows
@@ -2507,6 +2508,7 @@ static void ResetLane() {
     runT = 0.0f;
     traceNext[R->index] = 0.0f;
     R->runId = ++GA::runIds;
+    R->bornGen = GA::generation;
     nearIdx = 0;
     steerOut = steerCmd = 0.0f;
     stats = Stats();
@@ -3077,7 +3079,8 @@ static void DrawHud() {
         Text(cPos, y + 4.0f, Format("%d", i + 1), ts, kDim);
         Box(cCar, y + 5.0f, 16.0f, 16.0f, ColorOf(k));
         Text(cCar + 24.0f, y + 4.0f, R->tag, ts, kWhite);
-        Text(cMode, y + 4.0f, human && k == 0 ? std::string("VOCE (humano)") : GA::on && !GA::pop[k].label.empty() ? cfg.mode + " - " + GA::pop[k].label : cfg.mode,
+        const std::string born = GA::on && GA::steady ? Format("  g%d", R->bornGen) : std::string();
+        Text(cMode, y + 4.0f, human && k == 0 ? std::string("VOCE (humano)") : (GA::on && !GA::pop[k].label.empty() ? cfg.mode + " - " + GA::pop[k].label : cfg.mode) + born,
             ts, human && k == 0 ? CRGBA(255, 214, 10, 255) : kWhite);
         const bool running = R->result.empty(), arrived = R->result == "end";
         Text(cSpeed, y + 4.0f, running ? Format("%.0f", R->speedNow) : "-", ts, kWhite, 2);
@@ -3106,7 +3109,10 @@ static void DrawHud() {
         Box(x, y, gw, 404.0f, kPanel);
         Box(x, y, 6.0f, 404.0f, CRGBA(175, 110, 255, 255));
         Text(x + 20.0f, y + 8.0f, "ALGORITMO GENETICO", 1.0f, kWhite, 0, FONT_MENU);
-        Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
+        if (GA::steady)
+            Text(x + 20.0f, y + 38.0f, Format("geracao %d  (%d voltas nela, %d no total)  arquivo %d  sigma %.3f", GA::generation,
+                static_cast<int>(GA::batch.size()), GA::runIds - numRunners, static_cast<int>(GA::archive.size()), GA::sigma), 0.74f, kDim);
+        else Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
         if (course.halfWidth > 0.0f && GA::edgePenalty <= 0.0f)
             Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x s fora da pista (%.0f m): dentro dela, qualquer linha", GA::offPenalty,
                 2.0f * course.halfWidth), 0.66f, kDim);
