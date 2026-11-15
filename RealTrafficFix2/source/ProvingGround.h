@@ -138,6 +138,10 @@ static float countdownS = 0.0f;
 // forward/sideways speed, yaw rate, the wheel, the road's curvature 20/50/100 m ahead -> 10 tanh -> wheel and pedal;
 // the GA evolves its weights (tools/nn_clone.py can start them from a human's lap)
 static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnHid + 1) * 2;
+// mode neural2: every sensor there is (63: rays, the road and its own line, curvature ahead, obstacles, the car's
+// motion, slip, attitude, each wheel) -> 24 tanh -> wheel and pedal; first taught by imitation (tools/nn2_train.py,
+// DAgger), then improved by evolution strategies in the game (GA::Nn2*)
+static constexpr int kNn2In = 63, kNn2Hid = 24, kNN2 = (kNn2In + 1) * kNn2Hid + (kNn2Hid + 1) * 2;
 static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
 static void SetRunnerSettings(const Settings* rs);
@@ -369,6 +373,7 @@ struct Runner {
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake)
+    float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
     std::vector<int> obstacles;     // its lane's obstacle objects (handles)
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
     float tcBand[5] = { 1, 1, 1, 1, 1 };  // ... the gas its TC lets through in each kind of curve
@@ -973,6 +978,119 @@ static void NeuralInputs(CVehicle* v, float* in) {
     }
 }
 
+// What neural2 sees (also logged for its teachers and itself: tools/nn2_train.py)
+static void Neural2Inputs(CVehicle* v, float* in) {
+    const Course& rd = R->road;
+    const int n = static_cast<int>(rd.p.size());
+    const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), rt(fwd.y, -fwd.x);
+    const float carHead = std::atan2(fwd.y, fwd.x), half = rd.halfWidth > 0.0f ? rd.halfWidth : 2.0f;
+    const int ni = std::clamp(nearIdx, 0, std::max(n - 1, 0));
+    int k = 0;
+    // 19 rays to the road's edges, every 10 degrees over the front 180
+    for (int r = 0; r < 19; r++) {
+        const float a = carHead + (-90.0f + 10.0f * r) * 3.14159265f / 180.0f;
+        const CVector2D dir(std::cos(a), std::sin(a));
+        float dist = 60.0f;
+        int hint = ni;
+        for (float t = 2.0f; t <= 60.0f && n > 1; t += 2.0f) {
+            const CVector2D pt = pos + dir * t;
+            hint = NearestIndexIn(rd, pt, hint, 10);
+            if (std::abs(ProjectIn(rd, pt, hint).offset) > half) { dist = t; break; }
+        }
+        in[k++] = dist / 60.0f;
+    }
+    // the road and its own line: offset, heading error; the room each side (the body's corners)
+    const OnCourse oc = n > 1 ? ProjectIn(rd, pos, ni) : OnCourse{ 0, 0, 0, carHead, 0 };
+    in[k++] = oc.offset / half;
+    in[k++] = offsetNow / half;
+    in[k++] = WrapPi(carHead - oc.head);
+    in[k++] = headErrNow;
+    float latMax = -99.0f, latMin = 99.0f;
+    for (float fy : { R->bodyFront, R->bodyRear })
+        for (float sx : { -1.0f, 1.0f }) {
+            const CVector2D corner = pos + fwd * fy + rt * (sx * R->bodyHalfW);
+            const float lat = n > 1 ? ProjectIn(rd, corner, NearestIndexIn(rd, corner, ni, 16)).offset : 0.0f;
+            latMax = std::max(latMax, lat);
+            latMin = std::min(latMin, lat);
+        }
+    in[k++] = (half - latMax) / 2.0f;
+    in[k++] = (half + latMin) / 2.0f;
+    // the road's curvature ahead, the next curve, the next obstacle, the progress
+    auto at = [&](float m) { return std::clamp(ni + static_cast<int>(m / 0.5f), 0, std::max(n - 1, 0)); };
+    for (float m : { 0.0f, 10.0f, 25.0f, 50.0f, 100.0f, 200.0f }) in[k++] = n ? std::clamp(rd.curv[at(m)] * 20.0f, -1.0f, 1.0f) : 0.0f;
+    float curveD = 1.0f, curveK = 0.0f;
+    for (float m = 0.0f; m <= 300.0f && n; m += 2.0f)
+        if (std::abs(rd.curv[at(m)]) > 1.0f / 150.0f) { curveD = m / 300.0f; curveK = std::clamp(rd.curv[at(m)] * 20.0f, -1.0f, 1.0f); break; }
+    in[k++] = curveD;
+    in[k++] = curveK;
+    float obD = 1.0f, obLat = 0.0f, obKind = 0.0f;
+    for (const auto& o : rd.obst)
+        if (o.i >= ni && n) { obD = std::min((rd.s[std::min(o.i, n - 1)] - rd.s[ni]) / 100.0f, 1.0f); obLat = o.lat; obKind = o.model == 19402 ? -1.0f : 1.0f; break; }
+    in[k++] = obD;
+    in[k++] = obLat;
+    in[k++] = obKind;
+    in[k++] = n ? rd.s[ni] / std::max(rd.length, 1.0f) : 0.0f;
+    // the car's motion
+    const CVector vel = v->m_vecMoveSpeed * GAME_SPEED_TO_MPS, turn = v->m_vecTurnSpeed * GAME_SPEED_TO_MPS;
+    const float vF = CVector::Dot(vel, v->GetForward()), vR = CVector::Dot(vel, v->GetRight());
+    in[k++] = vF / 80.0f;
+    in[k++] = vR / 10.0f;
+    in[k++] = vel.z / 10.0f;
+    in[k++] = turn.z / 2.0f;
+    in[k++] = CVector::Dot(turn, v->GetForward()) / 2.0f;   // roll rate
+    in[k++] = CVector::Dot(turn, v->GetRight()) / 2.0f;     // pitch rate
+    in[k++] = std::clamp(R->aLongNow / 20.0f, -2.0f, 2.0f);
+    in[k++] = std::clamp(R->latGNow / 2.0f, -2.0f, 2.0f);
+    in[k++] = std::atan2(vR, std::max(std::abs(vF), 0.5f));
+    in[k++] = std::atan2(vR - v->m_vecTurnSpeed.z * rearAxleY * GAME_SPEED_TO_MPS, std::max(std::abs(vF), 0.5f));
+    in[k++] = v->GetRight().z;                              // roll
+    in[k++] = v->GetForward().z;                            // pitch
+    in[k++] = v->m_fSteerAngle / HandlingLockRad(v);
+    in[k++] = gasOut;
+    in[k++] = brakeOut;
+    // each wheel: its state (rolling, spinning, skidding, locked), its suspension, on the ground or not
+    CAutomobile* a = static_cast<CAutomobile*>(v);
+    int contact = 0;
+    for (int w = 0; w < 4; w++) in[k++] = static_cast<float>(a->m_wheelState[w]) / 3.0f;
+    for (int w = 0; w < 4; w++) { const float c = a->m_fWheelsSuspensionCompressionPrev[w]; in[k++] = c; contact += c < 1.0f; }
+    in[k++] = contact / 4.0f;
+    in[k++] = contact == 0 ? 1.0f : 0.0f;
+    // the grip in use, the crosswind
+    in[k++] = std::clamp(std::abs(R->latGNow) / std::max(aiGripG, 0.1f), 0.0f, 2.0f);
+    in[k++] = R->windNow / 3.0f;
+    while (k < kNn2In) in[k++] = 0.0f;
+}
+
+static float Neural2Steer(CVehicle* v, float vv, int i) {
+    float in[kNn2In], h[kNn2Hid];
+    Neural2Inputs(v, in);
+    const float lock = HandlingLockRad(v);
+    // the teacher: what pursuit with this car's genes would steer (DAgger's label; also neural2's fallback)
+    {
+        const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
+        const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), left(-fwd.y, fwd.x);
+        const CVector2D rel = course.p[Advance(i, ld)] - pos;
+        R->teacherSteer = std::clamp(std::atan2(2.0f * wheelBase * std::sin(std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd))), ld) * cfg.gain, -lock, lock);
+    }
+    const std::vector<float>& w = cfg.nn;
+    if (static_cast<int>(w.size()) < kNN2) { R->nnPedal = 0.0f; return R->teacherSteer; }
+    for (int j = 0; j < kNn2Hid; j++) {
+        const float* row = &w[j * (kNn2In + 1)];
+        float sum = row[kNn2In];
+        for (int q = 0; q < kNn2In; q++) sum += row[q] * in[q];
+        h[j] = std::tanh(sum);
+    }
+    float o[2];
+    for (int m = 0; m < 2; m++) {
+        const float* row = &w[kNn2Hid * (kNn2In + 1) + m * (kNn2Hid + 1)];
+        float sum = row[kNn2Hid];
+        for (int j = 0; j < kNn2Hid; j++) sum += row[j] * h[j];
+        o[m] = std::tanh(sum);
+    }
+    R->nnPedal = o[1];
+    return o[0] * lock;
+}
+
 static float NeuralSteer(CVehicle* v) {
     float in[kNnIn], h[kNnHid];
     NeuralInputs(v, in);
@@ -1070,6 +1188,10 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
     }
     else if (cfg.mode == "neural") {
         d = NeuralSteer(v);
+        lookPoint = course.p[Advance(i, 0.5f * vv)];
+    }
+    else if (cfg.mode == "neural2") {
+        d = Neural2Steer(v, vv, i);
         lookPoint = course.p[Advance(i, 0.5f * vv)];
     }
     else if (cfg.mode == "mpc") {
@@ -1278,8 +1400,9 @@ static void Control(CVehicle* v) {
         if (e > -0.5f) gas = std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f);
         if (e < -1.0f) brake = std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f);
     }
-    // mode neural: its own pedal (the speed plan is not its)
-    if (!openLoop && cfg.mode == "neural") {
+    // mode neural / neural2: its own pedal (the speed plan is not its; for neural2 it is the teacher's)
+    R->teacherPedal = gas - brake;
+    if (!openLoop && (cfg.mode == "neural" || (cfg.mode == "neural2" && !cfg.nn.empty()))) {
         gas = std::max(R->nnPedal, 0.0f);
         brake = std::max(-R->nnPedal, 0.0f);
         // (below 18 km/h a launch: its teachers had nothing slower, and it never left the start)
@@ -1567,12 +1690,16 @@ static const GeneDef kGenes[] = {
 constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
 // label: its pilot profile (elites keep it); sum / runs: its scores so far (an elite drives again every generation: GTA's
 // physics gave the same genome 156.8 and 158.2, more than between 1st and 3rd; its average is what ranks it)
-struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; double sum = 0.0; int runs = 0; float nn[kNN] = {}; };
+struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; double sum = 0.0; int runs = 0; float nn[kNN2] = {}; };
 struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0, deficit = 0.0, minMargin = 1e9; std::string why; int runs = 0; };
 
 static int elite = 2, tournament = 3, immigrants = 1, maxGenerations = 0;
 static int minPerMode = 0; // islands: every algorithm at least this many cars, bred among its own
 static float nnSigma = 0.05f;  // mode neural: the mutation of a weight
+// neural2's evolution strategies ([GA] Nn2*: see AssignNn2 / StepTheta)
+static bool nn2Es = false;
+static float nn2Sigma = 0.02f, nn2Alpha = 0.03f, nn2Noise = 0.01f;
+static int nn2Cars = 20;
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
 static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
 static bool resume = true;
@@ -1613,6 +1740,11 @@ static void Read(CIniReader& ini, const Settings& s) {
     elite = ini.ReadInteger("GA", "Elite", elite);
     minPerMode = ini.ReadInteger("GA", "MinPerMode", minPerMode);
     nnSigma = ini.ReadFloat("GA", "NnSigma", nnSigma);
+    nn2Es = ini.ReadInteger("GA", "Nn2Es", 0) != 0;
+    nn2Sigma = ini.ReadFloat("GA", "Nn2Sigma", nn2Sigma);
+    nn2Alpha = ini.ReadFloat("GA", "Nn2Alpha", nn2Alpha);
+    nn2Noise = ini.ReadFloat("GA", "Nn2Noise", nn2Noise);
+    nn2Cars = ini.ReadInteger("GA", "Nn2Cars", nn2Cars);
     tournament = std::max(ini.ReadInteger("GA", "Tournament", tournament), 1);
     immigrants = ini.ReadInteger("GA", "Immigrants", immigrants);
     maxGenerations = ini.ReadInteger("GA", "Generations", maxGenerations);
@@ -1666,6 +1798,75 @@ static std::string ShortText(const Genome& g) {
 
 static bool IsNeural(const Genome& g) { return modes[std::clamp(g.mode, 0, static_cast<int>(modes.size()) - 1)] == "neural"; }
 // a neural genome's first weights: tools/nn_clone.py's (a human's lap) if there, else small random ones
+// Neural2's evolution strategies (OpenAI-ES, Salimans et al. 2017): one central network theta
+// (scripts\proving\nn2_central.txt: tools/nn2_train.py writes it, the game reloads it when it changes); its cars drive
+// theta + sigma eps and theta - sigma eps in pairs (and one theta itself); after the generation, with Nn2Es = 1, theta
+// moves by Nn2Alpha / (N sigma) x sum of each pair's eps weighted by its rank (centred ranks of the score)
+static bool IsNeural2(const Genome& g) { return modes[std::clamp(g.mode, 0, static_cast<int>(modes.size()) - 1)] == "neural2"; }
+static std::vector<float> nn2Theta;
+static FILETIME nn2Stamp{};
+static std::vector<float> nn2Eps[kMaxRunners];     // the perturbation each car drove (empty: none)
+static std::string Nn2Path() { return baseDir + "proving\\nn2_central.txt"; }
+static void LoadTheta() {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(Nn2Path().c_str(), GetFileExInfoStandard, &a) || CompareFileTime(&a.ftLastWriteTime, &nn2Stamp) == 0) return;
+    std::ifstream f(Nn2Path());
+    std::vector<float> w;
+    float x;
+    while (f >> x) w.push_back(x);
+    if (static_cast<int>(w.size()) != kNN2) return;
+    nn2Theta = w;
+    nn2Stamp = a.ftLastWriteTime;
+    Log(Format("neural2: theta loaded (%d weights)", kNN2));
+}
+static void SaveTheta() {
+    {
+        std::ofstream f(Nn2Path(), std::ios::trunc);
+        for (float x : nn2Theta) f << x << " ";
+        f << "\n";
+    }
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesExA(Nn2Path().c_str(), GetFileExInfoStandard, &a)) nn2Stamp = a.ftLastWriteTime;
+}
+// Theta and its perturbations onto the neural2 genomes (pairs: +eps, -eps; the first is theta itself)
+static void AssignNn2(Genome* g, int n) {
+    LoadTheta();
+    const float sg = nn2Es ? nn2Sigma : nn2Noise;
+    int j = 0;
+    std::vector<float> eps(kNN2);
+    for (int k = 0; k < n; k++) {
+        nn2Eps[k].clear();
+        if (!IsNeural2(g[k])) continue;
+        if (static_cast<int>(nn2Theta.size()) != kNN2) { for (float& w : g[k].nn) w = 0.0f; continue; } // (no theta yet: the teacher steers)
+        if (j > 0 && j % 2 == 1) for (float& e : eps) e = N01();
+        const float sign = j == 0 ? 0.0f : j % 2 == 1 ? 1.0f : -1.0f;
+        nn2Eps[k].resize(kNN2);
+        for (int w = 0; w < kNN2; w++) { nn2Eps[k][w] = sign * eps[w]; g[k].nn[w] = nn2Theta[w] + sg * nn2Eps[k][w]; }
+        if (j == 0) nn2Eps[k].clear();          // (theta itself: shown, not used for the step)
+        j++;
+    }
+}
+// After a generation: theta's step from how its perturbations scored
+static void StepTheta(int n) {
+    if (!nn2Es || static_cast<int>(nn2Theta.size()) != kNN2) return;
+    std::vector<int> ks;
+    for (int k = 0; k < n; k++) if (IsNeural2(pop[k]) && !nn2Eps[k].empty()) ks.push_back(k);
+    if (ks.size() < 2) return;
+    std::vector<int> order = ks;
+    std::sort(order.begin(), order.end(), [](int a, int b) { return res[a].score > res[b].score; }); // worst first
+    std::vector<float> step(kNN2, 0.0f);
+    const int m = static_cast<int>(order.size());
+    for (int r = 0; r < m; r++) {
+        const float u = static_cast<float>(r) / (m - 1) - 0.5f;   // centred rank: the best +0.5
+        for (int w = 0; w < kNN2; w++) step[w] += u * nn2Eps[order[r]][w];
+    }
+    for (int w = 0; w < kNN2; w++) nn2Theta[w] += nn2Alpha / (m * nn2Sigma) * step[w] - 0.0005f * nn2Alpha * nn2Theta[w];
+    SaveTheta();
+    double best = 1e18;
+    for (int k : ks) best = std::min(best, res[k].score);
+    Log(Format("neural2: ES step from %d cars (best of them %.1f)", m, best));
+}
+
 static void SeedWeights(Genome& g) {
     std::ifstream f(baseDir + "proving\\nn_seed.txt");
     std::vector<float> w;
@@ -1679,6 +1880,8 @@ static void Apply() {
     for (int k = 0; k < numRunners; k++) {
         Settings s = ToSettings(pop[k]);
         if (IsNeural(pop[k])) s.nn.assign(pop[k].nn, pop[k].nn + kNN);
+        // (neural2 with no theta yet: no weights, it drives as its teacher)
+        if (IsNeural2(pop[k]) && static_cast<int>(nn2Theta.size()) == kNN2) s.nn.assign(pop[k].nn, pop[k].nn + kNN2);
         s.driver = base.driver;
         CfgOf(k) = s;
     }
@@ -1802,6 +2005,7 @@ static void Start() {
         }
     }
     for (int k = 0; k < kMaxRunners; k++) res[k] = Result();
+    AssignNn2(pop, numRunners);
     Apply();
     Log(Format("GA: %s, generation %d, population %d, elite %d, sigma %.3f, modes %d, best ever %s", resumed ? "resumed" : "new",
         generation, numRunners, elite, sigma, static_cast<int>(modes.size()), bestGen >= 0 ? Format("%.2f (gen %d)", bestScore, bestGen).c_str() : "-"));
@@ -1913,7 +2117,8 @@ static void NextGeneration() {
     for (int m = 0; m < nm; m++) {
         int have = 0;
         for (int i = 0; i < e; i++) have += next[i].mode == m;
-        int need = minPerMode > 0 ? std::max(minPerMode - have, 0) : (have ? 0 : 2);
+        const int quota = modes[m] == "neural2" ? std::max(minPerMode, nn2Cars) : minPerMode; // (neural2: its ES's pairs)
+        int need = minPerMode > 0 ? std::max(quota - have, 0) : (have ? 0 : 2);
         if (need <= 0) continue;
         for (int r = e; r < n; r++)
             if (pop[order[r]].mode == m && res[order[r]].why == "end" && !(human && order[r] == 0)) { next[kept++] = pop[order[r]]; need--; break; }
@@ -1976,6 +2181,8 @@ static void NextGeneration() {
     }
     for (int i = n - imm; i < n; i++) next[i] = Random();
     if (human && n > 1) std::swap(next[0], next[n - 1]); // (the best brain not on the human's car A)
+    StepTheta(n);
+    AssignNn2(next, n);
     for (int k = 0; k < n; k++) { pop[k] = next[k]; res[k] = Result(); }
     generation++;
     sigma = std::max(sigma * sigmaDecay, sigmaMin);
@@ -2071,6 +2278,8 @@ static void OpenTrace() {
     trace.open(dir + (GA::on ? Format("gen_%04d.csv", GA::generation) : std::string("trace.csv")), std::ios::trunc);
     trace << "generation,car,mode,t,x,y,speed_kmh,target_kmh,offset,steer,gas,brake,s,lat_g,slip,abs,tc,margin";
     for (int i = 0; i < kNnIn; i++) trace << ",in" << i;
+    for (int i = 0; i < kNn2In; i++) trace << ",n" << i;
+    trace << ",teacher_steer,teacher_pedal";
     trace << "\n";
     for (float& t : traceNext) t = 0.0f;
     if (courseWritten || !curTest) return;
@@ -2105,6 +2314,15 @@ static void Trace(CVehicle* v) {
     NeuralInputs(v, in);
     std::string tail;
     for (int i = 0; i < kNnIn; i++) tail += Format(",%.3f", in[i]);
+    // (neural2's sensors only for its teachers and itself: they make the file 3x bigger)
+    const bool n2 = cfg.mode == "neural2" || cfg.mode == "pursuit" || cfg.mode == "rpp" || cfg.mode == "blend";
+    if (n2) {
+        float in2[kNn2In];
+        Neural2Inputs(v, in2);
+        for (int i = 0; i < kNn2In; i++) tail += Format(",%.3f", in2[i]);
+        tail += cfg.mode == "neural2" ? Format(",%.4f,%.3f", R->teacherSteer, R->teacherPedal) : Format(",%.4f,%.3f", v->m_fSteerAngle, gasOut - brakeOut);
+    }
+    else tail += std::string(kNn2In + 2, ',');
     trace << tail << "\n";
 }
 
