@@ -102,10 +102,13 @@ static std::vector<std::string> ParseWords(const std::string& s) {
     return out;
 }
 
-// Up to 10 cars on the same course at once, each LaneShift m to the right of the one before (A/B tests; the GA's
-// population)
-static constexpr int kMaxRunners = 10;
-static const char* const kTags[kMaxRunners] = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J" };
+// Up to 20 cars on the same course at once, each LaneShift m to the right of the one before, LanesPerDeck to a deck of
+// the platform, the next ones on the deck DeckHeight m above (A/B tests; the GA's population)
+static constexpr int kMaxRunners = 20;
+static const char* const kTags[kMaxRunners] = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+                                                "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T" };
+static int lanesPerDeck = 10;
+static float deckHeight = 80.0f;
 static void SetRunnerSettings(const Settings* rs);
 static int numRunners = 1;
 static float laneShiftB = 40.0f;
@@ -221,6 +224,8 @@ static void ReadSettings() {
     // [Steer.B] / [Speed.B] (C, D...) over A's settings
     numRunners = std::clamp(ini.ReadInteger("Proving", "Runners", ini.ReadInteger("Proving", "AB", 0) ? 2 : 1), 1, kMaxRunners);
     laneShiftB = ini.ReadFloat("Proving", "LaneShift", laneShiftB);
+    lanesPerDeck = std::max(ini.ReadInteger("Proving", "LanesPerDeck", lanesPerDeck), 1);
+    deckHeight = ini.ReadFloat("Proving", "DeckHeight", deckHeight);
     std::vector<Settings> rs(kMaxRunners, s);
     for (int k = 1; k < kMaxRunners; k++) control(rs[k], std::string(".") + kTags[k]);
     SetRunnerSettings(rs.data());
@@ -261,6 +266,7 @@ struct Runner {
     const char* tag = "A";
     int index = 0;
     float laneShift = 0.0f;         // m to the right of the test's course
+    float baseZ = 300.0f;           // its deck's surface
     Settings cfg;
     Course course;
     CVehicle* car = nullptr;
@@ -283,6 +289,7 @@ struct Runner {
     // the run so far (HUD, GA)
     std::string result;             // how its run ended ("" while it runs)
     float endTime = 0.0f, sMax = 0.0f, slowTime = 0.0f;
+    float progressS = 0.0f, progressT = 0.0f; // the last 5 m of progress: where and when
     float latGNow = 0.0f, slipNow = 0.0f, speedNow = 0.0f;
     bool skidFNow = false, skidRNow = false, absOn = false, tcOn = false;
     float windNow = 0.0f;
@@ -294,7 +301,8 @@ static void SetRunnerSettings(const Settings* rs) {
         runners[k].cfg = rs[k];
         runners[k].tag = kTags[k];
         runners[k].index = k;
-        runners[k].laneShift = k * laneShiftB;
+        runners[k].laneShift = (k % lanesPerDeck) * laneShiftB;
+        runners[k].baseZ = rs[k].origin.z + (k / lanesPerDeck) * deckHeight;
     }
 }
 static Settings& CfgOf(int k) { return runners[k].cfg; }
@@ -684,11 +692,12 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
         // at the front axle
         const CVector2D front = pos + fwd * (0.5f * L);
         const int fi = NearestIndex(front, i, 20);
-        const CVector2D fd(std::cos(course.head[fi]), std::sin(course.head[fi]));
-        const float ef = CVector2D::Dot(front - course.p[fi], CVector2D(-fd.y, fd.x));
-        const float pf = WrapPi(carHead - course.head[fi]);
+        // (between the course's points, as the kinematic mode: their own directions step every 0.5 m)
+        const OnCourse oc = Project(front, fi);
+        const float ef = oc.offset;
+        const float pf = WrapPi(carHead - oc.head);
         d = -pf - std::atan(cfg.stanleyK * ef / (vv + cfg.stanleySoft));
-        if (cfg.feedForward) d += std::atan(L * course.curv[Advance(fi, cfg.preview * vv)]);
+        if (cfg.feedForward) d += std::atan(L * course.curv[Advance(oc.i, cfg.preview * vv + oc.frac * 0.5f)]);
         lookPoint = course.p[fi];
     }
     else if (cfg.mode == "kinematic") {
@@ -769,7 +778,9 @@ static void Control(CVehicle* v) {
     const float dt = std::max(CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS, 0.001f);
     const float speed = CVector::Dot(v->m_vecMoveSpeed, v->GetForward()) * GAME_SPEED_TO_MPS;
     const bool openLoop = d.steer != "none";
-    nearIdx = NearestIndex(v->GetPosition().To2D(), nearIdx, 120);
+    // the search around the last point no wider than the car can go (the spiral's tight loops are 7-11 m apart and ~44 m
+    // of course apart: with +-60 m a car off the line snapped onto the next loop and went round and round)
+    nearIdx = NearestIndex(v->GetPosition().To2D(), nearIdx, std::clamp(static_cast<int>(std::abs(speed) * 0.5f / 0.5f), 30, 120));
     if (openLoop) {
         // offset from the drawn line, for the record only
         ClosedLoopSteer(v, speed);
@@ -986,6 +997,7 @@ static void Record(CVehicle* v, float dt) {
     R->skidFNow = ws[0] || ws[2];
     R->skidRNow = ws[1] || ws[3];
     if (!course.s.empty()) R->sMax = std::max(R->sMax, course.s[nearIdx]);
+    if (R->sMax > R->progressS + 5.0f) { R->progressS = R->sMax; R->progressT = runT; }
     if (std::abs(offsetNow) > offLimitGA) stats.outTime += dt;
     if (csv.is_open()) csv << Format("%.3f,%.4f,%.2f,%.2f,%.2f,%.4f,%.2f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.2f,%d,%d,%.3f,%.4f,%.5f,%.1f,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.1f,%d,%.4f,%d\n",
         runT, dt, p.x, p.y, p.z, std::atan2(fwd.y, fwd.x), speed * 3.6f, vF, vL, yaw, aLong, aLat, steerCmd, v->m_fSteerAngle, gasOut, brakeOut,
@@ -1051,21 +1063,22 @@ static void EndRun(const char* why) {
 // the same; Resume = 0 starts over), ga_history.csv (every individual of every generation), ga_best.ini (the best ever
 // as [Steer] / [Speed] sections).
 namespace GA {
-struct GeneDef { const char* sec; const char* key; float Settings::* field; float lo, hi; };
+// (uses: the modes that read the gene, empty = all: only those genes mutate)
+struct GeneDef { const char* sec; const char* key; float Settings::* field; float lo, hi; const char* uses; };
 static const GeneDef kGenes[] = {
-    { "Steer", "Bandwidth", &Settings::bandwidth, 0.5f, 4.0f },       // kinematic
-    { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f },           // kinematic
-    { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f },           // kinematic, stanley
+    { "Steer", "Bandwidth", &Settings::bandwidth, 0.5f, 4.0f, "kinematic" },
+    { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f, "kinematic" },
+    { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley" },
     // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
-    { "Steer", "LookaheadTime", &Settings::lookTime, 0.05f, 1.5f },   // pursuit, mod fallback
-    { "Steer", "LookaheadMin", &Settings::lookMin, 3.0f, 15.0f },     // pursuit
-    { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f },         // stanley
-    { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f },                 // all
-    { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f },      // all
-    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f },    // curve speeds: share of the AI grip formula
-    { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f },        // braking planned for curves and limits
-    { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f },
-    { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 1.5f },
+    { "Steer", "LookaheadTime", &Settings::lookTime, 0.05f, 1.5f, "pursuit mod" }, // (mod: its fallback)
+    { "Steer", "LookaheadMin", &Settings::lookMin, 3.0f, 15.0f, "pursuit mod" },
+    { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
+    { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "" },
+    { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f, "" },
+    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f, "" }, // curve speeds: share of the AI grip formula
+    { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
+    { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
+    { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 1.5f, "" },
 };
 constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
 struct Genome { int mode = 0; float g[kNumGenes] = {}; };
@@ -1086,6 +1099,7 @@ static Genome best;
 static double bestScore = 1e18;
 static int bestGen = -1;
 static std::vector<double> history;  // the best score of each generation (HUD)
+static Result bestRes;               // the best ever's run
 static std::mt19937 rng;
 
 static float U() { return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng); }
@@ -1094,6 +1108,13 @@ static int Pick(int n) { return std::uniform_int_distribution<int>(0, std::max(n
 static int ModeIndex(const std::string& m) {
     for (size_t i = 0; i < modes.size(); i++) if (modes[i] == m) return static_cast<int>(i);
     return 0;
+}
+static bool Uses(int gene, int mode) {
+    const std::string u = kGenes[gene].uses;
+    if (u.empty()) return true;
+    const std::string m = modes[std::clamp(mode, 0, static_cast<int>(modes.size()) - 1)];
+    for (const std::string& w : ParseWords(u)) if (w == m) return true;
+    return false;
 }
 static std::string StatePath() { return baseDir + "proving\\ga_state.txt"; }
 
@@ -1162,7 +1183,8 @@ static void Save() {
     f << "genes";
     for (const auto& gd : kGenes) f << " " << gd.key;
     f << "\ngeneration " << generation << "\nsigma " << sigma << "\n";
-    if (bestGen >= 0) f << "best " << bestScore << " " << bestGen << " " << modes[best.mode] << " " << GenesText(best, " ") << "\n";
+    if (bestGen >= 0) f << "best " << bestScore << " " << bestGen << " " << modes[best.mode] << " " << GenesText(best, " ") << "\n"
+                        << "bestrun " << bestRes.time << " " << bestRes.mean << " " << bestRes.maxE << " " << bestRes.out << "\n";
     f << "history";
     for (double h : history) f << " " << h;
     f << "\n";
@@ -1183,6 +1205,7 @@ static bool Load() {
         else if (key == "generation") is >> generation;
         else if (key == "sigma") is >> sigma;
         else if (key == "history") { double h; while (is >> h) history.push_back(h); }
+        else if (key == "bestrun") is >> bestRes.time >> bestRes.mean >> bestRes.maxE >> bestRes.out;
         else if (key == "best" || key == "ind") {
             Genome g;
             std::string mode;
@@ -1191,7 +1214,7 @@ static bool Load() {
             if (key == "best") is >> score >> gen;
             is >> mode;
             g.mode = ModeIndex(mode);
-            for (int i = 0; i < kNumGenes; i++) is >> g.g[i];
+            for (int i = 0; i < kNumGenes; i++) { is >> g.g[i]; g.g[i] = std::clamp(g.g[i], kGenes[i].lo, kGenes[i].hi); }
             if (!is) continue;
             if (key == "best") { best = g; bestScore = score; bestGen = gen; }
             else if (n < numRunners) pop[n++] = g;
@@ -1219,6 +1242,7 @@ static void Start() {
     history.clear();
     bestScore = 1e18;
     bestGen = -1;
+    bestRes = Result();
     const bool resumed = resume && Load();
     if (!resumed) {
         // the ini's own controller, then one of each algorithm, then random ones
@@ -1270,6 +1294,7 @@ static void NextGeneration() {
     if (top.score < bestScore) {
         bestScore = top.score;
         best = pop[order[0]];
+        bestRes = top;
         bestGen = generation;
         WriteBest();
     }
@@ -1306,9 +1331,16 @@ static void NextGeneration() {
         Genome c;
         c.mode = U() < 0.5f ? a.mode : b.mode;
         for (int g = 0; g < kNumGenes; g++) c.g[g] = U() < 0.5f ? a.g[g] : b.g[g];
-        if (U() < modeMutation && modes.size() > 1) c.mode = (c.mode + 1 + Pick(static_cast<int>(modes.size()) - 1)) % static_cast<int>(modes.size());
+        if (U() < modeMutation && modes.size() > 1) {
+            // another algorithm: the genes it reads and the old one did not are drawn anew (they only rode along)
+            const int old = c.mode;
+            c.mode = (c.mode + 1 + Pick(static_cast<int>(modes.size()) - 1)) % static_cast<int>(modes.size());
+            for (int g = 0; g < kNumGenes; g++)
+                if (Uses(g, c.mode) && !Uses(g, old)) c.g[g] = kGenes[g].lo + U() * (kGenes[g].hi - kGenes[g].lo);
+        }
+        // only the genes its algorithm reads (a third of the mutations went to genes the mode ignores)
         for (int g = 0; g < kNumGenes; g++)
-            if (U() < mutRate)
+            if (Uses(g, c.mode) && U() < mutRate)
                 c.g[g] = std::clamp(c.g[g] + N01() * sigma * (kGenes[g].hi - kGenes[g].lo), kGenes[g].lo, kGenes[g].hi);
         next[i] = c;
     }
@@ -1323,8 +1355,8 @@ static void NextGeneration() {
 
 static CVehicle* MakeCar(int model) {
     const CVector2D start = course.p.empty() ? CVector2D(cfg.origin.x, cfg.origin.y) : course.p[0];
-    Command<COMMAND_CLEAR_AREA>(start.x, start.y, cfg.origin.z, 30.0f, 0);
-    Command<COMMAND_CREATE_CAR>(model, start.x, start.y, cfg.origin.z + 1.0f, &carHandle);
+    Command<COMMAND_CLEAR_AREA>(start.x, start.y, R->baseZ, 30.0f, 0);
+    Command<COMMAND_CREATE_CAR>(model, start.x, start.y, R->baseZ + 1.0f, &carHandle);
     CVehicle* v = CPools::GetVehicle(carHandle);
     if (!v) return nullptr;
     Command<COMMAND_SET_CAR_PROOFS>(carHandle, 1, 1, 1, 1, 1);
@@ -1377,8 +1409,8 @@ static void PlaceCar(CVehicle* v, float kmh) {
     const CVector2D p0 = course.p[0];
     const float head = course.head[0];
     bool found = false;
-    float z = FindGroundZ({ p0.x, p0.y, cfg.origin.z + 3.0f }, &found);
-    if (!found) z = cfg.origin.z;
+    float z = FindGroundZ({ p0.x, p0.y, R->baseZ + 3.0f }, &found);
+    if (!found) z = R->baseZ;
     Command<COMMAND_SET_CAR_COORDINATES>(carHandle, p0.x, p0.y, z + 0.5f);
     Command<COMMAND_SET_CAR_HEADING>(carHandle, head * 180.0f / 3.14159265f - 90.0f);
     v->m_vecMoveSpeed = CVector(std::cos(head), std::sin(head), 0.0f) * (kmh / 3.6f / GAME_SPEED_TO_MPS);
@@ -1446,7 +1478,7 @@ static std::vector<int> Standings() {
     std::stable_sort(o.begin(), o.end(), [&](int a, int b) {
         const Runner &x = runners[a], &y = runners[b];
         if (rank(x) != rank(y)) return rank(x) < rank(y);
-        if (rank(x) == 0) return x.endTime < y.endTime;
+        if (rank(x) == 0) return GA::on ? GA::res[x.index].score < GA::res[y.index].score : x.endTime < y.endTime;
         return x.sMax > y.sMax;
     });
     return o;
@@ -1605,15 +1637,15 @@ void Update() {
         // the collision where it starts must be there first (it fell through the ground teleported 300 m away)
         {
             const CVector2D p0 = course.p[0];
-            CColStore::RequestCollision(CVector(p0.x, p0.y, cfg.origin.z), 0);
-            CColStore::AddCollisionNeededAtPosn(CVector(p0.x, p0.y, cfg.origin.z));
+            CColStore::RequestCollision(CVector(p0.x, p0.y, R->baseZ), 0);
+            CColStore::AddCollisionNeededAtPosn(CVector(p0.x, p0.y, R->baseZ));
             CColPoint cp;
             CEntity* hit = nullptr;
-            const bool ground = CWorld::ProcessVerticalLine(CVector(p0.x, p0.y, cfg.origin.z + 5.0f), cfg.origin.z - 10.0f, cp, hit,
+            const bool ground = CWorld::ProcessVerticalLine(CVector(p0.x, p0.y, R->baseZ + 5.0f), R->baseZ - 10.0f, cp, hit,
                 true, false, false, false, true, false, nullptr);
             if (!ground) {
                 if (now - stateTime > 8000) { Log("no ground at the start of this course: check Origin / Start"); state = NEXT_CAR; }
-                else if (now - stateTime > 1500 && now - stateTime < 1600) Command<COMMAND_LOAD_SCENE>(p0.x, p0.y, cfg.origin.z);
+                else if (now - stateTime > 1500 && now - stateTime < 1600) Command<COMMAND_LOAD_SCENE>(p0.x, p0.y, R->baseZ);
                 ready = false;
             }
         }
@@ -1631,7 +1663,7 @@ void Update() {
             absScale = tcScale = 1.0f;
             R->finished = false;
             R->result.clear();
-            R->endTime = R->sMax = R->slowTime = 0.0f;
+            R->endTime = R->sMax = R->slowTime = R->progressS = R->progressT = 0.0f;
             PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
             brakeDone = false;
             StartCsv();
@@ -1681,8 +1713,9 @@ void Update() {
             std::abs(std::atan2(CVector::Dot(car->m_vecMoveSpeed, car->GetRight()), CVector::Dot(car->m_vecMoveSpeed, car->GetForward()))) > 1.2f)
             end = "SPUN";
         else if ((curTest->pedal == "brake" || curTest->pedal == "coast") && runT > curTest->pedalStart + 0.5f && speed < 0.3f) end = "stopped";
-        else if (car->GetPosition().z < cfg.origin.z - 5.0f) end = "FELL";
+        else if (car->GetPosition().z < R->baseZ - 5.0f) end = "FELL";
         else if (R->slowTime > 8.0f) end = "STUCK";
+        else if (!openLoop && runT - R->progressT > 15.0f) end = "NOPROG"; // moving, but not along the course (circling)
         if (end) {
             EndRun(end);
             R->finished = true;
@@ -1741,7 +1774,9 @@ static void Line3D(const CVector& a, const CVector& b, CRGBA c) {
 // one colour per car: its line on the ground, its trail, its row and dot in the HUD
 static const CRGBA kColors[kMaxRunners] = {
     { 255, 214, 10, 255 }, { 255, 89, 94, 255 }, { 54, 162, 235, 255 }, { 76, 217, 100, 255 }, { 255, 146, 43, 255 },
-    { 175, 110, 255, 255 }, { 0, 220, 220, 255 }, { 255, 105, 200, 255 }, { 190, 230, 60, 255 }, { 235, 235, 235, 255 } };
+    { 175, 110, 255, 255 }, { 0, 220, 220, 255 }, { 255, 105, 200, 255 }, { 190, 230, 60, 255 }, { 235, 235, 235, 255 },
+    { 160, 120, 60, 255 }, { 120, 140, 255, 255 }, { 255, 180, 150, 255 }, { 0, 160, 120, 255 }, { 200, 60, 140, 255 },
+    { 150, 200, 255, 255 }, { 255, 240, 140, 255 }, { 120, 90, 200, 255 }, { 255, 120, 70, 255 }, { 140, 140, 140, 255 } };
 static CRGBA Alpha(CRGBA c, int a) { c.a = static_cast<unsigned char>(a); return c; }
 
 // HUD: positions in pixels of a 1080-line screen (u), x up to W
@@ -1807,62 +1842,89 @@ static void DrawHud() {
     if (GA::on) sub = Format("Geracao %d   ", GA::generation) + sub;
     Text(44.0f, 62.0f, sub, 0.85f, kDim);
 
-    // standings
-    const float rowH = 30.0f, top = 104.0f;
-    Box(24.0f, top, 700.0f, 34.0f + rowH * numRunners, kPanel);
-    const float cPos = 36.0f, cCar = 66.0f, cMode = 112.0f, cSpeed = 290.0f, cBar = 306.0f, cOff = 590.0f, cStat = 712.0f;
+    // standings: the finished ones by score (what the GA ranks), then the ones running by how far they got
+    const float rowH = numRunners > 12 ? 26.0f : 30.0f, top = 104.0f, pw = 860.0f;
+    const float ts = numRunners > 12 ? 0.78f : 0.85f;
+    Box(24.0f, top, pw, 34.0f + rowH * numRunners, kPanel);
+    const float cPos = 36.0f, cCar = 66.0f, cMode = 112.0f, cSpeed = 290.0f, cBar = 306.0f, cOff = 590.0f, cTime = 690.0f, cScore = 872.0f;
     Text(cCar, top + 8.0f, "carro", 0.7f, kDim);
     Text(cMode, top + 8.0f, "algoritmo", 0.7f, kDim);
     Text(cSpeed, top + 8.0f, "km/h", 0.7f, kDim, 2);
     Text(cBar, top + 8.0f, "progresso", 0.7f, kDim);
     Text(cOff, top + 8.0f, "desvio medio / max", 0.7f, kDim, 2);
-    Text(cStat, top + 8.0f, "estado", 0.7f, kDim, 2);
+    Text(cTime, top + 8.0f, "tempo", 0.7f, kDim, 2);
+    Text(cScore, top + 8.0f, "pontos", 0.7f, kDim, 2);
     for (int i = 0; i < static_cast<int>(order.size()); i++) {
         const int k = order[i];
         R = &runners[k];
         const float y = top + 34.0f + rowH * i;
-        if (k == camOn) Box(24.0f, y, 700.0f, rowH, CRGBA(255, 255, 255, 28));
-        Text(cPos, y + 5.0f, Format("%d", i + 1), 0.85f, kDim);
-        Box(cCar, y + 6.0f, 18.0f, 18.0f, kColors[k]);
-        Text(cCar + 26.0f, y + 5.0f, R->tag, 0.85f, kWhite);
-        Text(cMode, y + 5.0f, cfg.mode, 0.85f, kWhite);
-        const bool running = R->result.empty();
-        Text(cSpeed, y + 5.0f, running ? Format("%.0f", R->speedNow) : "-", 0.85f, kWhite, 2);
+        if (k == camOn) Box(24.0f, y, pw, rowH, CRGBA(255, 255, 255, 28));
+        Text(cPos, y + 4.0f, Format("%d", i + 1), ts, kDim);
+        Box(cCar, y + 5.0f, 16.0f, 16.0f, kColors[k]);
+        Text(cCar + 24.0f, y + 4.0f, R->tag, ts, kWhite);
+        Text(cMode, y + 4.0f, cfg.mode, ts, kWhite);
+        const bool running = R->result.empty(), arrived = R->result == "end";
+        Text(cSpeed, y + 4.0f, running ? Format("%.0f", R->speedNow) : "-", ts, kWhite, 2);
         const float prog = course.length > 1.0f ? R->sMax / course.length : 0.0f;
-        Bar(cBar, y + 10.0f, 120.0f, 10.0f, prog, Alpha(kColors[k], 220));
-        Text(cBar + 128.0f, y + 5.0f, Format("%.0f%%", prog * 100.0f), 0.7f, kDim);
+        Bar(cBar, y + 9.0f, 120.0f, 9.0f, prog, Alpha(kColors[k], 220));
+        Text(cBar + 128.0f, y + 4.0f, Format("%.0f%%", prog * 100.0f), 0.68f, kDim);
         // the mean offset so far (what the GA scores) and the most
         const float mean = stats.time > 0.0 ? static_cast<float>(stats.absE / stats.time) : 0.0f;
         const CRGBA meanC = mean > 0.3f ? CRGBA(255, 90, 90, 255) : mean > 0.15f ? CRGBA(255, 200, 60, 255) : CRGBA(120, 230, 120, 255);
-        Text(cOff, y + 5.0f, Format("%.2f / %.2f", mean, stats.maxE), 0.8f, running ? meanC : kDim, 2);
-        const std::string st = running ? "" : StatusText(*R);
-        Text(cStat, y + 5.0f, st, 0.8f, R->result == "end" ? CRGBA(120, 230, 120, 255) : CRGBA(255, 90, 90, 255), 2);
+        Text(cOff, y + 4.0f, Format("%.2f / %.2f", mean, stats.maxE), ts, meanC, 2);
+        Text(cTime, y + 4.0f, running ? Format("%.0f s", runT) : arrived ? Format("%.1f s", R->endTime) : R->result, ts,
+            running ? kDim : arrived ? kWhite : CRGBA(255, 90, 90, 255), 2);
+        if (GA::on && !running)
+            Text(cScore, y + 4.0f, Format("%.1f", GA::res[k].score), ts, arrived ? CRGBA(120, 230, 120, 255) : CRGBA(255, 90, 90, 255), 2);
     }
 
-    // GA panel: best ever and the best score of each generation
+    // GA: the best of this generation so far and the best ever, each with what makes its score
     if (GA::on) {
-        const float x = W - 24.0f - 440.0f, y = 24.0f;
-        Box(x, y, 440.0f, 196.0f, kPanel);
-        Box(x, y, 6.0f, 196.0f, CRGBA(175, 110, 255, 255));
+        const float gw = 500.0f, x = W - 24.0f - gw, y = 24.0f;
+        Box(x, y, gw, 404.0f, kPanel);
+        Box(x, y, 6.0f, 404.0f, CRGBA(175, 110, 255, 255));
         Text(x + 20.0f, y + 8.0f, "ALGORITMO GENETICO", 1.0f, kWhite, 0, FONT_MENU);
-        Text(x + 20.0f, y + 40.0f, Format("populacao %d   elite %d   sigma %.3f", numRunners, GA::elite, GA::sigma), 0.8f, kDim);
+        Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
+        Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x desvio medio + %.0f x s fora de %.0f m", GA::meanPenalty, GA::offPenalty, offLimitGA), 0.68f, kDim);
+        auto card = [&](float cy, const char* title, int k, const std::string& mode, double score, double time, double mean, double maxE) {
+            Box(x + 16.0f, cy, gw - 32.0f, 112.0f, CRGBA(255, 255, 255, 16));
+            Text(x + 28.0f, cy + 8.0f, title, 0.72f, kDim);
+            if (k < -1) { Text(x + 28.0f, cy + 40.0f, "ainda nenhum carro chegou", 0.85f, kDim); return; }
+            if (k >= 0) {
+                Box(x + 28.0f, cy + 38.0f, 18.0f, 18.0f, kColors[k]);
+                Text(x + 54.0f, cy + 36.0f, Format("%s  %s", kTags[k], mode.c_str()), 0.95f, kWhite);
+            }
+            else Text(x + 28.0f, cy + 36.0f, mode, 0.95f, kWhite);
+            Text(x + gw - 28.0f, cy + 26.0f, Format("%.1f", score), 1.9f, CRGBA(120, 230, 120, 255), 2, FONT_PRICEDOWN);
+            Text(x + gw - 28.0f, cy + 64.0f, "pontos", 0.65f, kDim, 2);
+            Text(x + 28.0f, cy + 78.0f, Format("tempo %.1f s    desvio medio %.3f m    max %.2f m", time, mean, maxE), 0.78f, kWhite);
+        };
+        int bestNow = -2;
+        for (int k = 0; k < numRunners; k++)
+            if (runners[k].result == "end" && (bestNow < 0 || GA::res[k].score < GA::res[bestNow].score)) bestNow = k;
+        if (bestNow >= 0) {
+            const GA::Result& b = GA::res[bestNow];
+            card(y + 88.0f, "MELHOR DESTA GERACAO", bestNow, CfgOf(bestNow).mode, b.score, b.time, b.mean, b.maxE);
+        }
+        else card(y + 88.0f, "MELHOR DESTA GERACAO", -2, "", 0, 0, 0, 0);
         if (GA::bestGen >= 0)
-            Text(x + 20.0f, y + 64.0f, Format("melhor: %.1f (ger. %d, %s)", GA::bestScore, GA::bestGen, GA::modes[GA::best.mode].c_str()), 0.85f, CRGBA(120, 230, 120, 255));
-        else Text(x + 20.0f, y + 64.0f, "melhor: primeira geracao em andamento", 0.85f, kDim);
+            card(y + 208.0f, Format("MELHOR DE TODAS (geracao %d)", GA::bestGen).c_str(), -1, GA::modes[GA::best.mode], GA::bestScore,
+                GA::bestRes.time, GA::bestRes.mean, GA::bestRes.maxE);
+        else card(y + 208.0f, "MELHOR DE TODAS", -2, "", 0, 0, 0, 0);
         // best of each generation, the last 40 (lower is better: taller bar)
         const auto& h = GA::history;
         const int n = std::min<int>(static_cast<int>(h.size()), 40);
+        const float bx = x + 20.0f, by = y + 330.0f, bw = gw - 40.0f, bh = 62.0f, step = bw / 40.0f;
+        Box(bx, by, bw, bh, CRGBA(255, 255, 255, 18));
+        Text(bx + 6.0f, by + 4.0f, "melhor de cada geracao", 0.6f, kDim);
         if (n > 0) {
             double lo = 1e18, hi = 0.0;
             for (int i = static_cast<int>(h.size()) - n; i < static_cast<int>(h.size()); i++) { lo = std::min(lo, h[i]); hi = std::max(hi, h[i]); }
-            const float bx = x + 20.0f, by = y + 96.0f, bw = 400.0f, bh = 84.0f, step = bw / 40.0f;
-            Box(bx, by, bw, bh, CRGBA(255, 255, 255, 18));
             for (int i = 0; i < n; i++) {
                 const double v = h[h.size() - n + i];
                 const float f = hi > lo ? static_cast<float>(1.0 - 0.85 * (v - lo) / (hi - lo)) : 1.0f;
                 Box(bx + step * i + 1.0f, by + bh * (1.0f - f), step - 2.0f, bh * f, v < 1000.0 ? CRGBA(120, 200, 255, 220) : CRGBA(255, 90, 90, 200));
             }
-            Text(bx + bw, by + bh - 20.0f, Format("%.1f", h.back()), 0.7f, kWhite, 2);
         }
     }
 
@@ -1932,7 +1994,10 @@ void Draw() {
     RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nullptr);
     RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
-    const float z = cfg.origin.z + 0.08f;
+    // the grid on the deck the camera is over, each course on its car's deck
+    const CVector camPos = TheCamera.GetPosition();
+    float z = cfg.origin.z + 0.08f;
+    while (deckHeight > 1.0f && camPos.z > z + deckHeight && z < cfg.origin.z + deckHeight * (kMaxRunners - 1) / lanesPerDeck) z += deckHeight;
     const CVector cam = TheCamera.GetPosition();
     const float near2 = 260.0f * 260.0f;
     auto close = [&](const CVector2D& p) { return (p.x - cam.x) * (p.x - cam.x) + (p.y - cam.y) * (p.y - cam.y) < near2; };
@@ -1957,6 +2022,7 @@ void Draw() {
         }
     }
     forRunners {
+    if (std::abs(R->baseZ + 0.08f - z) > 1.0f) continue; // (another deck's: drawn with no depth test, seen through the floor)
     const CRGBA col = kColors[R->index];
     const int n = static_cast<int>(course.p.size());
     for (int i = 0; i + 1 < n + (course.closed ? 1 : 0); i += 2) {

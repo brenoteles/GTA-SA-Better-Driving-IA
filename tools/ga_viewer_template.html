@@ -92,7 +92,8 @@ pre { white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospa
 </main>
 <script>
 const DATA = /*DATA*/null;
-const COLORS = { A: '#ffd60a', B: '#ff595e', C: '#36a2eb', D: '#4cd964', E: '#ff922b', F: '#af6eff', G: '#00dcdc', H: '#ff69c8', I: '#bee63c', J: '#9aa3b2' };
+const COLORS = { A: '#ffd60a', B: '#ff595e', C: '#36a2eb', D: '#4cd964', E: '#ff922b', F: '#af6eff', G: '#00dcdc', H: '#ff69c8', I: '#bee63c', J: '#9aa3b2',
+  K: '#a0783c', L: '#788cff', M: '#ffb496', N: '#00a078', O: '#c83c8c', P: '#96c8ff', Q: '#e6d264', R: '#785ac8', S: '#ff7846', T: '#8c8c8c' };
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

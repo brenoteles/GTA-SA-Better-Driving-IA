@@ -35,8 +35,11 @@ HTML = os.path.join(REPO, 'docs', 'ga_viewer.html')
 REVIEWS = os.path.join(PROVING, 'ga_reviews')
 AGY = r'C:/Users/death/AppData/Local/agy/bin/agy'
 GEMINI_MODEL = 'gemini-4-argon-high'
-GENES = ['Bandwidth', 'Damping', 'Preview', 'LookaheadTime', 'LookaheadMin', 'StanleyK', 'Gain', 'Smoothing',
-         'GripFactor', 'BrakeG', 'Kp', 'BrakeKp']
+# the genes and their ranges (ProvingGround.h, GA::kGenes)
+RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.05, 1.5),
+          'LookaheadMin': (3.0, 15.0), 'StanleyK': (0.3, 5.0), 'Gain': (0.5, 1.3), 'Smoothing': (0.0, 0.12),
+          'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 1.5)}
+GENES = list(RANGES)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS generations (gen INTEGER PRIMARY KEY, stamp TEXT, sigma REAL, best_score REAL, best_car TEXT,
@@ -155,9 +158,46 @@ def ingest(quiet=False):
     return c
 
 
+def evolution(c):
+    """Every generation so far in one table: is the score making the cars faster AND closer to the line, and is the
+    population still varied enough to find better (or stuck on one peak)?"""
+    L = ['== Evolution, every generation (best = lowest score; median of the cars that finished; diversity = mean over '
+         'the genes of their spread / their range, 0 = all equal; distinct = genomes that differ; stale = generations '
+         'since the best ever improved)',
+         '  gen  sigma   best   time  mean_m | median  time  mean_m | finished | modes                          | '
+         'diversity distinct | stale']
+    best, stale = 1e18, 0
+    for (g, sigma) in c.execute('SELECT gen, sigma FROM generations ORDER BY gen').fetchall():
+        ind = c.execute('SELECT score, result, time_s, mean_m, mode, genes FROM individuals WHERE gen=? ORDER BY score',
+                        (g,)).fetchall()
+        fin = [i for i in ind if i[1] == 'end']
+        med = fin[len(fin) // 2] if fin else None
+        modes = {}
+        for i in ind:
+            modes[i[4]] = modes.get(i[4], 0) + 1
+        genes = [json.loads(i[5]) for i in ind]
+        spread = []
+        for k, (lo, hi) in RANGES.items():
+            v = [x[k] for x in genes if k in x]
+            if len(v) > 1:
+                m = sum(v) / len(v)
+                spread.append((sum((a - m) ** 2 for a in v) / len(v)) ** 0.5 / (hi - lo))
+        distinct = len({(i[4],) + tuple(round(json.loads(i[5]).get(k, 0), 3) for k in GENES) for i in ind})
+        if ind[0][0] < best - 0.05:
+            best, stale = ind[0][0], 0
+        else:
+            stale += 1
+        b = ind[0]
+        L.append(f'  {g:3d}  {sigma:.3f} {b[0]:7.1f} {b[2]:6.1f} {b[3]:6.3f} | ' +
+                 (f'{med[0]:6.1f} {med[2]:5.1f} {med[3]:6.3f}' if med else '     -     -      -') +
+                 f' | {len(fin):3d}/{len(ind):<3d}  | {" ".join(f"{k} {v}" for k, v in sorted(modes.items())):<30} | '
+                 f'{(sum(spread) / len(spread) if spread else 0):9.3f} {distinct:8d} | {stale:5d}')
+    return '\n'.join(L)
+
+
 def report(c, g0, g1):
     """A plain-text report of generations g0..g1 for Gemini (and for checking what it says)."""
-    L = []
+    L = [evolution(c)]
     for (g, sigma, best, car, mode, mean, fin, pop) in c.execute(
             'SELECT gen, sigma, best_score, best_car, best_mode, mean_score, finished, population FROM generations '
             'WHERE gen BETWEEN ? AND ? ORDER BY gen', (g0, g1)):
@@ -210,8 +250,14 @@ def ask_gemini(c, g0, g1):
         f'{os.path.join(REPO, "RealTrafficFix2", "source", "ProvingGround.h")} (namespace GA: genes, faixas, pontuacao, '
         f'selecao; ClosedLoopSteer e Control: os algoritmos kinematic/stanley/pursuit/mod), '
         f'{os.path.join(REPO, "RealTrafficFix2", "RealTrafficFix.proving.ini")} ([GA] e [Test.circuit]).\n'
+        'Voce tem duas responsabilidades fixas, alem do resumo: (A) verificar se a pontuacao realmente esta deixando '
+        'os carros mais rapidos E melhores (menor desvio medio) ao longo das geracoes, ou se esta trocando um pelo outro '
+        '(ver a tabela "Evolution": tempo e desvio do melhor e da mediana); (B) verificar se a geracao de novos cerebros '
+        'funciona bem: diversidade da populacao, algoritmos que sumiram, genes presos no limite da faixa, quantas '
+        'geracoes sem melhorar (stale), e se os carros estao presos num pico local ruim.\n'
         'Responda com:\n'
-        '1. Resumo do progresso (melhor/media por geracao, qual algoritmo domina e por que, segundo os dados).\n'
+        '1. Resumo do progresso (melhor/mediana por geracao, qual algoritmo domina e por que, segundo os dados).\n'
+        '2a. Veredito (A) sobre a pontuacao e (B) sobre a evolucao, cada um com os numeros da tabela Evolution.\n'
         '2. Afirmacoes numeradas no formato "C1: <afirmacao> [dado: <numero e de onde veio>]", cada uma verificavel nos '
         'arquivos (onde os carros perdem tempo, saem da linha, ficam presos; genes que convergiram).\n'
         '3. Sugestoes numeradas "S1: <mudanca concreta no ini ou no codigo> -- motivo", no maximo 5, so as que os dados '

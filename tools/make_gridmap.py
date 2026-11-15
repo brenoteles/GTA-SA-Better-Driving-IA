@@ -19,6 +19,7 @@ TILE = 100.0                     # m
 X0, X1 = -100.0, 2900.0          # the platform (world): 3 km east-west
 Y0, Y1 = -2950.0, -1750.0        # 1.2 km north-south (10 lanes of the GA circuit)
 Z = 300.0                        # its surface
+DECKS = (300.0, 380.0)           # the platform twice, 80 m apart (20 GA cars: 10 lanes on each)
 RW = 0x1803FFFF                  # RenderWare 3.6.0.3 (San Andreas)
 TEX = 512                        # texture size: 50 m of ground (5 cells of 10 m)
 TEX_M = 50.0
@@ -148,16 +149,17 @@ def main(game_dir):
     n = 0
     with open(os.path.join(out, 'ProvingGrid.ipl'), 'w', newline='\r\n') as f:
         f.write('inst\n')
-        y = Y0 + TILE / 2
-        while y < Y1:
-            x = X0 + TILE / 2
-            while x < X1:
-                f.write(f'{MODEL_ID}, {NAME}, 0, {x:.1f}, {y:.1f}, {Z:.1f}, 0, 0, 0, 1, -1\n')
-                n += 1
-                x += TILE
-            y += TILE
+        for z in DECKS:
+            y = Y0 + TILE / 2
+            while y < Y1:
+                x = X0 + TILE / 2
+                while x < X1:
+                    f.write(f'{MODEL_ID}, {NAME}, 0, {x:.1f}, {y:.1f}, {z:.1f}, 0, 0, 0, 1, -1\n')
+                    n += 1
+                    x += TILE
+                y += TILE
         f.write('end\n')
-    print(f'{out}: {n} tiles of {TILE:.0f} m, platform x {X0:.0f}..{X1:.0f}, y {Y0:.0f}..{Y1:.0f}, z {Z:.0f}')
+    print(f'{out}: {n} tiles of {TILE:.0f} m, platform x {X0:.0f}..{X1:.0f}, y {Y0:.0f}..{Y1:.0f}, z {DECKS}')
 
 
 if __name__ == '__main__':
