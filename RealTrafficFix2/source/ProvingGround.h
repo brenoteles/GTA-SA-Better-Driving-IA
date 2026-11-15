@@ -1289,7 +1289,7 @@ static const GeneDef kGenes[] = {
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
     { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "" },  // its own line: to one side of the road
     { "Steer", "LineCut", &Settings::lineCut, -0.5f, 1.0f, "" },    // ... into the inside of the curves
-    { "Speed", "GripTight", &Settings::gripTight, 0.6f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this
+    { "Speed", "GripTight", &Settings::gripTight, 0.35f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this (from 0.35: 24 of 60 at 0.6)
     { "Speed", "GripFast", &Settings::gripFast, 0.6f, 1.6f, "" },   // ... in fast ones (>= 150 m)
     { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns curves, ABS and TC itself
     { "Speed", "CruiseGas", &Settings::cruiseGas, 0.0f, 0.4f, "" },  // the speed controller's base gas

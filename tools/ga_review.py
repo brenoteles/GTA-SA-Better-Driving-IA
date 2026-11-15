@@ -43,7 +43,7 @@ GEMINI_MODEL = 'gemini-4-argon-high'
 RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.0, 1.5),
           'LookaheadMin': (1.5, 15.0), 'StanleyK': (0.3, 5.0), 'Gain': (0.5, 1.3), 'Smoothing': (0.0, 0.12),
           'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 2.5),
-          'GripTight': (0.6, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4), 'CruiseGas': (0.0, 0.4),
+          'GripTight': (0.35, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4), 'CruiseGas': (0.0, 0.4),
           'AbsMargin': (0.5, 1.2), 'AbsDrop': (0.02, 0.4), 'AbsRecover': (0.01, 0.2), 'AbsCircle': (0.0, 1.0),
           'TcSlip': (0.03, 1.0), 'TcMinGas': (0.0, 1.0), 'TcDrop': (0.0, 0.3), 'TcRecover': (0.01, 0.1),
           'TcCircle': (0.0, 1.0), 'LineBias': (-1.0, 1.0), 'LineCut': (-0.5, 1.0)}
