@@ -832,8 +832,13 @@ static int camOn = 0;                  // the car the camera is on
 
 static unsigned int Now() { return CTimer::m_snTimeInMilliseconds; }
 
+// (the summary is kept here and handed to Disk once a second, Perf::Frame: written on the game's thread, a write waited
+// up to 16 s while the antivirus looked at the trace files)
+static std::string logBuf, logPath;
 static void Log(const std::string& s) {
-    if (summary.is_open()) summary << s << "\n"; // (flushed every 10 s: Perf::Frame)
+    if (logPath.empty()) return;
+    logBuf += s;
+    logBuf += "\n";
 }
 
 // --- Disk: files written on a thread of their own --------------------------------------------------------------------
@@ -841,11 +846,14 @@ static void Log(const std::string& s) {
 // the stutters when a generation ended, its history, state and trace files). A whole file goes to .tmp first, then over
 // the old one: a state file is never half-written when the game is closed
 namespace Disk {
-struct Job { std::string path, data; bool append; };
+struct Job { std::string path, data; bool append, close; };
 static std::mutex mtx;
 static std::condition_variable cv;
 static std::deque<Job> jobs;
 static bool started = false;
+// (an appended file stays open until Close: opened and closed for every MB, the antivirus read the whole growing file
+// again each time; 50 MB a generation)
+static std::map<std::string, FILE*> files;
 static void Loop() {
     for (;;) {
         Job j;
@@ -855,11 +863,24 @@ static void Loop() {
             j = std::move(jobs.front());
             jobs.pop_front();
         }
-        const std::string to = j.append ? j.path : j.path + ".tmp";
-        if (FILE* f = std::fopen(to.c_str(), j.append ? "ab" : "wb")) {
+        auto it = files.find(j.path);
+        if (j.close || !j.append) {
+            if (it != files.end()) { std::fclose(it->second); files.erase(it); }
+            if (j.close) continue;
+        }
+        else {
+            FILE* f = it != files.end() ? it->second : std::fopen(j.path.c_str(), "ab");
+            if (!f) continue;
+            files[j.path] = f;
+            std::fwrite(j.data.data(), 1, j.data.size(), f);
+            std::fflush(f);
+            continue;
+        }
+        const std::string to = j.path + ".tmp";
+        if (FILE* f = std::fopen(to.c_str(), "wb")) {
             std::fwrite(j.data.data(), 1, j.data.size(), f);
             std::fclose(f);
-            if (!j.append) MoveFileExA(to.c_str(), j.path.c_str(), MOVEFILE_REPLACE_EXISTING);
+            MoveFileExA(to.c_str(), j.path.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
     }
 }
@@ -867,7 +888,14 @@ static void Write(const std::string& path, std::string data, bool append = false
     {
         std::lock_guard<std::mutex> l(mtx);
         if (!started) { started = true; std::thread(Loop).detach(); }
-        jobs.push_back({ path, std::move(data), append });
+        jobs.push_back({ path, std::move(data), append, false });
+    }
+    cv.notify_one();
+}
+static void Close(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> l(mtx);
+        jobs.push_back({ path, std::string(), true, true });
     }
     cv.notify_one();
 }
@@ -906,6 +934,8 @@ static void Frame(bool running) {
     }
     for (int i = 0; i < N; i++) { sum[i] += cur[i]; peak[i] = std::max(peak[i], cur[i]); cur[i] = 0.0; }
     last = t;
+    static double lastLog = 0.0;
+    if (t - lastLog > 1000.0 && !logBuf.empty()) { lastLog = t; Disk::Write(logPath, std::move(logBuf), true); logBuf.clear(); }
     if (t - windowStart >= 10000.0 && frames > 0) {
         fps = static_cast<float>(1000.0 * frames / (t - windowStart));
         frameMs = static_cast<float>(frameSum / frames);
@@ -918,7 +948,6 @@ static void Frame(bool running) {
         // (troca, fim de geracao and trace are inside update; hud inside desenho)
         modMs = static_cast<float>(shown[UPDATE] + shown[CONTROL] + shown[DRAW]);
         Log(s + Format("; in all %.1f of %.1f; disk queue %d", modMs, frameMs, Disk::Pending()));
-        if (running && summary.is_open()) summary.flush();
         frames = 0;
         frameSum = frameMax = 0.0;
         windowStart = t;
@@ -968,8 +997,11 @@ static void OpenRunDir() {
     CreateDirectoryA((baseDir + "proving").c_str(), nullptr);
     runDir = baseDir + "proving\\" + stamp + "\\";
     CreateDirectoryA(runDir.c_str(), nullptr);
-    if (summary.is_open()) summary.close();
-    summary.open(runDir + "summary.txt", std::ios::trunc);
+    if (!logPath.empty() && !logBuf.empty()) Disk::Write(logPath, std::move(logBuf), true);
+    logBuf.clear();
+    if (!logPath.empty()) Disk::Close(logPath);
+    logPath = runDir + "summary.txt";
+    Disk::Write(logPath, std::string()); // (a new, empty one)
     std::ofstream latest(baseDir + "proving\\latest.txt", std::ios::trunc);
     latest << stamp << "\n";
     CopyFileA(iniPath.c_str(), (runDir + "proving.ini").c_str(), FALSE);
@@ -1845,6 +1877,10 @@ static float parentTop = 0.2f, sigmaMax = 0.15f;
 static int stall = 0;
 static double stallRef = 1e18;
 static std::vector<double> history10; // steady state: each generation's mean of its 10 best runs
+// [GA] Trace = 0: no trace files (only the analysis tools read them: the viewer, Gemini, nn2_train); TraceEvery: s
+// between a car's rows (0: 0.25, or 0.5 above 100 cars)
+static bool traceOn = true;
+static float traceEvery = 0.0f;
 // CutoffFactor: once the first car is home, a car still running at that time x this is stopped (CUT) and scored by
 // the time it was heading for (its time x the course / how far it got) + CutPenalty (0: no cutoff)
 static float cutoffFactor = 1.3f, cutPenalty = 20.0f;
@@ -1908,6 +1944,8 @@ static void Read(CIniReader& ini, const Settings& s) {
     offLimitGA = ini.ReadFloat("GA", "OffLimit", offLimitGA);
     meanPenalty = ini.ReadFloat("GA", "MeanPenalty", meanPenalty);
     devWeight = ini.ReadFloat("GA", "DevWeight", devWeight);
+    traceOn = ini.ReadInteger("GA", "Trace", 1) != 0;
+    traceEvery = ini.ReadFloat("GA", "TraceEvery", 0.0f);
     parentTop = std::clamp(ini.ReadFloat("GA", "ParentTop", parentTop), 0.01f, 1.0f);
     sigmaMax = ini.ReadFloat("GA", "SigmaMax", sigmaMax);
     offPenalty = ini.ReadFloat("GA", "OffPenalty", offPenalty);
@@ -2772,6 +2810,7 @@ static void CloseTrace(int g) {
     auto it = traceGen.find(g);
     if (it == traceGen.end()) return;
     if (!it->second.data.empty()) Disk::Write(TracePath(g), std::move(it->second.data), it->second.started);
+    Disk::Close(TracePath(g));
     traceGen.erase(it);
 }
 
@@ -2807,10 +2846,10 @@ static void OpenTrace() {
 
 static void Trace(CVehicle* v) {
     const bool perGen = GA::on && GA::steady;
-    if ((!perGen && !trace.is_open()) || runT < traceNext[R->index]) return;
+    if ((!perGen && !trace.is_open()) || runT < traceNext[R->index] || (GA::on && !GA::traceOn)) return;
     Perf::Scope perf(Perf::TRACE);
     std::string row;
-    traceNext[R->index] = runT + (numRunners > 100 ? 0.5f : 0.25f); // (2 a second above 100 cars: the file grows with them)
+    traceNext[R->index] = runT + (GA::traceEvery > 0.0f ? GA::traceEvery : numRunners > 100 ? 0.5f : 0.25f); // (2 a second above 100 cars: the file grows with them)
     const CVector2D q = ToLane(v->GetPosition().To2D());
     row = Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d,%.2f", perGen ? R->bornGen : GA::on ? GA::generation : runCount,
         GA::steady ? Format("%s.%d", R->tag, R->runId).c_str() : R->tag, human && R == runners ? "human" : cfg.mode.c_str(), runT, q.x, q.y, R->speedNow, targetKmh, offsetNow, v->m_fSteerAngle, gasOut, brakeOut, R->sMax,
