@@ -85,7 +85,7 @@ pre { white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospa
   <div class="grid2">
     <section class="panel"><h2>Ranking da geração</h2><div class="scroll" id="ranking"></div></section>
     <section class="panel"><h2>Pontuação por geração <span class="dim">(menor é melhor)</span></h2><canvas id="chart"></canvas>
-      <div class="dim" style="font-size:12px">pontos = tempo + 100 × desvio médio (m) + 5 × s a mais de 2 m · linha cheia: melhor · tracejada: média dos que chegaram · x vermelho: geração sem chegada</div></section>
+      <div class="dim" style="font-size:12px">pontos = tempo + 5 × m·s a menos de 0,3 m da borda + 10 × s fora da faixa de 4 m (antes: tempo + 100 × desvio médio) · linha cheia: melhor · tracejada: média dos que chegaram · x vermelho: geração sem chegada</div></section>
   </div>
   <section class="panel"><h2>Tempo por trecho <span class="dim">(s; verde = mais rápido da geração; passe o mouse para ver o desvio)</span></h2><div class="scroll" id="heat"></div></section>
   <section class="panel"><h2>Revisões do Gemini e validação</h2><div id="reviews"></div></section>
@@ -176,6 +176,21 @@ function drawMap() {
     ctx.globalAlpha = 0.55; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
   }
   ctx.globalAlpha = 1;
+  // the road's edges (a corridor)
+  if (C.length > 2 && C[0][6] > 0) {
+    ctx.strokeStyle = css('--ink'); ctx.lineWidth = 1; ctx.globalAlpha = 0.6;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      for (let i = 0; i < C.length; i++) {
+        const a = C[Math.max(i - 1, 0)], b = C[Math.min(i + 1, C.length - 1)];
+        const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+        const p = W2S(C[i][0] - dy / l * side * C[i][6], C[i][1] + dx / l * side * C[i][6]);
+        i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
   ctx.fillStyle = '#ff7a00';
   for (const [x, y] of DATA.cones) { const p = W2S(x, y); ctx.fillRect(p[0] - 2, p[1] - 2, 4, 4); }
   // section names
@@ -247,9 +262,9 @@ function renderRanking() {
   const ind = DATA.individuals[gen] || [];
   if (!ind.length) { $('ranking').innerHTML = '<div class="empty">Sem dados desta geração.</div>'; return; }
   const genes = Object.keys(ind[0].genes);
-  $('ranking').innerHTML = `<table><tr><th>#</th><th class="l">carro</th><th class="l">algoritmo</th><th>pontos</th><th class="l">fim</th><th>tempo</th><th>desvio médio</th><th>máx</th><th>fora</th>${genes.map(g => `<th>${g}</th>`).join('')}</tr>` +
+  $('ranking').innerHTML = `<table><tr><th>#</th><th class="l">carro</th><th class="l">algoritmo</th><th>pontos</th><th class="l">fim</th><th>tempo</th><th>folga mín</th><th>perto da borda</th><th>desvio médio</th><th>máx</th><th>fora</th>${genes.map(g => `<th>${g}</th>`).join('')}</tr>` +
     ind.map(i => `<tr><td>${i.rank}</td><td class="l"><span class="dot" style="background:${colorOf(i.car)}"></span> ${i.car}</td><td class="l">${esc(i.mode)}${i.label ? ` <span class="badge b-valid">${esc(i.label)}</span>` : ''}</td><td><b>${fmt(i.score, 1)}</b></td>
-      <td class="l ${i.result === 'end' ? 'ok' : 'ko'}">${i.result === 'end' ? 'chegou' : esc(i.result)}</td><td>${fmt(i.time, 1)}</td><td><b>${fmt(i.mean, 2)}</b></td><td>${fmt(i.max, 2)}</td><td>${fmt(i.out, 1)}</td>
+      <td class="l ${i.result === 'end' ? 'ok' : 'ko'}">${i.result === 'end' ? 'chegou' : esc(i.result)}</td><td>${fmt(i.time, 1)}</td><td><b>${i.margin == null ? '–' : fmt(i.margin, 2) + ' m'}</b></td><td>${i.deficit == null ? '–' : fmt(i.deficit, 1) + ' m·s'}</td><td>${fmt(i.mean, 2)}</td><td>${fmt(i.max, 2)}</td><td>${fmt(i.out, 1)}</td>
       ${genes.map(g => `<td>${fmt(i.genes[g], 3)}</td>`).join('')}</tr>`).join('') + '</table>';
 }
 

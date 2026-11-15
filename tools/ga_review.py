@@ -77,8 +77,14 @@ STATE = os.path.join(PROVING, 'ga_state.txt')
 def db():
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
-    if 'label' not in [r[1] for r in c.execute('PRAGMA table_info(individuals)')]:
-        c.execute('ALTER TABLE individuals ADD COLUMN label TEXT')
+    cols = [r[1] for r in c.execute('PRAGMA table_info(individuals)')]
+    for col, kind in (('label', 'TEXT'), ('deficit_ms', 'REAL'), ('min_margin_m', 'REAL')):
+        if col not in cols:
+            c.execute(f'ALTER TABLE individuals ADD COLUMN {col} {kind}')
+    if 'min_margin' not in [r[1] for r in c.execute('PRAGMA table_info(sections)')]:
+        c.execute('ALTER TABLE sections ADD COLUMN min_margin REAL')
+    if 'margin' not in [r[1] for r in c.execute('PRAGMA table_info(trace)')]:
+        c.execute('ALTER TABLE trace ADD COLUMN margin REAL')
     return c
 
 
@@ -116,6 +122,7 @@ def section_stats(rows, secs, length):
         tt = (t1 - t0) if t1 is not None else None
         out.append({'idx': i, 'section': name, 'time_s': tt, 'avg_kmh': (s1 - s0) / tt * 3.6 if tt else None,
                     'mean_offset': sum(abs(r['offset']) for r in inside) / len(inside),
+                    'min_margin': min((r['margin'] for r in inside if r.get('margin') is not None), default=None),
                     'max_offset': max(abs(r['offset']) for r in inside), 'min_kmh': min(r['speed'] for r in inside)})
     return out
 
@@ -137,10 +144,11 @@ def ingest(quiet=False):
             by[(int(r['generation']), r['car'])] = r
         for (g, car), r in by.items():
             genes = {k: float(r[k]) if r.get(k) not in (None, '') else DEFAULTS.get(k, 0.0) for k in GENES}
-            c.execute('INSERT OR REPLACE INTO individuals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            c.execute('INSERT OR REPLACE INTO individuals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                       (g, int(r['rank']), car, r['mode'], float(r['score']), r['result'], float(r['time_s']),
                        float(r.get('mean_m') or 0), float(r['rms_m']), float(r['max_m']), float(r['out_s']), float(r['reached_m']),
-                       json.dumps(genes), r.get('label') or ''))
+                       json.dumps(genes), r.get('label') or '',
+                       float(r['deficit_ms']) if r.get('deficit_ms') else None, float(r['min_margin_m']) if r.get('min_margin_m') else None))
             gens.add(g)
         for g in gens:
             ind = c.execute('SELECT car, mode, score, result FROM individuals WHERE gen=? ORDER BY score', (g,)).fetchall()
@@ -163,16 +171,17 @@ def ingest(quiet=False):
             try:
                 recs.append((g, r['car'], float(r['t']), float(r['x']), float(r['y']), float(r['speed_kmh']),
                              float(r['target_kmh']), float(r['offset']), float(r['steer']), float(r['gas']),
-                             float(r['brake']), float(r['s']), float(r['lat_g']), float(r['slip']), int(r['abs']), int(r['tc'])))
+                             float(r['brake']), float(r['s']), float(r['lat_g']), float(r['slip']), int(r['abs']), int(r['tc']),
+                             float(r['margin']) if r.get('margin') not in (None, '') else None))
             except (ValueError, KeyError):
                 pass  # a line cut short
-        c.executemany('INSERT INTO trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', recs)
+        c.executemany('INSERT INTO trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', recs)
         for car in sorted({r[1] for r in recs}):
-            rr = [{'t': r[2], 's': r[11], 'offset': r[7], 'speed': r[5]} for r in recs if r[1] == car]
+            rr = [{'t': r[2], 's': r[11], 'offset': r[7], 'speed': r[5], 'margin': r[16]} for r in recs if r[1] == car]
             for st in section_stats(rr, secs, length):
-                c.execute('INSERT OR REPLACE INTO sections VALUES (?,?,?,?,?,?,?,?,?)',
+                c.execute('INSERT OR REPLACE INTO sections VALUES (?,?,?,?,?,?,?,?,?,?)',
                           (g, car, st['section'], st['idx'], st['time_s'], st['avg_kmh'], st['mean_offset'], st['max_offset'],
-                           st['min_kmh']))
+                           st['min_kmh'], st['min_margin']))
     c.commit()
     if not quiet:
         n = c.execute('SELECT COUNT(*), MAX(gen) FROM generations').fetchone()
@@ -225,11 +234,12 @@ def report(c, g0, g1):
             'WHERE gen BETWEEN ? AND ? ORDER BY gen', (g0, g1)):
         L.append(f'\n== Generation {g}: sigma {sigma:.3f}, best {best:.2f} (car {car}, {mode}), mean {mean:.1f}, '
                  f'{fin}/{pop} finished')
-        for r in c.execute('SELECT rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label '
-                           'FROM individuals WHERE gen=? ORDER BY rank', (g,)):
+        for r in c.execute('SELECT rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label, '
+                           'deficit_ms, min_margin_m FROM individuals WHERE gen=? ORDER BY rank', (g,)):
             genes = json.loads(r[11])
-            L.append(f'  {r[0]:2d}. {r[1]} {r[2]:<9}' + (f' [{r[12]}]' if r[12] else '') + f' score {r[3]:8.2f} {r[4]:<7} {r[5]:6.1f} s offset mean {r[6]:.2f} rms {r[7]:.2f} '
-                     f'max {r[8]:5.2f} out {r[9]:5.1f} s reached {r[10]:.0f} m | ' + ' '.join(f'{k} {v:.3g}' for k, v in genes.items()))
+            room = f' room min {r[14]:.2f} m, near edge {r[13]:.1f} m.s' if r[13] is not None else ''
+            L.append(f'  {r[0]:2d}. {r[1]} {r[2]:<9}' + (f' [{r[12]}]' if r[12] else '') + f' score {r[3]:8.2f} {r[4]:<7} {r[5]:6.1f} s offset mean {r[6]:.2f} '
+                     f'max {r[8]:5.2f}{room} out {r[9]:5.1f} s reached {r[10]:.0f} m | ' + ' '.join(f'{k} {v:.3g}' for k, v in genes.items()))
     g = g1
     rows = c.execute('SELECT car, section, idx, time_s, avg_kmh, mean_offset, max_offset, min_kmh FROM sections WHERE gen=? '
                      'ORDER BY idx, time_s', (g,)).fetchall()
@@ -264,16 +274,18 @@ def ask_gemini(c, g0, g1):
     out = os.path.join(REVIEWS, f'gemini_gen{g0:04d}-{g1:04d}.md')
     prompt = (
         'Voce revisa um algoritmo genetico que ajusta o controle de direcao/velocidade de carros da IA do GTA San Andreas '
-        'numa pista de testes (10 carros por geracao no mesmo circuito de 4,7 km). O objetivo nao e o mais rapido: e o '
-        'que fica mais perto da linha (desvio medio pequeno) e ainda assim e rapido; a pontuacao e tempo + 100 x desvio '
-        'medio (m) + 5 x segundos a mais de 2 m da linha. NAO altere nenhum arquivo: so leia e '
+        'numa pista de testes (40 carros por geracao no mesmo circuito de 5,1 km). A pista e uma faixa de mao unica de 4 m (transito): '
+        'o carro deve manter a carroceria inteira entre as duas bordas, a linha central so guia; o objetivo nao e o mais '
+        'rapido, e o que fica com folga dentro da pista e ainda assim e rapido. Pontuacao (menor e melhor): tempo + 5 x '
+        'm.s com a carroceria a menos de 0,3 m da borda + 10 x segundos com a carroceria fora da pista (o desvio do centro '
+        'nao conta). NAO altere nenhum arquivo: so leia e '
         'responda no terminal, em portugues.\n'
         f'Leia: {rep} (geracoes {g0}-{g1}: ranking, genes, e tempos por trecho da ultima), {HISTORY} (todas as geracoes), '
         f'{os.path.join(REPO, "RealTrafficFix2", "source", "ProvingGround.h")} (namespace GA: genes, faixas, pontuacao, '
         f'selecao; ClosedLoopSteer e Control: os algoritmos kinematic/stanley/pursuit/mod), '
         f'{os.path.join(REPO, "RealTrafficFix2", "RealTrafficFix.proving.ini")} ([GA] e [Test.circuit]).\n'
         'Voce tem duas responsabilidades fixas, alem do resumo: (A) verificar se a pontuacao realmente esta deixando '
-        'os carros mais rapidos E melhores (menor desvio medio) ao longo das geracoes, ou se esta trocando um pelo outro '
+        'os carros mais rapidos E melhores (mais folga ate a borda, nunca fora da pista) ao longo das geracoes, ou se esta trocando um pelo outro '
         '(ver a tabela "Evolution": tempo e desvio do melhor e da mediana); (B) verificar se a geracao de novos cerebros '
         'funciona bem: diversidade da populacao, algoritmos que sumiram, genes presos no limite da faixa, quantas '
         'geracoes sem melhorar (stale), e se os carros estao presos num pico local ruim.\n'
@@ -354,11 +366,11 @@ def write_html(c=None):
     gens = [dict(zip(('gen', 'stamp', 'sigma', 'best', 'car', 'mode', 'mean', 'finished', 'population'), r))
             for r in c.execute('SELECT * FROM generations ORDER BY gen')]
     inds = {}
-    for r in c.execute('SELECT gen, rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label '
-                       'FROM individuals ORDER BY gen, rank'):
+    for r in c.execute('SELECT gen, rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label, '
+                       'deficit_ms, min_margin_m FROM individuals ORDER BY gen, rank'):
         inds.setdefault(r[0], []).append({'rank': r[1], 'car': r[2], 'mode': r[3], 'score': r[4], 'result': r[5],
                                          'time': r[6], 'mean': r[7], 'rms': r[8], 'max': r[9], 'out': r[10], 'reached': r[11],
-                                         'genes': json.loads(r[12]), 'label': r[13] or ''})
+                                         'genes': json.loads(r[12]), 'label': r[13] or '', 'deficit': r[14], 'margin': r[15]})
     traces = {}
     for g, car, t, x, y, v, off, s, br in c.execute(
             'SELECT gen, car, t, x, y, speed, offset, s, brake FROM trace WHERE CAST(ROUND(t * 4) AS INTEGER) % 2 = 0 '
@@ -376,7 +388,8 @@ def write_html(c=None):
               c.execute('SELECT n, claim, verdict, evidence FROM claims WHERE review_id=? ORDER BY n', (rid,))]
         reviews.append({'id': rid, 'from': g0, 'to': g1, 'created': created, 'gemini': gem, 'verdict': verdict,
                         'notes': notes, 'validated': validated, 'claims': cl})
-    data = {'course': [[round(p['x'], 1), round(p['y'], 2), round(p['s']), p['vcap_kmh'], p['vsud_kmh'], p.get('wind', 0.0)]
+    data = {'course': [[round(p['x'], 1), round(p['y'], 2), round(p['s']), p['vcap_kmh'], p['vsud_kmh'], p.get('wind', 0.0),
+                        p.get('half_width', 0.0)]
                        for p in pts],
             'sections': secs, 'cones': cones, 'generations': gens, 'individuals': inds, 'traces': traces,
             'sectionStats': sects, 'reviews': reviews, 'written': datetime.datetime.now().isoformat(timespec='seconds')}

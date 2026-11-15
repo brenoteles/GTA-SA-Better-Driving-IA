@@ -35,6 +35,8 @@ struct TestDef {
     float startSpeed = -1.0f;            // km/h at the start (flying start); < 0: the run's speed
     float gripG = -1.0f, brakeG = -1.0f; // speed planning for the course's curves (< 0: [Speed] GripG / BrakeG)
     float brakeTo = 0.0f;                // Pedal = brake: down to this speed (km/h), then held there
+    float width = 0.0f;                  // m between the two edges of the road (> 0: a corridor; the car's body is judged
+                                         // against its edges, not its centre against the centre line)
     std::string segments;                // Shape = track: "S 300 / L 90 30 / R 45 120" (straight m; left/right degrees radius)
     std::vector<CVector2D> points;       // shape = points (course frame, m)
     bool closed = false;
@@ -118,6 +120,7 @@ static const char* const kTags[kMaxRunners] = { "A", "B", "C", "D", "E", "F", "G
     "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
     "m", "n" };
 static int lanesPerDeck = 10;
+static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
 static void SetRunnerSettings(const Settings* rs);
 static int numRunners = 1;
@@ -126,7 +129,8 @@ namespace GA {
 static bool on = false;
 static void Read(CIniReader& ini, const Settings& s);
 static void Start();
-static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length);
+static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length,
+    double deficit, double minMargin);
 static void NextGeneration();
 }
 
@@ -219,6 +223,7 @@ static void ReadSettings() {
         d.gripG = ini.ReadFloat(sec, "GripG", d.gripG);
         d.brakeG = ini.ReadFloat(sec, "BrakeG", d.brakeG);
         d.brakeTo = ini.ReadFloat(sec, "BrakeTo", d.brakeTo);
+        d.width = ini.ReadFloat(sec, "Width", d.width);
         d.segments = ini.ReadString(sec, "Segments", "");
         // a long track over several lines: Segments2, Segments3...
         for (int k = 2; k <= 40; k++) {
@@ -265,6 +270,7 @@ struct Course {
     std::vector<std::pair<float, std::string>> sections; // track: where each named part starts (m)
     bool closed = false;
     float length = 0.0f;
+    float halfWidth = 0.0f;        // the corridor: its edges this far each side of the points (0: none)
 };
 // The grip for a curve of curvature c (1/m): x GripTight at a radius <= 15 m, x 1 at 45 m, x GripFast >= 150 m
 static float CurveGrip(float c);
@@ -283,7 +289,9 @@ static std::string SectionAt(const Course& c, float s) {
 struct Stats {
     double n = 0, absE = 0, sqE = 0, maxE = 0, speedErr = 0, maxLatG = 0, steerAbs = 0, reversals = 0;
     double skidFront = 0, skidRear = 0, spin = 0, time = 0;
-    double outTime = 0;             // s further than the GA's OffLimit from the course
+    double outTime = 0;             // s further than the GA's OffLimit from the course (a corridor: the body past an edge)
+    double deficit = 0;             // a corridor: m x s the body was closer to an edge than the GA's EdgeComfort
+    double minMargin = 1e9;         // ... the least room it had (m; < 0: past the edge)
     double gainSum = 0, gainN = 0;  // yaw rate / (v tan(steer)): 1/L of the car's turn while the tyres hold
     float lastSteerDelta = 0.0f, lastSign = 0.0f;
     float maxSpeed = 0.0f;
@@ -326,6 +334,8 @@ struct Runner {
     float latGNow = 0.0f, slipNow = 0.0f, speedNow = 0.0f;
     bool skidFNow = false, skidRNow = false, absOn = false, tcOn = false;
     float windNow = 0.0f;
+    float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
+    float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
     float tcBand[5] = { 1, 1, 1, 1, 1 };  // ... the gas its TC lets through in each kind of curve
     float absLearn = 1.0f;                // ... and the brake pedal its ABS allows
@@ -563,6 +573,7 @@ static void BuildCourse(const TestDef& d) {
     course.curv.resize(n);
     for (int i = 0; i < n; i++) course.s[i] = i ? course.s[i - 1] + (course.p[i] - course.p[i - 1]).Magnitude() : 0.0f;
     course.length = course.s[n - 1] + (course.closed ? (course.p[0] - course.p[n - 1]).Magnitude() : 0.0f);
+    course.halfWidth = 0.5f * d.width;
     auto idx = [&](int i) { return course.closed ? ((i % n) + n) % n : std::clamp(i, 0, n - 1); };
     for (int i = 0; i < n; i++) {
         const CVector2D t = course.p[idx(i + 2)] - course.p[idx(i - 2)];
@@ -750,6 +761,14 @@ static void EndTrial(Trial& t, float& base) {
     t = Trial();
 }
 
+// What a frame costs in a trial: the offset from the centre line (m), or with a corridor the room closer than
+// EdgeComfort to an edge (+1 past it); and > 2 when the car is out (the trial's -0.5)
+static float LinePenalty() {
+    if (course.halfWidth <= 0.0f) return std::abs(offsetNow);
+    return std::max(edgeComfortGA - R->marginNow, 0.0f) + (R->marginNow < 0.0f ? 1.0f : 0.0f);
+}
+static float LineOut() { return course.halfWidth <= 0.0f ? std::abs(offsetNow) : R->marginNow < 0.0f ? 3.0f : 0.0f; }
+
 static void LearnByResult(float speed, float dt, float brakeAsked) {
     const float step = 0.03f + 0.25f * cfg.learnRate;
     const float G = aiGripG * 9.81f;
@@ -770,8 +789,8 @@ static void LearnByResult(float speed, float dt, float brakeAsked) {
     }
     if (ct.band >= 0) {
         ct.sum += std::min(speed / std::sqrt(G / c), 2.0f);
-        ct.off += std::abs(offsetNow);
-        ct.maxOff = std::max(ct.maxOff, std::abs(offsetNow));
+        ct.off += LinePenalty();
+        ct.maxOff = std::max(ct.maxOff, LineOut());
         ct.t += dt;
         ct.n++;
     }
@@ -787,8 +806,8 @@ static void LearnByResult(float speed, float dt, float brakeAsked) {
     else if (!braking && bt.band >= 0) EndTrial(bt, R->absBase);
     if (bt.band >= 0) {
         bt.sum += std::min(std::max(-R->aLongNow, 0.0f) / G, 2.0f);
-        bt.off += std::abs(offsetNow);
-        bt.maxOff = std::max(bt.maxOff, std::abs(offsetNow));
+        bt.off += LinePenalty();
+        bt.maxOff = std::max(bt.maxOff, LineOut());
         bt.t += dt;
         bt.n++;
     }
@@ -1135,7 +1154,26 @@ static void Record(CVehicle* v, float dt) {
     R->skidRNow = ws[1] || ws[3];
     if (!course.s.empty()) R->sMax = std::max(R->sMax, course.s[nearIdx]);
     if (R->sMax > R->progressS + 5.0f) { R->progressS = R->sMax; R->progressT = runT; }
-    if (std::abs(offsetNow) > offLimitGA) stats.outTime += dt;
+    if (course.halfWidth > 0.0f && !course.p.empty()) {
+        // The road is a corridor between two edges: what has to stay inside is the whole body, not its centre. Each of
+        // its four corners on the course (in a curve the body sweeps wider than its centre's path, and the room left
+        // shrinks); the room = the edge's distance from the corner nearest to it
+        const CVector2D c0 = v->GetPosition().To2D(), f = v->GetForward().To2D(), rt(f.y, -f.x);
+        float worst = 0.0f;
+        for (float fy : { R->bodyFront, R->bodyRear })
+            for (float sx : { -1.0f, 1.0f }) {
+                const CVector2D corner = c0 + f * fy + rt * (sx * R->bodyHalfW);
+                const OnCourse oc = Project(corner, NearestIndex(corner, nearIdx, 16));
+                worst = std::max(worst, std::abs(oc.offset));
+            }
+        R->marginNow = course.halfWidth - worst;
+        if (runT > 2.0f) {
+            stats.deficit += std::max(edgeComfortGA - R->marginNow, 0.0f) * dt;
+            stats.minMargin = std::min<double>(stats.minMargin, R->marginNow);
+            if (R->marginNow < 0.0f) stats.outTime += dt;
+        }
+    }
+    else if (std::abs(offsetNow) > offLimitGA) stats.outTime += dt;
     if (csv.is_open()) csv << Format("%.3f,%.4f,%.2f,%.2f,%.2f,%.4f,%.2f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.2f,%d,%d,%.3f,%.4f,%.5f,%.1f,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.1f,%d,%.4f,%d\n",
         runT, dt, p.x, p.y, p.z, std::atan2(fwd.y, fwd.x), speed * 3.6f, vF, vL, yaw, aLong, aLat, steerCmd, v->m_fSteerAngle, gasOut, brakeOut,
         handbrakeOut ? 1 : 0, static_cast<int>(v->m_nCurrentGear), offsetNow, headErrNow, curvNow, targetKmh,
@@ -1184,7 +1222,8 @@ static void EndRun(const char* why) {
     Log(line);
     R->result = why;
     R->endTime = runT;
-    if (GA::on) GA::Score(R->index, why, runT, stats.absE / T, std::sqrt(stats.sqE / T), stats.maxE, stats.outTime, R->sMax, course.length);
+    if (GA::on) GA::Score(R->index, why, runT, stats.absE / T, std::sqrt(stats.sqE / T), stats.maxE, stats.outTime, R->sMax, course.length,
+        stats.deficit, stats.minMargin);
 }
 
 // --- Genetic algorithm -----------------------------------------------------------------------------------------------
@@ -1235,11 +1274,11 @@ constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
 // label: its pilot profile (elites keep it); sum / runs: its scores so far (an elite drives again every generation: GTA's
 // physics gave the same genome 156.8 and 158.2, more than between 1st and 3rd; its average is what ranks it)
 struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; double sum = 0.0; int runs = 0; };
-struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0; std::string why; int runs = 0; };
+struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0, deficit = 0.0, minMargin = 1e9; std::string why; int runs = 0; };
 
 static int elite = 2, tournament = 3, immigrants = 1, maxGenerations = 0;
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
-static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f;
+static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
 static bool resume = true;
 static unsigned int seed = 0;
 static std::vector<std::string> modes{ "kinematic", "stanley", "pursuit", "mod" };
@@ -1285,6 +1324,8 @@ static void Read(CIniReader& ini, const Settings& s) {
     offLimitGA = ini.ReadFloat("GA", "OffLimit", offLimitGA);
     meanPenalty = ini.ReadFloat("GA", "MeanPenalty", meanPenalty);
     offPenalty = ini.ReadFloat("GA", "OffPenalty", offPenalty);
+    edgePenalty = ini.ReadFloat("GA", "EdgePenalty", edgePenalty);
+    edgeComfortGA = ini.ReadFloat("GA", "EdgeComfort", edgeComfortGA);
     rmsPenalty = ini.ReadFloat("GA", "RmsPenalty", rmsPenalty);
     resume = ini.ReadInteger("GA", "Resume", 1) != 0;
     seed = static_cast<unsigned int>(ini.ReadInteger("GA", "Seed", 0));
@@ -1440,14 +1481,18 @@ static void Start() {
         generation, numRunners, elite, sigma, static_cast<int>(modes.size()), bestGen >= 0 ? Format("%.2f (gen %d)", bestScore, bestGen).c_str() : "-"));
 }
 
-static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length) {
+static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length,
+    double deficit, double minMargin) {
     Result& r = res[k];
     const bool done = why == "end";
-    // the best is not the fastest: the one that keeps closest to the line and is still fast (MeanPenalty s per m of
-    // mean offset: 0.1 m costs 10 s)
-    r.score += done ? time + meanPenalty * mean + offPenalty * out + rmsPenalty * rms
+    // the best is not the fastest: the one that is still fast and keeps inside the road. A corridor (Width): anywhere
+    // with EdgeComfort m of room is free; EdgePenalty per m x s closer to an edge, OffPenalty per s with the body past
+    // it (MeanPenalty x mean offset from the centre line: 0 with a corridor)
+    r.score += done ? time + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms
                     : 1000.0 + 0.5 * std::max(length - sMax, 0.0f) + offPenalty * out;
     r.mean = std::max(r.mean, mean);
+    r.deficit += deficit;
+    r.minMargin = std::min(r.minMargin, minMargin);
     r.time += time;
     r.rms = std::max(r.rms, rms);
     r.maxE = std::max(r.maxE, maxE);
@@ -1498,7 +1543,7 @@ static void NextGeneration() {
     const std::string histPath = baseDir + "proving\\ga_history.csv";
     std::string header = "stamp,generation,rank,car,mode,score,result,time_s,mean_m,rms_m,max_m,out_s,reached_m,sigma";
     for (const auto& gd : kGenes) header += std::string(",") + gd.key;
-    header += ",label,avg_score,runs";
+    header += ",label,avg_score,runs,deficit_ms,min_margin_m";
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
@@ -1517,11 +1562,12 @@ static void NextGeneration() {
     for (int r = 0; r < n; r++) {
         const int k = order[r];
         const Result& x = res[k];
-        Log(Format("  %2d. %s %-9s score %8.2f  %-7s %6.1f s  offset mean %.2f rms %.2f max %5.2f m  out %5.1f s  | %s", r + 1, kTags[k],
-            modes[pop[k].mode].c_str(), x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, ShortText(pop[k]).c_str()));
+        Log(Format("  %2d. %s %-9s score %8.2f  %-7s %6.1f s  offset mean %.2f max %5.2f m  room min %.2f m, near the edge %.1f m.s  out %5.1f s  | %s",
+            r + 1, kTags[k], modes[pop[k].mode].c_str(), x.score, x.why.c_str(), x.time, x.mean, x.maxE, x.minMargin < 1e8 ? x.minMargin : 0.0,
+            x.deficit, x.out, ShortText(pop[k]).c_str()));
         h << Format("%s,%d,%d,%s,%s,%.3f,%s,%.2f,%.3f,%.3f,%.3f,%.2f,%.0f,%.4f,", stamp, generation, r + 1, kTags[k], modes[pop[k].mode].c_str(),
             x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, x.reached, sigma) << GenesText(pop[k], ",") << "," << pop[k].label
-          << Format(",%.3f,%d", avg[k], pop[k].runs) << "\n";
+          << Format(",%.3f,%d,%.3f,%.3f", avg[k], pop[k].runs, x.deficit, x.minMargin < 1e8 ? x.minMargin : 0.0) << "\n";
     }
 
     // the next generation: elite first (lane A, CJ's car, is the best), children, immigrants
@@ -1601,6 +1647,9 @@ static CVehicle* MakeCar(int model) {
     CVector mn, mx;
     GetEntityDimensions(v, mn, mx);
     wheelBase = GetWheelBase(v, mn, mx);
+    R->bodyFront = mx.y;
+    R->bodyRear = mn.y;
+    R->bodyHalfW = std::max(-mn.x, mx.x);
     rearAxleY = -0.5f * wheelBase;
     if (CColModel* cm = v->GetColModel()) if (cm->m_pColData && cm->m_pColData->m_nNumLines >= 4 && cm->m_pColData->m_pLines) {
         float rear = 1000.0f;
@@ -1658,18 +1707,19 @@ static void OpenTrace() {
     CreateDirectoryA(dir.c_str(), nullptr);
     if (trace.is_open()) trace.close();
     trace.open(dir + (GA::on ? Format("gen_%04d.csv", GA::generation) : std::string("trace.csv")), std::ios::trunc);
-    trace << "generation,car,mode,t,x,y,speed_kmh,target_kmh,offset,steer,gas,brake,s,lat_g,slip,abs,tc\n";
+    trace << "generation,car,mode,t,x,y,speed_kmh,target_kmh,offset,steer,gas,brake,s,lat_g,slip,abs,tc,margin\n";
     for (float& t : traceNext) t = 0.0f;
     if (courseWritten || !curTest) return;
     courseWritten = true;
     Runner* keep = R;
     R = runners;
     std::ofstream c(dir + "course.csv", std::ios::trunc);
-    c << "x,y,s,curv,vcap_kmh,vsud_kmh,wind\n";
+    c << "x,y,s,curv,vcap_kmh,vsud_kmh,wind,half_width\n";
     for (size_t i = 0; i < course.p.size(); i += 2) {
         const CVector2D q = ToLane(course.p[i]);
-        c << Format("%.2f,%.2f,%.1f,%.5f,%.0f,%.0f,%.1f\n", q.x, q.y, course.s[i], course.curv[i],
-            course.vcap[i] < 1e8f ? course.vcap[i] * 3.6f : -1.0f, course.vsud[i] < 1e8f ? course.vsud[i] * 3.6f : -1.0f, course.wind[i]);
+        c << Format("%.2f,%.2f,%.1f,%.5f,%.0f,%.0f,%.1f,%.2f\n", q.x, q.y, course.s[i], course.curv[i],
+            course.vcap[i] < 1e8f ? course.vcap[i] * 3.6f : -1.0f, course.vsud[i] < 1e8f ? course.vsud[i] * 3.6f : -1.0f, course.wind[i],
+            course.halfWidth);
     }
     std::ofstream s(dir + "sections.csv", std::ios::trunc);
     s << "s,name\n";
@@ -1684,9 +1734,9 @@ static void Trace(CVehicle* v) {
     if (!trace.is_open() || runT < traceNext[R->index]) return;
     traceNext[R->index] = runT + 0.25f;
     const CVector2D q = ToLane(v->GetPosition().To2D());
-    trace << Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d\n", GA::on ? GA::generation : runCount,
+    trace << Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d,%.2f\n", GA::on ? GA::generation : runCount,
         R->tag, cfg.mode.c_str(), runT, q.x, q.y, R->speedNow, targetKmh, offsetNow, v->m_fSteerAngle, gasOut, brakeOut, R->sMax,
-        R->latGNow, R->slipNow, R->absOn ? 1 : 0, R->tcOn ? 1 : 0);
+        R->latGNow, R->slipNow, R->absOn ? 1 : 0, R->tcOn ? 1 : 0, course.halfWidth > 0.0f ? R->marginNow : 0.0f);
 }
 
 // --- Camera ----------------------------------------------------------------------------------------------------------
@@ -1894,6 +1944,7 @@ void Update() {
             R->absBase = NAN;
             R->curveTrial = R->absTrial = Trial();
             R->trials = R->kept = 0;
+            R->marginNow = 99.0f;
             PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
             brakeDone = false;
             StartCsv();
@@ -2001,6 +2052,26 @@ static void Line3D(const CVector& a, const CVector& b, CRGBA c) {
     if (lineBuf.size() >= 4000) FlushLines();
 }
 
+// filled quads (the road: asphalt, kerbs), batched as triangles
+static std::vector<RwIm3DVertex> triBuf;
+static void FlushTris() {
+    if (triBuf.empty()) return;
+    if (RwIm3DTransform(triBuf.data(), static_cast<RwUInt32>(triBuf.size()), nullptr, 0)) {
+        RwIm3DRenderPrimitive(rwPRIMTYPETRILIST);
+        RwIm3DEnd();
+    }
+    triBuf.clear();
+}
+static void Quad3D(const CVector& a, const CVector& b, const CVector& c, const CVector& d, CRGBA col) {
+    for (const CVector* q : { &a, &b, &c, &a, &c, &d }) {
+        RwIm3DVertex v;
+        RwIm3DVertexSetPos(&v, q->x, q->y, q->z);
+        RwIm3DVertexSetRGBA(&v, col.r, col.g, col.b, col.a);
+        triBuf.push_back(v);
+    }
+    if (triBuf.size() >= 3000) FlushTris();
+}
+
 // one colour per car: its line on the ground, its trail, its row and dot in the HUD
 static const CRGBA kColorTable[20] = {
     { 255, 214, 10, 255 }, { 255, 89, 94, 255 }, { 54, 162, 235, 255 }, { 76, 217, 100, 255 }, { 255, 146, 43, 255 },
@@ -2094,7 +2165,7 @@ static void DrawHud() {
     Text(cMode, top + 8.0f, "algoritmo", 0.7f, kDim);
     Text(cSpeed, top + 8.0f, "km/h", 0.7f, kDim, 2);
     Text(cBar, top + 8.0f, "progresso", 0.7f, kDim);
-    Text(cOff, top + 8.0f, "desvio medio / max", 0.7f, kDim, 2);
+    Text(cOff, top + 8.0f, course.halfWidth > 0.0f ? "margem / min" : "desvio medio / max", 0.7f, kDim, 2);
     Text(cTime, top + 8.0f, "tempo", 0.7f, kDim, 2);
     Text(cScore, top + 8.0f, "pontos", 0.7f, kDim, 2);
     std::vector<int> shown;
@@ -2126,7 +2197,13 @@ static void DrawHud() {
         // the mean offset so far (what the GA scores) and the most
         const float mean = stats.time > 0.0 ? static_cast<float>(stats.absE / stats.time) : 0.0f;
         const CRGBA meanC = mean > 0.3f ? CRGBA(255, 90, 90, 255) : mean > 0.15f ? CRGBA(255, 200, 60, 255) : CRGBA(120, 230, 120, 255);
-        Text(cOff, y + 4.0f, Format("%.2f / %.2f", mean, stats.maxE), ts, meanC, 2);
+        if (course.halfWidth > 0.0f) {
+            // the room to the road's edge now and the least so far (green: more than EdgeComfort)
+            const float mm = stats.minMargin < 1e8 ? static_cast<float>(stats.minMargin) : R->marginNow;
+            const CRGBA mc = mm < 0.0f ? CRGBA(255, 90, 90, 255) : mm < edgeComfortGA ? CRGBA(255, 200, 60, 255) : CRGBA(120, 230, 120, 255);
+            Text(cOff, y + 4.0f, Format("%.2f / %.2f", running ? R->marginNow : 0.0f, mm), ts, mc, 2);
+        }
+        else Text(cOff, y + 4.0f, Format("%.2f / %.2f", mean, stats.maxE), ts, meanC, 2);
         Text(cTime, y + 4.0f, running ? Format("%.0f s", runT) : arrived ? Format("%.1f s", R->endTime) : R->result, ts,
             running ? kDim : arrived ? kWhite : CRGBA(255, 90, 90, 255), 2);
         if (GA::on && !running)
@@ -2140,7 +2217,10 @@ static void DrawHud() {
         Box(x, y, 6.0f, 404.0f, CRGBA(175, 110, 255, 255));
         Text(x + 20.0f, y + 8.0f, "ALGORITMO GENETICO", 1.0f, kWhite, 0, FONT_MENU);
         Text(x + 20.0f, y + 38.0f, Format("geracao %d   populacao %d   sigma %.3f", GA::generation, numRunners, GA::sigma), 0.78f, kDim);
-        Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x desvio medio + %.0f x s fora de %.0f m", GA::meanPenalty, GA::offPenalty, offLimitGA), 0.68f, kDim);
+        if (course.halfWidth > 0.0f)
+            Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x m.s a menos de %.1f m da borda + %.0f x s fora da pista (%.0f m)",
+                GA::edgePenalty, edgeComfortGA, GA::offPenalty, 2.0f * course.halfWidth), 0.66f, kDim);
+        else Text(x + 20.0f, y + 60.0f, Format("pontos = tempo + %.0f x desvio medio + %.0f x s fora de %.0f m", GA::meanPenalty, GA::offPenalty, offLimitGA), 0.68f, kDim);
         auto card = [&](float cy, const char* title, int k, const std::string& mode, double score, double time, double mean, double maxE) {
             Box(x + 16.0f, cy, gw - 32.0f, 112.0f, CRGBA(255, 255, 255, 16));
             Text(x + 28.0f, cy + 8.0f, title, 0.72f, kDim);
@@ -2218,9 +2298,17 @@ static void DrawHud() {
         const float lock = car->m_pHandlingData->m_fSteeringLock * 3.14159265f / 180.0f;
         Text(bx, y + 70.0f, "volante", 0.7f, kDim);
         Bar(bx + 80.0f, y + 74.0f, bw - 80.0f, 12.0f, -car->m_fSteerAngle / lock, CRGBA(120, 200, 255, 230), true);
-        Text(bx, y + 96.0f, Format("desvio %+.2f (med %.2f)", offsetNow, stats.time > 0.0 ? stats.absE / stats.time : 0.0), 0.7f, kDim);
-        Bar(bx + 80.0f, y + 100.0f, bw - 80.0f, 12.0f, -offsetNow / (2.0f * offLimitGA),
-            std::abs(offsetNow) > offLimitGA ? CRGBA(255, 90, 90, 230) : CRGBA(120, 230, 120, 230), true);
+        if (course.halfWidth > 0.0f) {
+            // where the car is across the road: the bar is the road, edge to edge
+            Text(bx, y + 96.0f, Format("margem %.2f m", R->marginNow), 0.7f, kDim);
+            Bar(bx + 80.0f, y + 100.0f, bw - 80.0f, 12.0f, -offsetNow / course.halfWidth,
+                R->marginNow < 0.0f ? CRGBA(255, 90, 90, 230) : R->marginNow < edgeComfortGA ? CRGBA(255, 200, 60, 230) : CRGBA(120, 230, 120, 230), true);
+        }
+        else {
+            Text(bx, y + 96.0f, Format("desvio %+.2f (med %.2f)", offsetNow, stats.time > 0.0 ? stats.absE / stats.time : 0.0), 0.7f, kDim);
+            Bar(bx + 80.0f, y + 100.0f, bw - 80.0f, 12.0f, -offsetNow / (2.0f * offLimitGA),
+                std::abs(offsetNow) > offLimitGA ? CRGBA(255, 90, 90, 230) : CRGBA(120, 230, 120, 230), true);
+        }
         Text(bx, y + 122.0f, Format("lateral %.2f g", std::abs(R->latGNow)), 0.7f, kDim);
         Bar(bx + 80.0f, y + 126.0f, bw - 80.0f, 12.0f, std::abs(R->latGNow) / 2.0f, CRGBA(255, 200, 60, 230));
         // pedals
@@ -2288,11 +2376,53 @@ void Draw() {
             Line3D({ p0.x, p0.y, z }, { p1.x, p1.y, z }, axis ? CRGBA(80, 255, 80, 200) : CRGBA(255, 255, 255, 70));
         }
     }
+    FlushLines();
+    // from here with the depth test (the road under the cars, not over them)
+    RwUInt32 zWrite = 0;
+    RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zWrite);
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+    RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
     forRunners {
-    if (std::abs(R->baseZ + 0.08f - z) > 1.0f) continue; // (another deck's: drawn with no depth test, seen through the floor)
+    if (std::abs(R->baseZ + 0.08f - z) > 1.0f) continue; // (another deck's: seen through the floor)
     const CRGBA col = ColorOf(R->index);
     const int n = static_cast<int>(course.p.size());
-    for (int i = 0; i + 1 < n + (course.closed ? 1 : 0); i += 2) {
+    if (course.halfWidth > 0.0f && n > 4) {
+        // A race track: asphalt between the edges (reddish where a sudden brake is, bluish in the crosswind), red and
+        // white kerbs outside each edge, a white line on the edge, a chequered line at the start and the end
+        const float H = course.halfWidth, K = 0.6f, za = z + 0.04f, zk = z + 0.05f, zl = z + 0.06f;
+        auto normal = [&](int i) { return CVector2D(-std::sin(course.head[i]), std::cos(course.head[i])); };
+        for (int i = 0; i < n - 1; i += 4) {
+            const int j = std::min(i + 4, n - 1);
+            const CVector2D a = course.p[i], b = course.p[j];
+            if (!close(a)) continue;
+            const CVector2D la = normal(i), lb = normal(j);
+            const CRGBA asphalt = course.vsud[i] < 1e8f ? CRGBA(120, 45, 45, 235) : course.wind[i] != 0.0f ? CRGBA(45, 70, 115, 235)
+                : CRGBA(52, 54, 60, 235);
+            const CVector2D al = a + la * H, ar = a - la * H, bl = b + lb * H, br = b - lb * H;
+            Quad3D({ ar.x, ar.y, za }, { al.x, al.y, za }, { bl.x, bl.y, za }, { br.x, br.y, za }, asphalt);
+            const CRGBA kerb = (i / 4) % 2 ? CRGBA(205, 35, 35, 255) : CRGBA(235, 235, 235, 255);
+            for (float side : { -1.0f, 1.0f }) {
+                const CVector2D ai = a + la * (side * H), ao = a + la * (side * (H + K)), bi = b + lb * (side * H), bo = b + lb * (side * (H + K));
+                Quad3D({ ai.x, ai.y, zk }, { ao.x, ao.y, zk }, { bo.x, bo.y, zk }, { bi.x, bi.y, zk }, kerb);
+                Line3D({ ai.x, ai.y, zl }, { bi.x, bi.y, zl }, CRGBA(255, 255, 255, 255));
+            }
+        }
+        for (int at : { 0, n - 1 }) {
+            if (!close(course.p[at])) continue;
+            // chequered: 2 rows of squares across the road
+            const CVector2D o = course.p[at], f(std::cos(course.head[at]), std::sin(course.head[at])), l = normal(at);
+            const int cells = std::max(static_cast<int>(2.0f * H / 0.5f), 2);
+            const float w = 2.0f * H / cells;
+            for (int r = 0; r < 2; r++)
+                for (int k = 0; k < cells; k++) {
+                    const CVector2D p0 = o + l * (-H + k * w) + f * (r * w), p1 = p0 + l * w, p2 = p1 + f * w, p3 = p0 + f * w;
+                    Quad3D({ p0.x, p0.y, zk }, { p1.x, p1.y, zk }, { p2.x, p2.y, zk }, { p3.x, p3.y, zk },
+                        (k + r) % 2 ? CRGBA(20, 20, 20, 255) : CRGBA(240, 240, 240, 255));
+                }
+        }
+    }
+    else for (int i = 0; i + 1 < n + (course.closed ? 1 : 0); i += 2) {
         const CVector2D a = course.p[i], b = course.p[(i + 2) % n];
         if (!course.closed && i + 2 >= n) break;
         if (!close(a)) continue;
@@ -2310,7 +2440,10 @@ void Draw() {
         Line3D(car->GetPosition(), { lookPoint.x, lookPoint.y, z + 0.5f }, CRGBA(255, 0, 0, 160));
     }
     }
+    FlushTris();
     FlushLines();
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(uintptr_t)zWrite);
     R = runners;
     DrawHud();
 }
