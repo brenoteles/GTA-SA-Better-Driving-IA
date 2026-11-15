@@ -2245,6 +2245,7 @@ static void WriteBest() {
 }
 
 static void ResetBatches();
+static void LoadRows();
 static void Start() {
     if (!on) return;
     rng.seed(seed ? seed : GetTickCount());
@@ -2260,6 +2261,7 @@ static void Start() {
     bestGen = -1;
     bestRes = Result();
     const bool resumed = resume && Load();
+    LoadRows();
     if (!resumed) {
         // the ini's own controller, then one of each algorithm, then random ones
         pop[0] = FromSettings(base);
@@ -2479,6 +2481,197 @@ static int NextBirth() {
     if (++birthCount >= numRunners) { birthGen++; birthCount = 0; }
     return g;
 }
+// --- The report: scripts\proving\ga_report.html, written by the ASI when a generation closes ---------------------------
+// The best car of each generation and how the GA and neural2 evolve, for the user to open in a browser with no tool
+// running (the rows also in ga_generations.tsv, read back at the start: the report keeps every generation)
+struct GenRow {
+    int gen = 0, runs = 0, home = 0, nnRuns = 0, nnHome = 0, esSteps = 0;
+    double score = 0.0, time = 0.0, mean = 0.0, top10 = 0.0, sigma = 0.0, nnBest = 0.0, nnReach = 0.0, nnOut = 0.0;
+    std::string stamp, id, mode, genes;
+};
+static std::vector<GenRow> genRows;
+static int esSteps = 0; // neural2's ES steps so far (StepThetaBatch)
+static std::string RowsPath() { return baseDir + "proving\\ga_generations.tsv"; }
+static void WriteReport();
+static void LoadRows() {
+    genRows.clear();
+    std::ifstream f(RowsPath());
+    std::string line;
+    while (std::getline(f, line)) {
+        std::vector<std::string> c;
+        size_t a = 0;
+        for (size_t b; (b = line.find('\t', a)) != std::string::npos; a = b + 1) c.push_back(line.substr(a, b - a));
+        c.push_back(line.substr(a));
+        if (c.size() < 19 || c[0] == "gen") continue;
+        GenRow r;
+        r.gen = std::atoi(c[0].c_str()); r.stamp = c[1]; r.runs = std::atoi(c[2].c_str()); r.home = std::atoi(c[3].c_str());
+        r.id = c[4]; r.mode = c[5]; r.score = std::atof(c[6].c_str()); r.time = std::atof(c[7].c_str()); r.mean = std::atof(c[8].c_str());
+        r.top10 = std::atof(c[9].c_str()); r.sigma = std::atof(c[10].c_str()); r.nnRuns = std::atoi(c[11].c_str());
+        r.nnHome = std::atoi(c[12].c_str()); r.nnBest = std::atof(c[13].c_str()); r.nnReach = std::atof(c[14].c_str());
+        r.esSteps = std::atoi(c[15].c_str()); r.nnOut = std::atof(c[16].c_str()); r.genes = c[18];
+        genRows.push_back(r);
+    }
+    if (!genRows.empty()) { esSteps = genRows.back().esSteps; WriteReport(); }
+}
+static std::string Html(const std::string& t) {
+    std::string o;
+    for (char ch : t) o += ch == '<' ? "&lt;" : ch == '>' ? "&gt;" : ch == '&' ? "&amp;" : std::string(1, ch);
+    return o;
+}
+// an SVG line chart: each series (value per generation, NAN = none) over the generations; lower is better if 'down'
+static std::string Chart(const std::vector<std::pair<std::string, std::vector<double>>>& series, const std::vector<int>& gens,
+    const char* const* colors, const char* unit, bool down) {
+    const double W = 900.0, H = 260.0, L = 56.0, Rm = 16.0, T = 14.0, B = 30.0;
+    double lo = 1e18, hi = -1e18;
+    for (const auto& se : series) for (double v : se.second) if (!std::isnan(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
+    std::string o = Format("<svg viewBox=\"0 0 %.0f %.0f\" class=\"chart\">", W, H);
+    if (gens.empty() || lo > hi) return o + "<text x=\"20\" y=\"40\">ainda sem dados</text></svg>";
+    if (hi - lo < 1e-6) { hi += 1.0; lo -= 1.0; }
+    const double pad = 0.06 * (hi - lo);
+    lo -= pad; hi += pad;
+    const int n = static_cast<int>(gens.size());
+    auto X = [&](int i) { return L + (n > 1 ? (W - L - Rm) * i / (n - 1) : (W - L - Rm) / 2); };
+    auto Y = [&](double v) { return T + (H - T - B) * (hi - v) / (hi - lo); };
+    for (int k = 0; k <= 4; k++) {
+        const double v = lo + (hi - lo) * k / 4.0;
+        o += Format("<line x1=\"%.0f\" x2=\"%.0f\" y1=\"%.1f\" y2=\"%.1f\" class=\"grid\"/><text x=\"%.0f\" y=\"%.1f\" class=\"ax\" text-anchor=\"end\">%.1f%s</text>",
+            L, W - Rm, Y(v), Y(v), L - 6, Y(v) + 4, v, unit);
+    }
+    const int every = std::max(1, n / 12);
+    for (int i = 0; i < n; i += every) o += Format("<text x=\"%.1f\" y=\"%.0f\" class=\"ax\" text-anchor=\"middle\">g%d</text>", X(i), H - 10, gens[i]);
+    for (size_t si = 0; si < series.size(); si++) {
+        std::string d;
+        bool pen = false;
+        for (int i = 0; i < n && i < static_cast<int>(series[si].second.size()); i++) {
+            const double v = series[si].second[i];
+            if (std::isnan(v)) { pen = false; continue; }
+            d += Format("%s%.1f,%.1f ", pen ? "L" : "M", X(i), Y(v));
+            pen = true;
+            o += Format("<circle cx=\"%.1f\" cy=\"%.1f\" r=\"2.5\" fill=\"%s\"><title>g%d: %.2f%s</title></circle>", X(i), Y(v), colors[si], gens[i], v, unit);
+        }
+        // (Format is limited to 4096 characters: the long parts joined as strings)
+        o += "<path d=\"" + d + "\" fill=\"none\" stroke=\"" + colors[si] + "\" stroke-width=\"2\"/>";
+    }
+    o += "</svg><div class=\"legend\">";
+    for (size_t si = 0; si < series.size(); si++)
+        o += Format("<span><i style=\"background:%s\"></i>%s</span>", colors[si], Html(series[si].first).c_str());
+    return o + Format("<span class=\"dim\">%s</span></div>", down ? "mais baixo = melhor" : "mais alto = melhor");
+}
+static void WriteReport() {
+    std::vector<int> gens;
+    std::vector<double> bestS, top10, nnBest, nnRate, nnReach, nnOut;
+    for (const auto& r : genRows) {
+        gens.push_back(r.gen);
+        bestS.push_back(r.score < 1000.0 ? r.score : NAN);
+        top10.push_back(r.top10 < 1000.0 ? r.top10 : NAN);
+        nnBest.push_back(r.nnHome > 0 ? r.nnBest : NAN);
+        nnRate.push_back(r.nnRuns > 0 ? 100.0 * r.nnHome / r.nnRuns : NAN);
+        nnReach.push_back(r.nnRuns > 0 ? r.nnReach / 1000.0 : NAN);
+        nnOut.push_back(r.nnOut);
+    }
+    static const char* const kC1[] = { "#3d8bfd", "#f59f00" };
+    static const char* const kC2[] = { "#b072ff" };
+    static const char* const kC3[] = { "#2fb380", "#e8590c" };
+    std::ostringstream h;
+    h << "<!doctype html><html lang=\"pt-br\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+         "<meta http-equiv=\"refresh\" content=\"60\"><title>Proving Ground GA</title><style>"
+         ":root{--bg:#f6f7f9;--fg:#1d2330;--card:#fff;--dim:#6b7280;--line:#e3e6eb}"
+         "@media (prefers-color-scheme:dark){:root{--bg:#12151b;--fg:#e8eaee;--card:#1b2029;--dim:#8b93a1;--line:#2a313d}}"
+         "body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif}"
+         "main{max-width:980px;margin:0 auto;padding:20px 16px}h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:26px 0 8px}"
+         ".dim{color:var(--dim)}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:10px 0}"
+         ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.kpi b{display:block;font-size:22px}"
+         ".chart{width:100%;height:auto}.chart .grid{stroke:var(--line)}.chart .ax{fill:var(--dim);font-size:11px}"
+         ".legend span{margin-right:16px;font-size:12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}"
+         ".tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:12.5px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}"
+         "th{color:var(--dim);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums}.genes{white-space:normal;color:var(--dim);font-size:11.5px;min-width:260px}"
+         "</style></head><body><main>";
+    char stamp[32];
+    std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%d/%m/%Y %H:%M", std::localtime(&now));
+    h << "<h1>Proving Ground: algoritmo genetico</h1><div class=\"dim\">Gerado pelo RealTrafficFix.SA.asi em " << stamp
+      << " ao fechar a geracao " << (genRows.empty() ? 0 : genRows.back().gen)
+      << " (a pagina recarrega a cada minuto). " << Html(Format("pontos = tempo x (1 + %.2f x desvio medio) + %.0f x s fora da pista; quem nao chega: 1000 + 0,5 x m que faltaram",
+             devWeight, offPenalty)) << "</div>";
+    h << "<div class=\"kpis\">";
+    if (bestGen >= 0)
+        h << Format("<div class=\"card kpi\"><span class=\"dim\">recorde (g%d)</span><b>%.2f</b>%s, %.1f s, desvio %.3f m</div>", bestGen, bestScore,
+            Html(modes[best.mode]).c_str(), bestRes.time, bestRes.mean);
+    if (!genRows.empty()) {
+        const GenRow& r = genRows.back();
+        h << Format("<div class=\"card kpi\"><span class=\"dim\">ultima geracao (g%d)</span><b>%.2f</b>%s %s</div>", r.gen, r.score, Html(r.id).c_str(), Html(r.mode).c_str());
+        h << Format("<div class=\"card kpi\"><span class=\"dim\">media dos 10 melhores</span><b>%.2f</b>%d de %d chegaram</div>", r.top10, r.home, r.runs);
+        h << Format("<div class=\"card kpi\"><span class=\"dim\">neural2 na ultima</span><b>%d/%d</b>chegaram%s</div>", r.nnHome, r.nnRuns,
+            r.nnHome > 0 ? Format(", melhor %.2f", r.nnBest).c_str() : "");
+    }
+    h << "</div>";
+    h << "<h2>Evolucao do GA</h2><div class=\"card\">"
+      << Chart({ { "melhor da geracao", bestS }, { "media dos 10 melhores", top10 } }, gens, kC1, "", true) << "</div>";
+    h << "<h2>Evolucao da IA neural (neural2)</h2><div class=\"dim\">Uma rede (63 sensores, 24 neuronios) que corrige o volante do pursuit "
+         "(ate 1/4 do curso) e a velocidade-alvo do planejador (ate 30%); aprende por estrategias evolutivas: cada passo junta as voltas de "
+      << nn2Cars << " carros. Passos ate agora: " << esSteps << ".</div>";
+    h << "<div class=\"card\">" << Chart({ { "neural2: melhor pontuacao", nnBest } }, gens, kC2, "", true) << "</div>";
+    h << "<div class=\"card\">" << Chart({ { "% das voltas que chegaram", nnRate } }, gens, kC3, "%", false) << "</div>";
+    h << "<div class=\"card\">" << Chart({ { "distancia media percorrida (km)", nnReach }, { "tamanho da correcao (RMS da camada de saida)", nnOut } },
+        gens, kC3, "", false) << "</div>";
+    h << "<h2>Melhor carro de cada geracao</h2><div class=\"card tw\"><table><tr><th>geracao</th><th>quando</th><th>carro</th><th>algoritmo</th>"
+         "<th>pontos</th><th>tempo</th><th>desvio</th><th>top 10</th><th>chegaram</th><th>neural2</th><th>sigma</th><th>genes</th></tr>";
+    for (auto it = genRows.rbegin(); it != genRows.rend(); ++it) {
+        const GenRow& r = *it;
+        h << Format("<tr><td>g%d</td><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%.2f</td><td class=\"num\">%.1f s</td><td class=\"num\">%.3f m</td>"
+                    "<td class=\"num\">%.2f</td><td class=\"num\">%d/%d</td><td class=\"num\">%d/%d%s</td><td class=\"num\">%.3f</td>",
+            r.gen, Html(r.stamp).c_str(), Html(r.id).c_str(), Html(r.mode).c_str(), r.score, r.time, r.mean, r.top10, r.home, r.runs, r.nnHome, r.nnRuns,
+            r.nnHome > 0 ? Format(" (%.1f)", r.nnBest).c_str() : "", r.sigma) << "<td class=\"genes\">" << Html(r.genes) << "</td></tr>";
+    }
+    h << "</table></div></main></body></html>\n";
+    Disk::Write(baseDir + "proving\\ga_report.html", h.str());
+}
+// the closed generation g into the rows, the tsv and the report
+static void ReportGeneration(int g, const std::vector<Done>& batch, double top10) {
+    GenRow r;
+    r.gen = g;
+    char stamp[32];
+    std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%d/%m %H:%M", std::localtime(&now));
+    r.stamp = stamp;
+    r.runs = static_cast<int>(batch.size());
+    r.top10 = top10;
+    r.sigma = sigma;
+    r.esSteps = esSteps;
+    double reach = 0.0;
+    for (const Done& d : batch) {
+        r.home += d.r.why == "end";
+        if (!IsNeural2(d.g)) continue;
+        r.nnRuns++;
+        reach += d.r.reached;
+        if (d.r.why == "end" && (r.nnHome++ == 0 || d.r.score < r.nnBest)) r.nnBest = d.r.score;
+    }
+    r.nnReach = r.nnRuns ? reach / r.nnRuns : 0.0;
+    if (static_cast<int>(nn2Theta.size()) == kNN2) {
+        // the output layer's size: 0 = pursuit itself; how far the net has moved from its teacher
+        const int out0 = (kNn2In + 1) * kNn2Hid;
+        double sq = 0.0;
+        for (int w = out0; w < kNN2; w++) sq += nn2Theta[w] * nn2Theta[w];
+        r.nnOut = std::sqrt(sq / (kNN2 - out0));
+    }
+    if (!batch.empty()) {
+        const Done& b = batch[0];
+        r.id = b.id;
+        r.mode = modes[b.g.mode];
+        r.score = b.r.score;
+        r.time = b.r.time;
+        r.mean = b.r.mean;
+        for (int i = 0; i < kNumGenes; i++) if (Uses(i, b.g.mode)) r.genes += Format("%s%s %.3g", r.genes.empty() ? "" : ", ", kGenes[i].key, b.g.g[i]);
+    }
+    genRows.push_back(r);
+    const bool fresh = GetFileAttributesA(RowsPath().c_str()) == INVALID_FILE_ATTRIBUTES && genRows.size() == 1;
+    std::string line = fresh ? "gen\tstamp\truns\thome\tid\tmode\tscore\ttime\tmean\ttop10\tsigma\tnn_runs\tnn_home\tnn_best\tnn_reach\tes_steps\tnn_out\t-\tgenes\n" : "";
+    line += Format("%d\t%s\t%d\t%d\t%s\t%s\t%.3f\t%.2f\t%.4f\t%.3f\t%.4f\t%d\t%d\t%.3f\t%.0f\t%d\t%.5f\t-\t", r.gen, r.stamp.c_str(), r.runs, r.home,
+        r.id.c_str(), r.mode.c_str(), r.score, r.time, r.mean, r.top10, r.sigma, r.nnRuns, r.nnHome, r.nnBest, r.nnReach, r.esSteps, r.nnOut) + r.genes + "\n";
+    Disk::Write(RowsPath(), line, true);
+    WriteReport();
+}
+
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
 static std::vector<float> pendingEps;   // a pair's + waiting for its -
@@ -2597,6 +2790,7 @@ static void StepThetaBatch() {
     }
     for (int w = 0; w < kNN2; w++) nn2Theta[w] += nn2Alpha / (m * nn2Sigma) * step[w] - 0.0005f * nn2Alpha * nn2Theta[w];
     SaveTheta();
+    esSteps++;
     Log(Format("neural2: ES step from %d runs (best of them %.1f)", m, esBatch.back().score));
     esBatch.clear();
 }
@@ -2663,6 +2857,7 @@ static void EndBatch(int g) {
           << Format(",%.3f,%d,%.3f,%.3f", x.score, 1, x.deficit, x.minMargin < 1e8 ? x.minMargin : 0.0) << "\n";
     }
     Disk::Write(histPath, h.str(), true);
+    ReportGeneration(g, batch, top10); // (before the erase: batch is a reference into batches)
     batches.erase(g);
     generation = std::max(generation, g + 1);
     // sigma by progress: the archive's 10 best better than before -> narrower (refine); 3 generations without -> wider
