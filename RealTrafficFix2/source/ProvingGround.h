@@ -787,6 +787,7 @@ static void __cdecl SteerAiHook(CVehicle* v) {
         return;
     }
     reinterpret_cast<void(__cdecl*)(CVehicle*)>(steerAiOriginal)(v);
+    if (cfgAiAbs) ApplyAiAbs(v, v->m_fBreakPedal);
 }
 // CAutomobile::ProcessControlInputs (virtual): the pad first, then ours
 static unsigned int inputsOriginal = 0x6AD690;
@@ -970,7 +971,11 @@ static void PlaceCar(CVehicle* v, float kmh) {
 void Init(const std::string& moduleDir) {
     baseDir = moduleDir;
     iniPath = moduleDir + "RealTrafficFix.proving.ini";
-    if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        // (the AI's ABS goes through the same call)
+        if (cfgAiAbs) InstallHooks();
+        return;
+    }
     enabled = true;
     IniChanged();
     ReadSettings();

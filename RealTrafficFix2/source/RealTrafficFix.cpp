@@ -238,6 +238,7 @@ public:
     bool onGhost = false;
     float ghostSpeed = 1000.0f;
     float lkGain = 1.0f;            // lane controller: the yaw the car really makes over what its turn model says
+    float absScale = 1.0f;          // AI ABS: eased off while a wheel still locks
     float lkPrevYaw = 0.0f, lkPrevSteer = 0.0f;
     unsigned int lkSteadySince = 0;
     float tcCut = 0.0f;       // traction control: share of the gas taken away (0..0.8)
@@ -1324,6 +1325,44 @@ static std::unordered_map<int, ModelLimits> learnedLimits;
 static std::string learnedFile;
 static bool learnedDirty = false;
 
+// The AI's sideways grip limit (g) on tarmac from the game's formula: every wheel cancels up to adhesive x tractionMult /
+// 1000 of game speed per frame step, whatever the load (CAutomobile::ProcessCarWheelPair, CVehicle::ProcessWheel): 10 x
+// adhesive x tractionMult m/s2
+static float TarmacAdhesive() {
+    static float adh = -1.0f;
+    if (adh < 0.0f) {
+        CColPoint cp{};
+        cp.m_nSurfaceTypeA = SURFACE_WHEELBASE;
+        cp.m_nSurfaceTypeB = SURFACE_TARMAC;
+        adh = reinterpret_cast<SurfaceInfos_c*>(0xB79538)->GetAdhesiveLimit(&cp);
+    }
+    return adh;
+}
+static float AiGripG(CVehicle* veh) { return 10.0f * TarmacAdhesive() * veh->m_pHandlingData->m_fTractionMultiplier / GRAVITY; }
+
+// AI ABS (proving ground): the pedal held under the point where a wheel's brake (brakeDecel x pedal x 2 x bias) passes its
+// adhesion (adhesive x tractionMult / 1000 x 2 x traction bias) and locks it, and in a curve under what the curve leaves
+static void ApplyAiAbs(CVehicle* veh, float& brake) {
+    if (brake <= 0.0f || veh->m_nVehicleSubClass != VEHICLE_AUTOMOBILE) return;
+    const tHandlingData* h = veh->m_pHandlingData;
+    const float adh = TarmacAdhesive() * h->m_fTractionMultiplier / 1000.0f;
+    const float bf = 2.0f * h->m_fBrakeBias, br = 2.0f - bf, tf = 2.0f * h->m_fTractionBias, tr = 2.0f - tf;
+    if (h->m_fBrakeDeceleration <= 0.0f) return;
+    const float lockF = bf > 0.01f ? adh * tf / (h->m_fBrakeDeceleration * bf) : 1.0f;
+    const float lockR = br > 0.01f ? adh * tr / (h->m_fBrakeDeceleration * br) : 1.0f;
+    float pedalMax = 0.9f * std::min(lockF, lockR);
+    const float G = AiGripG(veh) * GRAVITY;
+    const float speed = CVector::Dot(veh->m_vecMoveSpeed, veh->GetForward()) * GAME_SPEED_TO_MPS;
+    const float aLat = std::abs(speed * veh->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS);
+    if (G > 0.1f) pedalMax *= std::sqrt(std::max(1.0f - (aLat / G) * (aLat / G), 0.04f));
+    CAutomobile* a = static_cast<CAutomobile*>(veh);
+    bool locked = false;
+    for (int w = 0; w < 4; w++) if (a->m_wheelState[w] == WHEEL_STATE_FIXED) locked = true;
+    ExtendedData& x = vehExData.Get(veh);
+    x.absScale = locked ? std::max(x.absScale - 0.15f, 0.3f) : std::min(x.absScale + 0.05f, 1.0f);
+    if (speed > 2.0f) brake = std::min(brake, std::max(pedalMax * x.absScale, 0.05f));
+}
+
 static ModelLimits& GetModelLimits(CVehicle* veh) {
     auto it = learnedLimits.find(veh->m_nModelIndex);
     if (it != learnedLimits.end()) return it->second;
@@ -1903,6 +1942,17 @@ static float curGripCeiling = 1000.0f;
 static bool cfgSteerModel = true;
 static bool cfgSteerRateLimit = true;
 static bool cfgLaneKeep = true;
+// Proving ground results (ProvingGround.h, tools/proving.py on the proving grid):
+// - below the grip GTA's tyres don't slip at all: a car turns at exactly v tan(steer) / L with no lag, so the wheel for a
+//   line's curvature is known and only the error needs feeding back (kinematic steering)
+// - no ABS: a wheel braked past its adhesion locks at once and loses its sideways grip (the Infernus ran wide in every
+//   braked turn from ~70% pedal)
+// - the AI's grip: 10 x adhesive x tractionMult m/s2 from the formula, but the front axle saturates first; racing lines
+//   were followed within ~0.2-0.5 m at 42% of it (zig-zag, slalom, Z turns, chicanes, a hairpin after 385 km/h)
+static bool cfgKinematicSteer = true;
+static float cfgSteerBandwidth = 1.5f;   // rad/s: the error comes back like a critically damped spring at every speed
+static bool cfgAiAbs = true;
+static float cfgRacerGripShare = 0.42f;  // racing drivers' curve speeds: this share of the formula's AI grip
 // The game moves every AI car one lane left or right at random every 4-7 nodes on straight stretches (PickNextNode*:
 // 0x427655, 0x42E962, and 1 in 4 nodes at 0x427C7C). With the denser nodes that was a lane every few seconds, and the
 // mod's keep-right moved it back: cars drifting a lane and back (284 "back to the right" in 6 min on an empty map,
@@ -3676,6 +3726,47 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     laneKeepErrMax = std::max(laneKeepErrMax, std::abs(yOff));
     why = -1;
 
+    if (cfgKinematicSteer) {
+        // Kinematic steering (proving ground): at the rear axle, in the line's frame, e' = v sin(psi) and psi' = v (k -
+        // kLine): k = kLine - wn^2/v^2 e - 2 wn/v sin(psi), wheel = atan(L k). In a lane change the S's own sideways
+        // speed sets the heading it wants
+        float L = 2.7f;
+        float rearY = -1.35f;
+        {
+            CVector mn, mx;
+            GetEntityDimensions(veh, mn, mx);
+            L = GetWheelBase(veh, mn, mx);
+            rearY = -0.5f * L;
+            CColModel* col = veh->GetColModel();
+            if (col && col->m_pColData && col->m_pColData->m_nNumLines >= 4 && col->m_pColData->m_pLines) {
+                float r = 1000.0f;
+                for (int i = 0; i < 4; i++) r = std::min(r, col->m_pColData->m_pLines[i].m_vecStart.y);
+                if (r < 0.0f && r > -10.0f) rearY = r;
+            }
+        }
+        const CVector2D fwd = veh->GetForward().To2D();
+        const CVector2D rear = pos + fwd * rearY;
+        float sR, yR;
+        ProjectOnLine(line, rear, sR, yR);
+        const CVector2D tR = LinePointAt(line, sR + 2.0f) - LinePointAt(line, sR - 2.0f);
+        const CVector2D dR = tR * (1.0f / std::max(tR.Magnitude(), 0.001f));
+        const float h = std::clamp(0.15f * v, 3.0f, 8.0f);
+        float kLine = 0.0f;
+        {
+            const CVector2D p0 = LinePointAt(line, sR - h), p1 = LinePointAt(line, sR), p2 = LinePointAt(line, sR + h);
+            const float a = (p1 - p0).Magnitude(), b = (p2 - p1).Magnitude(), c = (p2 - p0).Magnitude();
+            if (a > 0.5f && b > 0.5f && c > 0.5f) kLine = 2.0f * CVector2D::Cross(p1 - p0, p2 - p1) / (a * b * c);
+        }
+        const float ref0 = refOffset ? refOffset(0.0f) : 0.0f, refRate = refOffset ? (refOffset(0.1f) - ref0) / 0.1f : 0.0f;
+        const float e = -(yR - ref0);                                                              // > 0: left of where it should be
+        const float psi = std::atan2(CVector2D::Cross(dR, fwd), CVector2D::Dot(dR, fwd)) + std::atan2(refRate, v); // > 0: pointing left of it
+        const float wn = cfgSteerBandwidth;
+        const float k = kLine - wn * wn / (v * v) * e - 2.0f * wn / v * std::sin(psi);
+        const float maxSteer = std::max(plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh), xdata.bRacer ? 0.45f : 0.0f);
+        xdata.laneKeepFrame = frameCounter;
+        return std::clamp(std::atan(L * k), -maxSteer, maxSteer);
+    }
+
     // Predictive steering on the car's own model (after ten-tenths: a single-track car in the road's frame, driven from
     // its offset, heading error, yaw rate and a preview of the road's curvature; no PID). For a set of steering angles
     // the next 1.2 s are simulated:
@@ -4728,6 +4819,10 @@ public:
         ReadIniBool(ini, "SteerModel", cfgSteerModel);
         ReadIniBool(ini, "SteerRateLimit", cfgSteerRateLimit);
         ReadIniBool(ini, "LaneKeep", cfgLaneKeep);
+        ReadIniBool(ini, "KinematicSteer", cfgKinematicSteer);
+        ReadIniFloat(ini, "SteerBandwidth", cfgSteerBandwidth);
+        ReadIniBool(ini, "AiABS", cfgAiAbs);
+        ReadIniFloat(ini, "RacerGripShare", cfgRacerGripShare);
         ReadIniBool(ini, "NoRandomLaneChanges", cfgNoRandomLaneChanges);
         ReadIniBool(ini, "RoadEdges", cfgRoadEdges);
         ReadIniBool(ini, "LeadAccel", cfgLeadAccel);
@@ -5253,6 +5348,9 @@ public:
             const ModelLimits& limits = GetModelLimits(vehicle);
             grip = limits.grip * std::min(prof.cornerGrip, 0.98f);
             decel = limits.decel * std::min(cfgLearnedDecelUse * Lerp(0.92f, 1.08f, aggr), 0.95f);
+            // The AI's own grip (proving ground): the learned values came from the player's laps (2.6 g in an Infernus,
+            // the player's load-sensitive grip); an AI car's front axle gives way well before
+            if (cfgRacerGripShare > 0.0f) grip = cfgRacerGripShare * AiGripG(vehicle);
         }
         curGripCeiling = racer && cfgAdaptiveLimits ? grip * xdata.surfaceFactor * damageGrip : 1000.0f;
         // Dirt, grass, rain and burst tyres
