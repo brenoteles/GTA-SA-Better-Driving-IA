@@ -125,10 +125,20 @@ static std::vector<std::string> ParseWords(const std::string& s) {
 
 // Up to 60 cars on the same course at once, each LaneShift m to the right of the one before, LanesPerDeck to a deck of
 // the platform, the next ones on the deck DeckHeight m above (A/B tests; the GA's population)
-static constexpr int kMaxRunners = 60;
-static const char* const kTags[kMaxRunners] = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
-    "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
-    "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7" };
+static constexpr int kMaxRunners = 100;
+// the cars' names: A..Z, a..z, 0..9, then AA, AB...
+static char kTagBuf[kMaxRunners][4];
+static const char* kTags[kMaxRunners];
+static const bool kTagsMade = [] {
+    for (int k = 0; k < kMaxRunners; k++) {
+        if (k < 26) snprintf(kTagBuf[k], 4, "%c", 'A' + k);
+        else if (k < 52) snprintf(kTagBuf[k], 4, "%c", 'a' + k - 26);
+        else if (k < 62) snprintf(kTagBuf[k], 4, "%c", '0' + k - 52);
+        else snprintf(kTagBuf[k], 4, "%c%c", 'A' + (k - 62) / 26, 'A' + (k - 62) % 26);
+        kTags[k] = kTagBuf[k];
+    }
+    return true;
+}();
 static int lanesPerDeck = 10;
 // Driver = human: the user drives car A with the game's own controls (the player's physics), scored like the others
 // and logged as HUMANO, but never chosen by the GA; a 3 s countdown holds everyone at the start
@@ -789,6 +799,7 @@ static int curModel = 0;
 static std::ofstream trace;            // (Trace)
 static float traceNext[kMaxRunners];
 static bool courseWritten = false;
+static float firstHome = -1.0f;        // the run's first car at the end (s; -1: none yet)
 static int camPick = -1;               // (UpdateCamera) -1: the leader
 static int camOn = 0;                  // the car the camera is on
 
@@ -1702,6 +1713,9 @@ static float nn2Sigma = 0.02f, nn2Alpha = 0.03f, nn2Noise = 0.01f;
 static int nn2Cars = 20;
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
 static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
+// CutoffFactor: once the first car is home, a car still running at that time x this is stopped (CUT) and scored by
+// the time it was heading for (its time x the course / how far it got) + CutPenalty (0: no cutoff)
+static float cutoffFactor = 1.3f, cutPenalty = 20.0f;
 static bool resume = true;
 static unsigned int seed = 0;
 static std::vector<std::string> modes{ "kinematic", "stanley", "pursuit", "mod" };
@@ -1756,6 +1770,8 @@ static void Read(CIniReader& ini, const Settings& s) {
     offLimitGA = ini.ReadFloat("GA", "OffLimit", offLimitGA);
     meanPenalty = ini.ReadFloat("GA", "MeanPenalty", meanPenalty);
     offPenalty = ini.ReadFloat("GA", "OffPenalty", offPenalty);
+    cutoffFactor = ini.ReadFloat("GA", "CutoffFactor", cutoffFactor);
+    cutPenalty = ini.ReadFloat("GA", "CutPenalty", cutPenalty);
     edgePenalty = ini.ReadFloat("GA", "EdgePenalty", edgePenalty);
     edgeComfortGA = ini.ReadFloat("GA", "EdgeComfort", edgeComfortGA);
     rmsPenalty = ini.ReadFloat("GA", "RmsPenalty", rmsPenalty);
@@ -2018,8 +2034,11 @@ static void Score(int k, const std::string& why, float time, double mean, double
     // the best is not the fastest: the one that is still fast and keeps inside the road. A corridor (Width): anywhere
     // with EdgeComfort m of room is free; EdgePenalty per m x s closer to an edge, OffPenalty per s with the body past
     // it (MeanPenalty x mean offset from the centre line: 0 with a corridor)
-    r.score += done ? time + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms
-                    : 1000.0 + 0.5 * std::max(length - sMax, 0.0f) + offPenalty * out;
+    // (CUT: too slow to wait for, scored by the time it was heading for, its outside time so far and CutPenalty)
+    const bool cut = why == "CUT" && sMax > 50.0f;
+    const double t = cut ? time * length / sMax : time;
+    r.score += done || cut ? t + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms + (cut ? cutPenalty : 0.0)
+                           : 1000.0 + 0.5 * std::max(length - sMax, 0.0f) + offPenalty * out;
     r.mean = std::max(r.mean, mean);
     r.deficit += deficit;
     r.minMargin = std::min(r.minMargin, minMargin);
@@ -2103,7 +2122,7 @@ static void NextGeneration() {
     }
 
     // the next generation: elite first (lane A, CJ's car, is the best), then the islands, children, immigrants
-    Genome next[kMaxRunners];
+    static Genome next[kMaxRunners]; // (static: ~6.5 KB a genome, 100+ of them blew the game's stack)
     const int e = std::clamp(elite, 0, n);
     const int imm = std::clamp(immigrants, 0, std::max(n - e - 1, 0));
     for (int i = 0; i < e; i++) next[i] = pop[order[i]];
@@ -2526,6 +2545,7 @@ void Update() {
             R->finished = false;
             R->result.clear();
             R->endTime = R->sMax = R->slowTime = R->progressS = R->progressT = 0.0f;
+            firstHome = -1.0f;
             for (float& m : R->learned) m = 1.0f;
             for (float& m : R->tcBand) m = 1.0f;
             for (float& b : R->bandBase) b = NAN;
@@ -2598,9 +2618,12 @@ void Update() {
         else if (car->GetPosition().z < R->baseZ - 5.0f) end = "FELL";
         else if (R->slowTime > 8.0f) end = "STUCK";
         else if (!openLoop && runT - R->progressT > 15.0f) end = "NOPROG"; // moving, but not along the course (circling)
+        // too slow to be worth waiting for: the first car home a while ago (GA::CutoffFactor)
+        else if (GA::on && GA::cutoffFactor > 0.0f && firstHome > 0.0f && runT > firstHome * GA::cutoffFactor) end = "CUT";
         if (end) {
             EndRun(end);
             R->finished = true;
+            if (!strcmp(end, "end") && firstHome < 0.0f) firstHome = runT;
         }
         }
         if (allDone) {
