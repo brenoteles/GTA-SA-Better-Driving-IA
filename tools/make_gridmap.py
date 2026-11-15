@@ -127,7 +127,7 @@ def dff():
 
 
 def bump_mesh():
-    w, length, h, n = 1.0, 3.0, 0.18, 12
+    w, length, h, n = 1.0, 3.0, 0.05, 12  # (18 cm lifted the cars and went through their floor between the wheels)
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
     zs = [h * math.sin(math.pi * i / n) for i in range(n + 1)]
     return tapered_profile(w, ys, zs, 0.3)
@@ -141,7 +141,7 @@ def kicker_mesh():
 
 
 def ripple_mesh():
-    w, waves, every, h, per = 5.0, 8, 3.0, 0.06, 8
+    w, waves, every, h, per = 5.0, 8, 3.0, 0.03, 8
     length = waves * every
     n = waves * per
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
@@ -150,7 +150,7 @@ def ripple_mesh():
 
 
 def hump_mesh():
-    w, length, h, n = 5.0, 3.5, 0.12, 14
+    w, length, h, n = 5.0, 3.5, 0.07, 14
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
     zs = [h * math.sin(math.pi * i / n) for i in range(n + 1)]
     return tapered_profile(w, ys, zs, 0.5)
