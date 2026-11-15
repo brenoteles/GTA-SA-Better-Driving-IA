@@ -291,6 +291,9 @@ struct Stats {
     float stopDist = 0.0f;          // brake tests
 };
 
+// A change a car is trying while it drives (LearnByResult): which number, its value before, and how it went
+struct Trial { int band = -1, which = -1; float old = 0, sum = 0, off = 0, maxOff = 0, t = 0; int n = 0; };
+
 // One car on the course (A, and B for A/B tests): its settings, course, car and controller state
 struct Runner {
     const char* tag = "A";
@@ -324,7 +327,12 @@ struct Runner {
     bool skidFNow = false, skidRNow = false, absOn = false, tcOn = false;
     float windNow = 0.0f;
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
-    float absLearn = 1.0f, tcLearn = 1.0f; // ... and of the brake pedal its ABS allows and the gas its TC allows
+    float tcBand[5] = { 1, 1, 1, 1, 1 };  // ... the gas its TC lets through in each kind of curve
+    float absLearn = 1.0f;                // ... and the brake pedal its ABS allows
+    float bandBase[5] = { NAN, NAN, NAN, NAN, NAN }, absBase = NAN; // its average result in each kind / braking
+    Trial curveTrial, absTrial;
+    int trials = 0, kept = 0;
+    float aLongNow = 0.0f;
 };
 static Runner runners[kMaxRunners];
 static Runner* R = &runners[0];
@@ -712,6 +720,80 @@ static bool IniChanged() {
 
 // --- Control (called right before the car's physics) -------------------------------------------------------------------
 
+// --- Learning by result ------------------------------------------------------------------------------------------------
+// While it drives each car tries small changes and keeps the ones that paid off, judged the way the score judges a run
+// (speed and the line; no rule against sliding: sideways may well be faster). In every curve one number for that kind
+// of curve (CurveBand) goes up or down by a step: its grip (the speed it plans) or the gas its TC lets through. At the
+// curve's end its result, speed / the most the tyres allow at that radius - 0.67 x mean offset (m) (1% of speed ~ 0.015
+// m of offset: the score's 1 s per 100 x mean offset over a ~150 s run) - 0.5 if it went 2 m off, against its own
+// average for that kind: better -> kept, worse -> put back. Every braking the same for its ABS limit (deceleration / the
+// AI grip). The step is 0.03 + 0.25 x LearnRate.
+static std::minstd_rand learnRng(12345);
+static float LearnU() { return std::uniform_real_distribution<float>(0.0f, 1.0f)(learnRng); }
+
+static float* TrialValue(const Trial& t) {
+    if (t.which == 0) return &R->learned[t.band];
+    if (t.which == 1) return &R->tcBand[t.band];
+    return &R->absLearn;
+}
+
+static void EndTrial(Trial& t, float& base) {
+    float* v = TrialValue(t);
+    if (t.t >= 0.5f && t.n > 0) {
+        const float r = t.sum / t.n - 0.67f * t.off / t.n - (t.maxOff > 2.0f ? 0.5f : 0.0f);
+        R->trials++;
+        if (!std::isnan(base) && r < base) *v = t.old; // worse than usual: back
+        else R->kept++;
+        base = std::isnan(base) ? r : 0.7f * base + 0.3f * r;
+    }
+    else *v = t.old; // too short to tell
+    t = Trial();
+}
+
+static void LearnByResult(float speed, float dt, float brakeAsked) {
+    const float step = 0.03f + 0.25f * cfg.learnRate;
+    const float G = aiGripG * 9.81f;
+    // a curve: a trial per curve (a new one when the kind changes)
+    const float c = std::abs(course.curv[nearIdx]);
+    const int band = c > 1.0f / 400.0f ? CurveBand(c) : -1;
+    Trial& ct = R->curveTrial;
+    if (band != ct.band) {
+        if (ct.band >= 0) EndTrial(ct, R->bandBase[ct.band]);
+        if (band >= 0) {
+            ct.band = band;
+            ct.which = LearnU() < 0.5f ? 0 : 1;
+            float* v = TrialValue(ct);
+            ct.old = *v;
+            const float lo = ct.which == 0 ? 0.6f : 0.5f, hi = ct.which == 0 ? 1.6f : 2.5f;
+            *v = std::clamp(*v + (LearnU() < 0.5f ? -step : step), lo, hi);
+        }
+    }
+    if (ct.band >= 0) {
+        ct.sum += std::min(speed / std::sqrt(G / c), 2.0f);
+        ct.off += std::abs(offsetNow);
+        ct.maxOff = std::max(ct.maxOff, std::abs(offsetNow));
+        ct.t += dt;
+        ct.n++;
+    }
+    // a braking: a trial for the ABS
+    Trial& bt = R->absTrial;
+    const bool braking = brakeAsked > 0.3f;
+    if (braking && bt.band < 0) {
+        bt.band = 0;
+        bt.which = 2;
+        bt.old = R->absLearn;
+        R->absLearn = std::clamp(R->absLearn + (LearnU() < 0.5f ? -step : step), 0.5f, 1.5f);
+    }
+    else if (!braking && bt.band >= 0) EndTrial(bt, R->absBase);
+    if (bt.band >= 0) {
+        bt.sum += std::min(std::max(-R->aLongNow, 0.0f) / G, 2.0f);
+        bt.off += std::abs(offsetNow);
+        bt.maxOff = std::max(bt.maxOff, std::abs(offsetNow));
+        bt.t += dt;
+        bt.n++;
+    }
+}
+
 static float HandlingLockRad(CVehicle* v) { return v->m_pHandlingData->m_fSteeringLock * 3.14159265f / 180.0f; }
 
 static float ClosedLoopSteer(CVehicle* v, float speed) {
@@ -876,18 +958,6 @@ static void Control(CVehicle* v) {
     }
     // a sudden brake: only once the car is in it
     if (!openLoop && !course.vsud.empty()) vt = std::min(vt, course.vsud[nearIdx]);
-    if (!openLoop && gripG > 0.0f && cfg.learnRate > 0.0f && speed > 5.0f) {
-        // Learning the kind of curve the car is in: on the line, not sliding, and using the grip it planned there -> it
-        // can take that kind faster; sliding or off the line by 1 m -> slower (three times quicker down than up)
-        const float c = std::abs(course.curv[nearIdx]);
-        if (c > 1.0f / 400.0f) {
-            float& m = R->learned[CurveBand(c)];
-            const float planned = gripG * CurveGrip(c) * m * 9.81f;
-            const float aLat = std::abs(speed * v->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS);
-            if (R->skidFNow || R->skidRNow || std::abs(offsetNow) > 1.0f) m = std::max(m - 3.0f * cfg.learnRate * dt, 0.6f);
-            else if (std::abs(offsetNow) < 0.3f && aLat > 0.85f * planned) m = std::min(m + cfg.learnRate * dt, 1.6f);
-        }
-    }
     targetKmh = vt * 3.6f;
     R->absOn = R->tcOn = false;
     R->windNow = 0.0f;
@@ -911,6 +981,7 @@ static void Control(CVehicle* v) {
         if (e > -0.5f) gas = std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f);
         if (e < -1.0f) brake = std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f);
     }
+    const float brakeAsked = brake;
     if (!openLoop && cfg.abs && brake > 0.0f) {
         // No ABS in GTA: a wheel whose brake (brakeDecel x pedal x 2 x bias) passes its adhesion (adhesive x tractionMult
         // / 1000 x 2 x traction bias) locks at once (ProcessWheel: WHEEL_STATE_FIXED) and loses its sideways grip; the
@@ -933,13 +1004,8 @@ static void Control(CVehicle* v) {
         bool locked = false;
         for (int w = 0; w < 4; w++) if (a->m_wheelState[w] == 3) locked = true;
         absScale = locked ? std::max(absScale - cfg.absDrop, 0.3f) : std::min(absScale + cfg.absRecover, 1.0f);
+        // (x what the car learned of its ABS: LearnByResult)
         const float allowed = pedalMax * absScale * R->absLearn;
-        // and the car learns its own limit: a wheel locked -> less pedal from now on; the ABS held the pedal back and
-        // nothing locked -> it could have braked harder
-        if (cfg.learnRate > 0.0f) {
-            if (locked) R->absLearn = std::max(R->absLearn - 3.0f * cfg.learnRate * dt, 0.5f);
-            else if (brake > allowed) R->absLearn = std::min(R->absLearn + cfg.learnRate * dt, 1.5f);
-        }
         R->absOn = brake > allowed;
         brake = std::min(brake, allowed);
     }
@@ -951,7 +1017,9 @@ static void Control(CVehicle* v) {
         // (the numbers are the car's genes: TcCircle, TcMinGas, TcSlip, TcDrop, TcRecover)
         const float room = 1.0f - cfg.tcCircle * (1.0f - std::sqrt(std::max(G * G - aLat * aLat, 0.0f)) / G);
         const float gasAsked = gas;
-        gas = std::min(gas, std::clamp(room * R->tcLearn, cfg.tcMinGas, 1.0f));
+        // (x the gas the car learned its tyres take in this kind of curve: LearnByResult)
+        const float cNow = std::abs(course.curv[nearIdx]);
+        gas = std::min(gas, std::clamp(room * (cNow > 1.0f / 400.0f ? R->tcBand[CurveBand(cNow)] : 1.0f), cfg.tcMinGas, 1.0f));
         // sliding: at the rear axle (at the car's centre a tight turn at full lock reads ~0.25 rad with the tyres holding:
         // the gas went off and the car stopped in the 7 m U-turn), and not at walking pace
         const float vRightRear = CVector::Dot(v->m_vecMoveSpeed, v->GetRight()) - v->m_vecTurnSpeed.z * rearAxleY;
@@ -965,13 +1033,8 @@ static void Control(CVehicle* v) {
         tcScale = spinning ? std::max(tcScale - cfg.tcDrop, 0.2f) : std::min(tcScale + cfg.tcRecover, 1.0f);
         gas *= tcScale;
         R->tcOn = gas < gasAsked - 0.05f;
-        // the car learns how much gas its tyres take in a curve: spinning or sliding -> less; the TC cut the gas and
-        // the tyres held -> more
-        if (cfg.learnRate > 0.0f) {
-            if (spinning || sliding) R->tcLearn = std::max(R->tcLearn - 3.0f * cfg.learnRate * dt, 0.5f);
-            else if (R->tcOn) R->tcLearn = std::min(R->tcLearn + cfg.learnRate * dt, 1.5f);
-        }
     }
+    if (!openLoop && cfg.learnRate > 0.0f && speed > 5.0f) LearnByResult(speed, dt, brakeAsked);
     if (d.handbrakeAt && tp >= 0.0f) hb = true;
     gasOut = gas;
     brakeOut = brake;
@@ -1065,6 +1128,7 @@ static void Record(CVehicle* v, float dt) {
     }
     const CVector p = v->GetPosition();
     R->latGNow = aLat / 9.81f;
+    R->aLongNow = aLong;
     R->slipNow = std::atan2(vL, std::max(std::abs(vF), 0.5f));
     R->speedNow = speed * 3.6f;
     R->skidFNow = ws[0] || ws[2];
@@ -1144,7 +1208,7 @@ static const GeneDef kGenes[] = {
     { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley" },
     // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
     { "Steer", "LookaheadTime", &Settings::lookTime, 0.05f, 1.5f, "pursuit mod" }, // (mod: its fallback)
-    { "Steer", "LookaheadMin", &Settings::lookMin, 3.0f, 15.0f, "pursuit mod" },
+    { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
     { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod" },
     { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f, "" },
@@ -1160,14 +1224,17 @@ static const GeneDef kGenes[] = {
     { "Speed", "AbsDrop", &Settings::absDrop, 0.02f, 0.4f, "" },
     { "Speed", "AbsRecover", &Settings::absRecover, 0.01f, 0.2f, "" },
     { "Speed", "AbsCircle", &Settings::absCircle, 0.0f, 1.0f, "" },
-    { "Speed", "TcSlip", &Settings::tcSlip, 0.03f, 0.3f, "" },       // TC: slip (rad) before the gas goes
-    { "Speed", "TcMinGas", &Settings::tcMinGas, 0.0f, 0.5f, "" },
-    { "Speed", "TcDrop", &Settings::tcDrop, 0.02f, 0.3f, "" },
+    // (up to no TC at all: driving sideways may be faster, and the score decides)
+    { "Speed", "TcSlip", &Settings::tcSlip, 0.03f, 1.0f, "" },       // TC: slip (rad) before the gas goes
+    { "Speed", "TcMinGas", &Settings::tcMinGas, 0.0f, 1.0f, "" },
+    { "Speed", "TcDrop", &Settings::tcDrop, 0.0f, 0.3f, "" },
     { "Speed", "TcRecover", &Settings::tcRecover, 0.01f, 0.1f, "" },
     { "Speed", "TcCircle", &Settings::tcCircle, 0.0f, 1.0f, "" },
 };
 constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
-struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; }; // label: its pilot profile (elites keep it)
+// label: its pilot profile (elites keep it); sum / runs: its scores so far (an elite drives again every generation: GTA's
+// physics gave the same genome 156.8 and 158.2, more than between 1st and 3rd; its average is what ranks it)
+struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; double sum = 0.0; int runs = 0; };
 struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0; std::string why; int runs = 0; };
 
 static int elite = 2, tournament = 3, immigrants = 1, maxGenerations = 0;
@@ -1330,6 +1397,12 @@ static bool Load() {
         }
     }
     for (; n < numRunners; n++) pop[n] = Random();  // (a bigger population than the saved one)
+    // genes the file did not have (added since): the ini's value for the elite, drawn anew for the rest (all 40 with
+    // the same value, mutation alone took generations to spread them: S1 of Gemini's 4th review)
+    for (int i = 0; i < kNumGenes; i++) {
+        if (std::find(names.begin(), names.end(), std::string(kGenes[i].key)) != names.end()) continue;
+        for (int k = std::max(elite, 0); k < numRunners; k++) pop[k].g[i] = kGenes[i].lo + U() * (kGenes[i].hi - kGenes[i].lo);
+    }
     return true;
 }
 
@@ -1384,21 +1457,34 @@ static void Score(int k, const std::string& why, float time, double mean, double
     r.runs++;
 }
 
-static int Tournament() {
-    int bestK = Pick(numRunners);
+// mode >= 0: among that algorithm's only (its own children: S2 of Gemini's 4th review)
+static int Tournament(const std::vector<double>& avg, int mode = -1) {
+    std::vector<int> pool;
+    for (int k = 0; k < numRunners; k++) if (mode < 0 || pop[k].mode == mode) pool.push_back(k);
+    if (pool.empty()) return Pick(numRunners);
+    int bestK = pool[Pick(static_cast<int>(pool.size()))];
     for (int t = 1; t < tournament; t++) {
-        const int k = Pick(numRunners);
-        if (res[k].score < res[bestK].score) bestK = k;
+        const int k = pool[Pick(static_cast<int>(pool.size()))];
+        if (avg[k] < avg[bestK]) bestK = k;
     }
     return bestK;
 }
 
 static void NextGeneration() {
     const int n = numRunners;
+    // ranked by the average of the generations each genome drove (a new one: this run)
+    std::vector<double> avg(n);
+    for (int k = 0; k < n; k++) {
+        pop[k].sum += res[k].score;
+        pop[k].runs++;
+        if (pop[k].runs > 5) { pop[k].sum *= 5.0 / 6.0; pop[k].runs = 5; } // (the last ~5)
+        avg[k] = pop[k].sum / pop[k].runs;
+    }
     std::vector<int> order(n);
     for (int k = 0; k < n; k++) order[k] = k;
-    std::stable_sort(order.begin(), order.end(), [](int a, int b) { return res[a].score < res[b].score; });
-    const Result& top = res[order[0]];
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return avg[a] < avg[b]; });
+    Result top = res[order[0]];
+    top.score = avg[order[0]];
     history.push_back(top.score);
     if (top.score < bestScore) {
         bestScore = top.score;
@@ -1407,12 +1493,12 @@ static void NextGeneration() {
         bestGen = generation;
         WriteBest();
     }
-    Log(Format("\n=== Generation %d (sigma %.3f): best %s %.2f, best ever %.2f (gen %d)", generation, sigma,
-        kTags[order[0]], top.score, bestScore, bestGen));
+    Log(Format("\n=== Generation %d (sigma %.3f): best %s %.2f (average of %d runs), best ever %.2f (gen %d)", generation, sigma,
+        kTags[order[0]], top.score, pop[order[0]].runs, bestScore, bestGen));
     const std::string histPath = baseDir + "proving\\ga_history.csv";
     std::string header = "stamp,generation,rank,car,mode,score,result,time_s,mean_m,rms_m,max_m,out_s,reached_m,sigma";
     for (const auto& gd : kGenes) header += std::string(",") + gd.key;
-    header += ",label";
+    header += ",label,avg_score,runs";
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
@@ -1434,7 +1520,8 @@ static void NextGeneration() {
         Log(Format("  %2d. %s %-9s score %8.2f  %-7s %6.1f s  offset mean %.2f rms %.2f max %5.2f m  out %5.1f s  | %s", r + 1, kTags[k],
             modes[pop[k].mode].c_str(), x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, ShortText(pop[k]).c_str()));
         h << Format("%s,%d,%d,%s,%s,%.3f,%s,%.2f,%.3f,%.3f,%.3f,%.2f,%.0f,%.4f,", stamp, generation, r + 1, kTags[k], modes[pop[k].mode].c_str(),
-            x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, x.reached, sigma) << GenesText(pop[k], ",") << "," << pop[k].label << "\n";
+            x.score, x.why.c_str(), x.time, x.mean, x.rms, x.maxE, x.out, x.reached, sigma) << GenesText(pop[k], ",") << "," << pop[k].label
+          << Format(",%.3f,%d", avg[k], pop[k].runs) << "\n";
     }
 
     // the next generation: elite first (lane A, CJ's car, is the best), children, immigrants
@@ -1445,16 +1532,21 @@ static void NextGeneration() {
     // and the best that finished of every other algorithm (in one generation the minorities were gone: a mode has to
     // be tuned before it can compete)
     int kept = e;
+    std::vector<int> minorities;
     for (int m = 0; m < static_cast<int>(modes.size()) && kept < n - imm; m++) {
         bool inElite = false;
         for (int i = 0; i < e; i++) inElite |= next[i].mode == m;
         if (inElite) continue;
         for (int r = e; r < n; r++)
-            if (pop[order[r]].mode == m && res[order[r]].why == "end") { next[kept++] = pop[order[r]]; break; }
+            if (pop[order[r]].mode == m && res[order[r]].why == "end") { next[kept++] = pop[order[r]]; minorities.push_back(m); break; }
     }
+    // (kept, a minority never won the tournament against 30 pursuits and never changed: one child of its own a
+    // generation, from parents of its algorithm)
+    size_t minorityChild = 0;
     for (int i = kept; i < n - imm; i++) {
-        const Genome& a = pop[Tournament()];
-        const Genome& b = pop[Tournament()];
+        const int own = minorityChild < minorities.size() ? minorities[minorityChild++] : -1;
+        const Genome& a = pop[Tournament(avg, own)];
+        const Genome& b = pop[Tournament(avg, own)];
         Genome c;
         c.mode = U() < 0.5f ? a.mode : b.mode;
         // each gene from the parent whose algorithm reads it (from the one that ignores it, it only rode along)
@@ -1462,7 +1554,7 @@ static void NextGeneration() {
             const bool ua = Uses(g, a.mode), ub = Uses(g, b.mode);
             c.g[g] = ua && !ub ? a.g[g] : ub && !ua ? b.g[g] : U() < 0.5f ? a.g[g] : b.g[g];
         }
-        if (U() < modeMutation && modes.size() > 1) {
+        if (own < 0 && U() < modeMutation && modes.size() > 1) {
             // another algorithm: the genes it reads and the old one did not are drawn anew (they only rode along)
             const int old = c.mode;
             c.mode = (c.mode + 1 + Pick(static_cast<int>(modes.size()) - 1)) % static_cast<int>(modes.size());
@@ -1796,7 +1888,12 @@ void Update() {
             R->result.clear();
             R->endTime = R->sMax = R->slowTime = R->progressS = R->progressT = 0.0f;
             for (float& m : R->learned) m = 1.0f;
-            R->absLearn = R->tcLearn = 1.0f;
+            for (float& m : R->tcBand) m = 1.0f;
+            for (float& b : R->bandBase) b = NAN;
+            R->absLearn = 1.0f;
+            R->absBase = NAN;
+            R->curveTrial = R->absTrial = Trial();
+            R->trials = R->kept = 0;
             PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
             brakeDone = false;
             StartCsv();
@@ -1927,13 +2024,14 @@ static float hudU = 1.0f, hudW = 1920.0f, hudH = 1080.0f;
 static void Box(float x, float y, float w, float h, CRGBA c) {
     CSprite2d::DrawRect(CRect(x * hudU, y * hudU, (x + w) * hudU, (y + h) * hudU), c);
 }
-static void Text(float x, float y, const std::string& s, float size, CRGBA c, int align = 0, short font = FONT_SUBTITLES) {
+static void Text(float x, float y, const std::string& s, float size, CRGBA c, int align = 0, short font = FONT_SUBTITLES, bool edge = true) {
     CFont::SetFontStyle(font);
     CFont::SetProportional(true);
     CFont::SetBackground(false, false);
     CFont::SetScale(0.42f * size * hudU, 0.95f * size * hudU);
     CFont::SetColor(c);
-    CFont::SetEdge(1);
+    CFont::SetEdge(edge ? 1 : 0);
+    CFont::SetDropShadowPosition(0);
     CFont::SetDropColor(CRGBA(0, 0, 0, 220));
     CFont::SetOrientation(align == 1 ? ALIGN_CENTER : align == 2 ? ALIGN_RIGHT : ALIGN_LEFT);
     CFont::SetWrapx(hudW * hudU);
@@ -1955,7 +2053,7 @@ static void Bar(float x, float y, float w, float h, float v, CRGBA c, bool centr
 }
 static void Chip(float x, float y, const char* label, bool lit, CRGBA c) {
     Box(x, y, 64.0f, 24.0f, lit ? c : CRGBA(255, 255, 255, 30));
-    Text(x + 32.0f, y + 3.0f, label, 0.75f, lit ? CRGBA(0, 0, 0, 255) : CRGBA(255, 255, 255, 110), 1);
+    Text(x + 32.0f, y + 3.0f, label, 0.75f, lit ? CRGBA(20, 20, 20, 255) : CRGBA(255, 255, 255, 110), 1, FONT_SUBTITLES, !lit);
 }
 static const CRGBA kPanel(12, 14, 20, 185), kDim(255, 255, 255, 140), kWhite(255, 255, 255, 255);
 
@@ -2101,12 +2199,15 @@ static void DrawHud() {
         Text(x + 16.0f, y + 42.0f, genes, 0.72f, kDim);
         // the grip it learned for each kind of curve (radius, m): green above 1 (faster than planned), red below
         if (cfg.learnRate > 0.0f) {
-            Text(x + 16.0f, y + 166.0f, Format("aprendido (x%.2f/s): curvas", cfg.learnRate), 0.64f, kDim);
+            Text(x + 16.0f, y + 166.0f, Format("aprendido (passo %.2f): curvas", 0.03f + 0.25f * cfg.learnRate), 0.64f, kDim);
+            float tc = 0.0f;
+            for (float m : R->tcBand) tc += m / 5.0f;
             for (int b = 0; b < 7; b++) {
-                const float m = b < 5 ? R->learned[b] : b == 5 ? R->absLearn : R->tcLearn;
-                Text(x + 290.0f + 76.0f * b, y + 166.0f, Format("%s x%.2f", b < 5 ? kBandNames[b] : b == 5 ? "ABS" : "TC", m), 0.64f,
+                const float m = b < 5 ? R->learned[b] : b == 5 ? R->absLearn : tc;
+                Text(x + 250.0f + 72.0f * b, y + 166.0f, Format("%s x%.2f", b < 5 ? kBandNames[b] : b == 5 ? "ABS" : "TC", m), 0.64f,
                     m > 1.02f ? CRGBA(120, 230, 120, 255) : m < 0.98f ? CRGBA(255, 120, 120, 255) : kWhite);
             }
+            Text(x + pw - 16.0f, y + 166.0f, Format("%d/%d mantidas", R->kept, R->trials), 0.64f, kDim, 2);
         }
         // speed
         Text(x + 150.0f, y + 66.0f, Format("%.0f", R->speedNow), 2.6f, kWhite, 2, FONT_PRICEDOWN);
