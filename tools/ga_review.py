@@ -43,7 +43,14 @@ GEMINI_MODEL = 'gemini-4-argon-high'
 RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.05, 1.5),
           'LookaheadMin': (3.0, 15.0), 'StanleyK': (0.3, 5.0), 'Gain': (0.5, 1.3), 'Smoothing': (0.0, 0.12),
           'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 1.5),
-          'GripTight': (0.6, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4)}
+          'GripTight': (0.6, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4), 'CruiseGas': (0.0, 0.4),
+          'AbsMargin': (0.5, 1.2), 'AbsDrop': (0.02, 0.4), 'AbsRecover': (0.01, 0.2), 'AbsCircle': (0.0, 1.0),
+          'TcSlip': (0.03, 0.3), 'TcMinGas': (0.0, 0.5), 'TcDrop': (0.02, 0.3), 'TcRecover': (0.01, 0.1),
+          'TcCircle': (0.0, 1.0)}
+# (genes a generation did not have yet: the value they had before they were genes)
+DEFAULTS = {'GripTight': 1.0, 'GripFast': 1.0, 'LearnRate': 0.0, 'CruiseGas': 0.15, 'AbsMargin': 0.9, 'AbsDrop': 0.15,
+            'AbsRecover': 0.05, 'AbsCircle': 1.0, 'TcSlip': 0.08, 'TcMinGas': 0.15, 'TcDrop': 0.1, 'TcRecover': 0.03,
+            'TcCircle': 1.0}
 GENES = list(RANGES)
 
 SCHEMA = """
@@ -118,15 +125,18 @@ def ingest(quiet=False):
     pts, secs, _ = course()
     length = pts[-1]['s'] if pts else 0.0
     gens = set()
-    if os.path.exists(HISTORY):
-        with open(HISTORY) as f:
-            rows = list(csv.DictReader(f))
+    paths = sorted(glob.glob(os.path.join(PROVING, 'ga_history_*.csv'))) + ([HISTORY] if os.path.exists(HISTORY) else [])
+    if paths:
+        rows = []
+        for path in paths:
+            with open(path) as f:
+                rows += list(csv.DictReader(f))
         # (a generation that ran again after a restart: its last rows)
         by = {}
         for r in rows:
             by[(int(r['generation']), r['car'])] = r
         for (g, car), r in by.items():
-            genes = {k: float(r[k]) for k in GENES if k in r}
+            genes = {k: float(r[k]) if r.get(k) not in (None, '') else DEFAULTS.get(k, 0.0) for k in GENES}
             c.execute('INSERT OR REPLACE INTO individuals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                       (g, int(r['rank']), car, r['mode'], float(r['score']), r['result'], float(r['time_s']),
                        float(r.get('mean_m') or 0), float(r['rms_m']), float(r['max_m']), float(r['out_s']), float(r['reached_m']),

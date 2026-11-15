@@ -79,6 +79,12 @@ struct Settings {
     // the grip by the kind of curve: x GripTight at a radius of 15 m and less, x 1 at 45 m, x GripFast at 150 m and more
     // (in between along the log of the radius); and how fast the car learns each kind itself while it drives (per s)
     float gripTight = 1.0f, gripFast = 1.0f, learnRate = 0.0f;
+    // ABS: the pedal at AbsMargin of the wheels' lock point, x the friction circle's share by AbsCircle (0 = ignore the
+    // curve, 1 = all of it); a lock takes AbsDrop off, AbsRecover a frame back
+    float absMargin = 0.9f, absDrop = 0.15f, absRecover = 0.05f, absCircle = 1.0f;
+    // TC: no gas past TcSlip rad of slip at the rear axle; in a curve at least TcMinGas, the friction circle's share by
+    // TcCircle; spinning wheels take TcDrop off, TcRecover a frame back
+    float tcSlip = 0.08f, tcMinGas = 0.15f, tcDrop = 0.1f, tcRecover = 0.03f, tcCircle = 1.0f;
     float abortOffset = 25.0f;
     float areaRadius = 1300.0f;                       // a run ends this far from the origin
     float carTraction = 0.0f;                         // > 0: CAutomobile::m_fCarTraction of the AI car (normally 1)
@@ -176,6 +182,15 @@ static void ReadSettings() {
     f(sp, "GripTight", s.gripTight);
     f(sp, "GripFast", s.gripFast);
     f(sp, "LearnRate", s.learnRate);
+    f(sp, "AbsMargin", s.absMargin);
+    f(sp, "AbsDrop", s.absDrop);
+    f(sp, "AbsRecover", s.absRecover);
+    f(sp, "AbsCircle", s.absCircle);
+    f(sp, "TcSlip", s.tcSlip);
+    f(sp, "TcMinGas", s.tcMinGas);
+    f(sp, "TcDrop", s.tcDrop);
+    f(sp, "TcRecover", s.tcRecover);
+    f(sp, "TcCircle", s.tcCircle);
     b(sp, "TractionControl", s.tractionControl);
     b(sp, "ABS", s.abs);
     f(sp, "AbortOffset", s.abortOffset);
@@ -309,6 +324,7 @@ struct Runner {
     bool skidFNow = false, skidRNow = false, absOn = false, tcOn = false;
     float windNow = 0.0f;
     float learned[5] = { 1, 1, 1, 1, 1 }; // its own grip multiplier for each kind of curve (CurveBand), learned on the way
+    float absLearn = 1.0f, tcLearn = 1.0f; // ... and of the brake pedal its ABS allows and the gas its TC allows
 };
 static Runner runners[kMaxRunners];
 static Runner* R = &runners[0];
@@ -906,38 +922,55 @@ static void Control(CVehicle* v) {
         const float tf = 2.0f * h->m_fTractionBias, tr = 2.0f - tf;
         const float lockF = bf > 0.01f ? adh * tf / (h->m_fBrakeDeceleration * bf) : 1.0f;
         const float lockR = br > 0.01f ? adh * tr / (h->m_fBrakeDeceleration * br) : 1.0f;
-        float pedalMax = 0.9f * std::min(lockF, lockR);
+        // (the numbers are the car's genes: AbsMargin, AbsCircle, AbsDrop, AbsRecover)
+        float pedalMax = cfg.absMargin * std::min(lockF, lockR);
         const float G = aiGripG * 9.81f;
         const float aLat = std::abs(speed * v->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS);
-        pedalMax *= std::sqrt(std::max(1.0f - (aLat / G) * (aLat / G), 0.04f));
+        const float circle = std::sqrt(std::max(1.0f - (aLat / G) * (aLat / G), 0.04f));
+        pedalMax *= 1.0f - cfg.absCircle * (1.0f - circle);
         // a wheel locked anyway: off a little more until it turns again
         CAutomobile* a = static_cast<CAutomobile*>(v);
         bool locked = false;
         for (int w = 0; w < 4; w++) if (a->m_wheelState[w] == 3) locked = true;
-        absScale = locked ? std::max(absScale - 0.15f, 0.3f) : std::min(absScale + 0.05f, 1.0f);
-        R->absOn = brake > pedalMax * absScale;
-        brake = std::min(brake, pedalMax * absScale);
+        absScale = locked ? std::max(absScale - cfg.absDrop, 0.3f) : std::min(absScale + cfg.absRecover, 1.0f);
+        const float allowed = pedalMax * absScale * R->absLearn;
+        // and the car learns its own limit: a wheel locked -> less pedal from now on; the ABS held the pedal back and
+        // nothing locked -> it could have braked harder
+        if (cfg.learnRate > 0.0f) {
+            if (locked) R->absLearn = std::max(R->absLearn - 3.0f * cfg.learnRate * dt, 0.5f);
+            else if (brake > allowed) R->absLearn = std::min(R->absLearn + cfg.learnRate * dt, 1.5f);
+        }
+        R->absOn = brake > allowed;
+        brake = std::min(brake, allowed);
     }
     if (!openLoop && cfg.tractionControl) {
         // The tyres share one grip between turning and driving (ProcessWheel: the thrust and the sideways pull are scaled
         // down together past the adhesion): gas only with the grip the curve leaves, none while sliding
         const float G = (gripG > 0.0f ? gripG : cfg.gripFactor * aiGripG) * 9.81f;
         const float aLat = std::abs(speed * v->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS);
-        const float room = std::sqrt(std::max(G * G - aLat * aLat, 0.0f)) / G;
+        // (the numbers are the car's genes: TcCircle, TcMinGas, TcSlip, TcDrop, TcRecover)
+        const float room = 1.0f - cfg.tcCircle * (1.0f - std::sqrt(std::max(G * G - aLat * aLat, 0.0f)) / G);
         const float gasAsked = gas;
-        gas = std::min(gas, std::max(room, 0.15f));
+        gas = std::min(gas, std::clamp(room * R->tcLearn, cfg.tcMinGas, 1.0f));
         // sliding: at the rear axle (at the car's centre a tight turn at full lock reads ~0.25 rad with the tyres holding:
         // the gas went off and the car stopped in the 7 m U-turn), and not at walking pace
         const float vRightRear = CVector::Dot(v->m_vecMoveSpeed, v->GetRight()) - v->m_vecTurnSpeed.z * rearAxleY;
         const float slip = std::abs(std::atan2(vRightRear, std::max(std::abs(CVector::Dot(v->m_vecMoveSpeed, v->GetForward())), 0.02f)));
-        if (slip > 0.08f && speed > 3.0f) gas = 0.0f;
+        const bool sliding = slip > cfg.tcSlip && speed > 3.0f;
+        if (sliding) gas = 0.0f;
         // wheels spinning (4WD out of a tight turn: all four at full gas): the gas comes off until they grip again
         CAutomobile* a = static_cast<CAutomobile*>(v);
         bool spinning = false;
         for (int w = 0; w < 4; w++) if (a->m_wheelState[w] == 1) spinning = true;
-        tcScale = spinning ? std::max(tcScale - 0.1f, 0.2f) : std::min(tcScale + 0.03f, 1.0f);
+        tcScale = spinning ? std::max(tcScale - cfg.tcDrop, 0.2f) : std::min(tcScale + cfg.tcRecover, 1.0f);
         gas *= tcScale;
         R->tcOn = gas < gasAsked - 0.05f;
+        // the car learns how much gas its tyres take in a curve: spinning or sliding -> less; the TC cut the gas and
+        // the tyres held -> more
+        if (cfg.learnRate > 0.0f) {
+            if (spinning || sliding) R->tcLearn = std::max(R->tcLearn - 3.0f * cfg.learnRate * dt, 0.5f);
+            else if (R->tcOn) R->tcLearn = std::min(R->tcLearn + cfg.learnRate * dt, 1.5f);
+        }
     }
     if (d.handbrakeAt && tp >= 0.0f) hb = true;
     gasOut = gas;
@@ -1121,7 +1154,17 @@ static const GeneDef kGenes[] = {
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 1.5f, "" },
     { "Speed", "GripTight", &Settings::gripTight, 0.6f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this
     { "Speed", "GripFast", &Settings::gripFast, 0.6f, 1.6f, "" },   // ... in fast ones (>= 150 m)
-    { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns each kind of curve itself
+    { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns curves, ABS and TC itself
+    { "Speed", "CruiseGas", &Settings::cruiseGas, 0.0f, 0.4f, "" },  // the speed controller's base gas
+    { "Speed", "AbsMargin", &Settings::absMargin, 0.5f, 1.2f, "" },  // ABS: share of the lock point
+    { "Speed", "AbsDrop", &Settings::absDrop, 0.02f, 0.4f, "" },
+    { "Speed", "AbsRecover", &Settings::absRecover, 0.01f, 0.2f, "" },
+    { "Speed", "AbsCircle", &Settings::absCircle, 0.0f, 1.0f, "" },
+    { "Speed", "TcSlip", &Settings::tcSlip, 0.03f, 0.3f, "" },       // TC: slip (rad) before the gas goes
+    { "Speed", "TcMinGas", &Settings::tcMinGas, 0.0f, 0.5f, "" },
+    { "Speed", "TcDrop", &Settings::tcDrop, 0.02f, 0.3f, "" },
+    { "Speed", "TcRecover", &Settings::tcRecover, 0.01f, 0.1f, "" },
+    { "Speed", "TcCircle", &Settings::tcCircle, 0.0f, 1.0f, "" },
 };
 constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
 struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; }; // label: its pilot profile (elites keep it)
@@ -1367,16 +1410,24 @@ static void NextGeneration() {
     Log(Format("\n=== Generation %d (sigma %.3f): best %s %.2f, best ever %.2f (gen %d)", generation, sigma,
         kTags[order[0]], top.score, bestScore, bestGen));
     const std::string histPath = baseDir + "proving\\ga_history.csv";
-    const bool fresh = GetFileAttributesA(histPath.c_str()) == INVALID_FILE_ATTRIBUTES;
-    std::ofstream h(histPath, std::ios::app);
-    if (fresh) {
-        h << "stamp,generation,rank,car,mode,score,result,time_s,mean_m,rms_m,max_m,out_s,reached_m,sigma";
-        for (const auto& gd : kGenes) h << "," << gd.key;
-        h << ",label\n";
-    }
+    std::string header = "stamp,generation,rank,car,mode,score,result,time_s,mean_m,rms_m,max_m,out_s,reached_m,sigma";
+    for (const auto& gd : kGenes) header += std::string(",") + gd.key;
+    header += ",label";
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+    {
+        // other genes than the file's columns: that file kept as ga_history_<stamp>.csv (tools/ga_review.py reads all)
+        std::ifstream old(histPath);
+        std::string first;
+        if (old && std::getline(old, first) && first != header) {
+            old.close();
+            MoveFileA(histPath.c_str(), (baseDir + "proving\\ga_history_" + stamp + ".csv").c_str());
+        }
+    }
+    const bool fresh = GetFileAttributesA(histPath.c_str()) == INVALID_FILE_ATTRIBUTES;
+    std::ofstream h(histPath, std::ios::app);
+    if (fresh) h << header << "\n";
     for (int r = 0; r < n; r++) {
         const int k = order[r];
         const Result& x = res[k];
@@ -1745,6 +1796,7 @@ void Update() {
             R->result.clear();
             R->endTime = R->sMax = R->slowTime = R->progressS = R->progressT = 0.0f;
             for (float& m : R->learned) m = 1.0f;
+            R->absLearn = R->tcLearn = 1.0f;
             PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
             brakeDone = false;
             StartCsv();
@@ -2049,10 +2101,10 @@ static void DrawHud() {
         Text(x + 16.0f, y + 42.0f, genes, 0.72f, kDim);
         // the grip it learned for each kind of curve (radius, m): green above 1 (faster than planned), red below
         if (cfg.learnRate > 0.0f) {
-            Text(x + 16.0f, y + 166.0f, Format("curvas aprendidas (raio, x%.2f/s):", cfg.learnRate), 0.68f, kDim);
-            for (int b = 0; b < 5; b++) {
-                const float m = R->learned[b];
-                Text(x + 330.0f + 96.0f * b, y + 166.0f, Format("%s x%.2f", kBandNames[b], m), 0.68f,
+            Text(x + 16.0f, y + 166.0f, Format("aprendido (x%.2f/s): curvas", cfg.learnRate), 0.64f, kDim);
+            for (int b = 0; b < 7; b++) {
+                const float m = b < 5 ? R->learned[b] : b == 5 ? R->absLearn : R->tcLearn;
+                Text(x + 290.0f + 76.0f * b, y + 166.0f, Format("%s x%.2f", b < 5 ? kBandNames[b] : b == 5 ? "ABS" : "TC", m), 0.64f,
                     m > 1.02f ? CRGBA(120, 230, 120, 255) : m < 0.98f ? CRGBA(255, 120, 120, 255) : kWhite);
             }
         }
