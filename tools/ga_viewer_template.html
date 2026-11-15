@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GA Proving Ground</title>
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --ink: #1b1f27; --dim: #5d6573; --line: #dfe3ea; --accent: #6d4aff;
+  --good: #1f9d55; --bad: #d64545; --warn: #c98a00; --track: #9aa3b2; --canvas: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --panel: #171b23; --ink: #e8ebf1; --dim: #97a0b0; --line: #2a303c; --accent: #a58bff;
+    --good: #4cd964; --bad: #ff5a5f; --warn: #ffc83c; --track: #59627a; --canvas: #11151c;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --panel: #171b23; --ink: #e8ebf1; --dim: #97a0b0; --line: #2a303c; --accent: #a58bff;
+  --good: #4cd964; --bad: #ff5a5f; --warn: #ffc83c; --track: #59627a; --canvas: #11151c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 18px 24px 10px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: baseline; }
+h1 { margin: 0; font-size: 20px; letter-spacing: .02em; }
+h2 { margin: 0 0 10px; font-size: 15px; }
+.dim { color: var(--dim); }
+main { padding: 0 24px 40px; display: grid; gap: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.controls label { display: flex; gap: 8px; align-items: center; }
+input[type=range] { accent-color: var(--accent); }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+#map { width: 100%; height: 440px; display: block; background: var(--canvas); border-radius: 8px; cursor: grab; touch-action: none; }
+#map:active { cursor: grabbing; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 99px; cursor: pointer; user-select: none; }
+.chip.off { opacity: .35; }
+.dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.sections { display: flex; flex-wrap: wrap; gap: 6px; }
+.sections button { padding: 3px 9px; font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } header, main { padding-left: 16px; padding-right: 16px; } }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 7px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+td.l, th.l { text-align: left; }
+tr.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ok { color: var(--good); } .ko { color: var(--bad); }
+#chart { width: 100%; height: 220px; display: block; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; }
+.b-valid { background: color-mix(in srgb, var(--good) 22%, transparent); color: var(--good); }
+.b-partial { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+.b-rejected { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad); }
+.b-pending { background: color-mix(in srgb, var(--dim) 22%, transparent); color: var(--dim); }
+details { border-top: 1px solid var(--line); padding: 10px 0; }
+summary { cursor: pointer; }
+pre { white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospace, Consolas, monospace; background: var(--canvas); padding: 10px; border-radius: 6px; }
+.heat td { min-width: 54px; }
+.empty { padding: 30px; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>GA Proving Ground</h1>
+  <span class="dim" id="meta"></span>
+  <span style="flex:1"></span>
+  <button class="ghost" id="theme">tema</button>
+</header>
+<main>
+  <section class="panel">
+    <div class="controls">
+      <label>Geração <input type="range" id="gen" min="0" max="0" value="0"> <b id="genLabel">0</b></label>
+      <label><button id="play">▶</button> t <input type="range" id="time" min="0" max="100" step="0.25" value="100" style="width:220px"> <b id="timeLabel"></b></label>
+      <label>velocidade <select id="rate"><option>1</option><option selected>4</option><option>10</option><option>25</option></select>x</label>
+      <label><input type="checkbox" id="bySpeed"> cor por velocidade</label>
+      <button class="ghost" id="fit">ver tudo</button>
+    </div>
+    <div class="chips" id="cars" style="margin:10px 0"></div>
+    <canvas id="map"></canvas>
+    <div class="sections" id="secButtons" style="margin-top:10px"></div>
+  </section>
+  <div class="grid2">
+    <section class="panel"><h2>Ranking da geração</h2><div class="scroll" id="ranking"></div></section>
+    <section class="panel"><h2>Pontuação por geração <span class="dim">(menor é melhor)</span></h2><canvas id="chart"></canvas>
+      <div class="dim" style="font-size:12px">pontos = tempo + 100 × desvio médio (m) + 5 × s a mais de 2 m · linha cheia: melhor · tracejada: média dos que chegaram · x vermelho: geração sem chegada</div></section>
+  </div>
+  <section class="panel"><h2>Tempo por trecho <span class="dim">(s; verde = mais rápido da geração; passe o mouse para ver o desvio)</span></h2><div class="scroll" id="heat"></div></section>
+  <section class="panel"><h2>Revisões do Gemini e validação</h2><div id="reviews"></div></section>
+</main>
+<script>
+const DATA = /*DATA*/null;
+const COLORS = { A: '#ffd60a', B: '#ff595e', C: '#36a2eb', D: '#4cd964', E: '#ff922b', F: '#af6eff', G: '#00dcdc', H: '#ff69c8', I: '#bee63c', J: '#9aa3b2' };
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmt = (v, d = 1) => v == null || isNaN(v) ? '–' : Number(v).toFixed(d);
+
+try { const t = localStorage.getItem('ga-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+$('theme').onclick = () => {
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const cur = document.documentElement.dataset.theme || (dark ? 'dark' : 'light');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem('ga-theme', next); } catch (e) {}
+  drawMap(); drawChart();
+};
+
+if (!DATA || !DATA.course.length) {
+  document.querySelector('main').innerHTML = '<div class="panel empty">Sem dados ainda: rode <code>python tools/ga_review.py html</code> depois da primeira geração.</div>';
+  throw new Error('no data');
+}
+const gens = DATA.generations.map(g => g.gen);
+let gen = gens.length ? gens[gens.length - 1] : 0, t = 1e9, playing = false;
+const hidden = new Set();
+$('meta').textContent = `${gens.length} gerações · circuito ${(DATA.course.at(-1)[2] / 1000).toFixed(2)} km · gerado ${DATA.written}`;
+$('gen').min = gens[0] ?? 0; $('gen').max = gens.at(-1) ?? 0; $('gen').value = gen;
+
+// --- map: pan and zoom over the course frame (x along the course, y to its left) ---
+const cv = $('map'), ctx = cv.getContext('2d');
+let view = { cx: 0, cy: 0, scale: 1 };
+function resize() {
+  const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1;
+  cv.width = r.width * d; cv.height = r.height * d; ctx.setTransform(d, 0, 0, d, 0, 0);
+  const c2 = $('chart'); const r2 = c2.getBoundingClientRect(); c2.width = r2.width * d; c2.height = r2.height * d; c2.getContext('2d').setTransform(d, 0, 0, d, 0, 0);
+}
+function fit(x0, x1, y0, y1) {
+  const r = cv.getBoundingClientRect();
+  view.cx = (x0 + x1) / 2; view.cy = (y0 + y1) / 2;
+  view.scale = Math.min(r.width / Math.max(x1 - x0, 1), r.height / Math.max(y1 - y0, 1)) * 0.92;
+}
+function fitAll() {
+  const xs = DATA.course.map(p => p[0]), ys = DATA.course.map(p => p[1]);
+  fit(Math.min(...xs) - 20, Math.max(...xs) + 20, Math.min(...ys) - 20, Math.max(...ys) + 20);
+}
+const W2S = (x, y) => { const r = cv.getBoundingClientRect(); return [r.width / 2 + (x - view.cx) * view.scale, r.height / 2 - (y - view.cy) * view.scale]; };
+let drag = null;
+cv.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY, view.cx, view.cy]; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => { if (!drag) return; view.cx = drag[2] - (e.clientX - drag[0]) / view.scale; view.cy = drag[3] + (e.clientY - drag[1]) / view.scale; drawMap(); });
+cv.addEventListener('pointerup', () => drag = null);
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const wx = view.cx + (mx - r.width / 2) / view.scale, wy = view.cy - (my - r.height / 2) / view.scale;
+  view.scale *= Math.exp(-e.deltaY * 0.0015);
+  view.cx = wx - (mx - r.width / 2) / view.scale; view.cy = wy + (my - r.height / 2) / view.scale;
+  drawMap();
+}, { passive: false });
+
+function speedColor(v) { const f = Math.max(0, Math.min(1, v / 300)); return `hsl(${(1 - f) * 220}, 85%, 55%)`; }
+function traces() { return (DATA.traces[gen] || {}); }
+function maxT() { let m = 0; for (const pts of Object.values(traces())) if (pts.length) m = Math.max(m, pts.at(-1)[0]); return m; }
+
+function drawMap() {
+  const r = cv.getBoundingClientRect();
+  ctx.clearRect(0, 0, r.width, r.height);
+  // grid every 50 m when close
+  if (view.scale > 1.2) {
+    ctx.strokeStyle = css('--line'); ctx.lineWidth = 1; ctx.beginPath();
+    const x0 = view.cx - r.width / 2 / view.scale, x1 = view.cx + r.width / 2 / view.scale;
+    const y0 = view.cy - r.height / 2 / view.scale, y1 = view.cy + r.height / 2 / view.scale;
+    for (let x = Math.floor(x0 / 50) * 50; x < x1; x += 50) { const a = W2S(x, y0), b = W2S(x, y1); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+    for (let y = Math.floor(y0 / 50) * 50; y < y1; y += 50) { const a = W2S(x0, y), b = W2S(x1, y); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+    ctx.stroke();
+  }
+  // course: limits white-ish, sudden brakes red
+  const C = DATA.course;
+  ctx.lineWidth = Math.max(2, Math.min(view.scale * 2.5, 10)); ctx.lineCap = 'round';
+  for (let i = 1; i < C.length; i++) {
+    const a = W2S(C[i - 1][0], C[i - 1][1]), b = W2S(C[i][0], C[i][1]);
+    ctx.strokeStyle = C[i][4] > 0 ? css('--bad') : C[i][3] > 0 ? css('--warn') : C[i][5] ? '#4aa8ff' : css('--track');
+    ctx.globalAlpha = 0.55; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ff7a00';
+  for (const [x, y] of DATA.cones) { const p = W2S(x, y); ctx.fillRect(p[0] - 2, p[1] - 2, 4, 4); }
+  // section names
+  ctx.font = '12px system-ui'; ctx.fillStyle = css('--dim');
+  for (const [s, name] of DATA.sections) {
+    const p = C.find(q => q[2] >= s) || C[0]; const q = W2S(p[0], p[1]);
+    ctx.fillText(name, q[0] + 4, q[1] - 8);
+  }
+  // cars: line up to t, dot at t
+  const bySpeed = $('bySpeed').checked;
+  for (const [car, pts] of Object.entries(traces())) {
+    if (hidden.has(car) || !pts.length) continue;
+    ctx.lineWidth = 2;
+    let last = null;
+    for (let i = 1; i < pts.length && pts[i][0] <= t; i++) {
+      const a = W2S(pts[i - 1][1], pts[i - 1][2]), b = W2S(pts[i][1], pts[i][2]);
+      ctx.strokeStyle = bySpeed ? speedColor(pts[i][3]) : COLORS[car];
+      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+      last = pts[i];
+    }
+    if (!last) last = pts[0];
+    const p = W2S(last[1], last[2]);
+    ctx.fillStyle = COLORS[car]; ctx.strokeStyle = css('--canvas'); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = css('--ink'); ctx.font = 'bold 12px system-ui';
+    ctx.fillText(`${car} ${last[3]} km/h`, p[0] + 9, p[1] + 4);
+  }
+}
+
+// --- controls ---
+function setGen(g) {
+  gen = g; $('gen').value = g; $('genLabel').textContent = g;
+  const m = maxT(); $('time').max = m; t = Math.min(t, m); if (!playing) t = m; $('time').value = t;
+  renderCars(); renderRanking(); renderHeat(); drawMap(); drawChart(); updTime();
+}
+function updTime() { $('timeLabel').textContent = `${fmt(Math.min(t, maxT()), 1)} s`; }
+$('gen').oninput = e => setGen(+e.target.value);
+$('time').oninput = e => { t = +e.target.value; updTime(); drawMap(); };
+$('bySpeed').onchange = drawMap;
+$('fit').onclick = () => { fitAll(); drawMap(); };
+$('play').onclick = () => {
+  playing = !playing; $('play').textContent = playing ? '❚❚' : '▶';
+  if (playing && t >= maxT()) t = 0;
+  let prev = performance.now();
+  const step = now => {
+    if (!playing) return;
+    t += (now - prev) / 1000 * +$('rate').value; prev = now;
+    if (t >= maxT()) { t = maxT(); playing = false; $('play').textContent = '▶'; }
+    $('time').value = t; updTime(); drawMap();
+    if (playing) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+};
+function renderCars() {
+  const ind = DATA.individuals[gen] || [];
+  $('cars').innerHTML = ind.slice().sort((a, b) => a.car.localeCompare(b.car)).map(i =>
+    `<span class="chip ${hidden.has(i.car) ? 'off' : ''}" data-car="${i.car}"><span class="dot" style="background:${COLORS[i.car]}"></span>${i.car} · ${esc(i.mode)}</span>`).join('');
+  for (const el of $('cars').children) el.onclick = () => { const c = el.dataset.car; hidden.has(c) ? hidden.delete(c) : hidden.add(c); renderCars(); drawMap(); };
+}
+$('secButtons').innerHTML = DATA.sections.map(([s, n], i) => `<button class="ghost" data-i="${i}">${esc(n)}</button>`).join('');
+for (const b of $('secButtons').children) b.onclick = () => {
+  const i = +b.dataset.i, s0 = DATA.sections[i][0], s1 = i + 1 < DATA.sections.length ? DATA.sections[i + 1][0] : 1e9;
+  const pts = DATA.course.filter(p => p[2] >= s0 && p[2] <= s1);
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  fit(Math.min(...xs) - 15, Math.max(...xs) + 15, Math.min(...ys) - 15, Math.max(...ys) + 15); drawMap();
+};
+
+function renderRanking() {
+  const ind = DATA.individuals[gen] || [];
+  if (!ind.length) { $('ranking').innerHTML = '<div class="empty">Sem dados desta geração.</div>'; return; }
+  const genes = Object.keys(ind[0].genes);
+  $('ranking').innerHTML = `<table><tr><th>#</th><th class="l">carro</th><th class="l">algoritmo</th><th>pontos</th><th class="l">fim</th><th>tempo</th><th>desvio médio</th><th>máx</th><th>fora</th>${genes.map(g => `<th>${g}</th>`).join('')}</tr>` +
+    ind.map(i => `<tr><td>${i.rank}</td><td class="l"><span class="dot" style="background:${COLORS[i.car]}"></span> ${i.car}</td><td class="l">${esc(i.mode)}</td><td><b>${fmt(i.score, 1)}</b></td>
+      <td class="l ${i.result === 'end' ? 'ok' : 'ko'}">${i.result === 'end' ? 'chegou' : esc(i.result)}</td><td>${fmt(i.time, 1)}</td><td><b>${fmt(i.mean, 2)}</b></td><td>${fmt(i.max, 2)}</td><td>${fmt(i.out, 1)}</td>
+      ${genes.map(g => `<td>${fmt(i.genes[g], 3)}</td>`).join('')}</tr>`).join('') + '</table>';
+}
+
+function renderHeat() {
+  const st = DATA.sectionStats[gen] || {};
+  const cars = Object.keys(st).sort();
+  if (!cars.length) { $('heat').innerHTML = '<div class="empty">Sem tempos por trecho desta geração.</div>'; return; }
+  const rows = DATA.sections.map(([s, n], i) => {
+    const vals = cars.map(c => st[c][i] ? st[c][i][0] : null);
+    const ok = vals.filter(v => v != null); const lo = Math.min(...ok), hi = Math.max(...ok);
+    return `<tr><td class="l">${esc(n)}</td>` + vals.map((v, k) => {
+      if (v == null) return '<td class="dim">–</td>';
+      const f = hi > lo ? (v - lo) / (hi - lo) : 0;
+      const off = st[cars[k]][i][2];
+      return `<td title="média ${fmt(st[cars[k]][i][1], 0)} km/h, desvio médio ${fmt(st[cars[k]][i][3], 2)} m, máx ${fmt(off, 2)} m" style="background:hsla(${(1 - f) * 120},70%,45%,.28)">${fmt(v, 1)}${off > 2 ? ' ⚠' : ''}</td>`;
+    }).join('') + '</tr>';
+  }).join('');
+  $('heat').innerHTML = `<table class="heat"><tr><th class="l">trecho</th>${cars.map(c => `<th><span class="dot" style="background:${COLORS[c]}"></span> ${c}</th>`).join('')}</tr>${rows}</table>`;
+}
+
+function drawChart() {
+  const c = $('chart'), g = c.getContext('2d'), r = c.getBoundingClientRect();
+  g.clearRect(0, 0, r.width, r.height);
+  const G = DATA.generations; if (!G.length) return;
+  const mean = G.map(x => { const f = (DATA.individuals[x.gen] || []).filter(i => i.result === 'end'); return f.length ? f.reduce((a, i) => a + i.score, 0) / f.length : null; });
+  const vals = G.map(x => x.best).filter(v => v < 1000).concat(mean.filter(v => v != null));
+  if (!vals.length) return;
+  const lo = Math.min(...vals) * 0.98, hi = Math.max(...vals) * 1.02, L = 44, B = 22, Wd = r.width - L - 10, Ht = r.height - B - 10;
+  const X = i => L + (G.length > 1 ? i / (G.length - 1) : 0.5) * Wd, Y = v => 10 + (1 - (v - lo) / (hi - lo || 1)) * Ht;
+  g.strokeStyle = css('--line'); g.fillStyle = css('--dim'); g.font = '11px system-ui'; g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4, y = Y(v); g.beginPath(); g.moveTo(L, y); g.lineTo(L + Wd, y); g.stroke(); g.fillText(v.toFixed(0), 4, y + 4); }
+  G.forEach((x, i) => { if (i % Math.ceil(G.length / 10) === 0) g.fillText(x.gen, X(i) - 4, r.height - 6); });
+  const line = (arr, dash, color) => { g.setLineDash(dash); g.strokeStyle = color; g.lineWidth = 2; g.beginPath(); let on = false;
+    arr.forEach((v, i) => { if (v == null || v >= 1000) { on = false; return; } on ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); on = true; }); g.stroke(); g.setLineDash([]); };
+  line(mean, [5, 4], css('--dim'));
+  line(G.map(x => x.best), [], css('--accent'));
+  G.forEach((x, i) => {
+    if (x.best >= 1000) { g.strokeStyle = css('--bad'); g.beginPath(); g.moveTo(X(i) - 4, 14); g.lineTo(X(i) + 4, 22); g.moveTo(X(i) + 4, 14); g.lineTo(X(i) - 4, 22); g.stroke(); }
+    else { g.fillStyle = x.gen === gen ? css('--ink') : css('--accent'); g.beginPath(); g.arc(X(i), Y(x.best), x.gen === gen ? 5 : 3, 0, 7); g.fill(); }
+  });
+}
+
+function renderReviews() {
+  const R = DATA.reviews.slice().reverse();
+  if (!R.length) { $('reviews').innerHTML = '<div class="empty">Nenhuma revisão ainda: a primeira sai depois da geração 0.</div>'; return; }
+  const label = { valid: 'validada', partial: 'parcial', rejected: 'rejeitada', pending: 'aguardando validação' };
+  $('reviews').innerHTML = R.map(r => `<details ${r === R[0] ? 'open' : ''}><summary><b>Revisão ${r.id}</b> · gerações ${r.from}–${r.to} · ${esc(r.created)}
+      <span class="badge b-${esc(r.verdict)}">${label[r.verdict] || esc(r.verdict)}</span></summary>
+      ${r.notes ? `<p><b>Validação:</b> ${esc(r.notes)}</p>` : ''}
+      ${r.claims.length ? `<div class="scroll"><table><tr><th class="l">#</th><th class="l">afirmação do Gemini</th><th class="l">veredito</th><th class="l">evidência</th></tr>${r.claims.map(c =>
+        `<tr><td class="l">${c.n}</td><td class="l" style="white-space:normal">${esc(c.claim)}</td><td class="l ${c.verdict === 'ok' ? 'ok' : c.verdict === 'errado' ? 'ko' : ''}">${esc(c.verdict)}</td><td class="l" style="white-space:normal">${esc(c.evidence)}</td></tr>`).join('')}</table></div>` : ''}
+      <details><summary class="dim">texto do Gemini</summary><pre>${esc(r.gemini)}</pre></details></details>`).join('');
+}
+
+addEventListener('resize', () => { resize(); drawMap(); drawChart(); });
+resize(); fitAll(); renderReviews(); setGen(gen);
+</script>
+</body>
+</html>

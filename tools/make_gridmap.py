@@ -16,8 +16,8 @@ import numpy as np
 MODEL_ID = 19400                 # free in the game's and the installed mods' .ide files (18631-19999 unused)
 NAME = 'pg_grid'
 TILE = 100.0                     # m
-X0, X1 = 500.0, 2900.0           # the platform (world): 2.4 km east-west
-Y0, Y1 = -2950.0, -2150.0        # 0.8 km north-south
+X0, X1 = -100.0, 2900.0          # the platform (world): 3 km east-west
+Y0, Y1 = -2950.0, -1750.0        # 1.2 km north-south (10 lanes of the GA circuit)
 Z = 300.0                        # its surface
 RW = 0x1803FFFF                  # RenderWare 3.6.0.3 (San Andreas)
 TEX = 512                        # texture size: 50 m of ground (5 cells of 10 m)
