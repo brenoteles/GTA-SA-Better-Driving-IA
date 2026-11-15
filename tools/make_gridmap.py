@@ -27,7 +27,9 @@ SURFACE_TARMAC = 1
 # Obstacles the proving ground puts on its road (ProvingGround.h, track piece O): a bump for one side of the car (1 m
 # wide, 3 m long, 0.18 m high, a sine) and a kicker across the lane (4 m wide, a 7 m ramp up to 0.45 m and a drop:
 # the car hops). Origin: the middle of their base; length along y (the car's forward)
-OBSTACLES = ((19401, 'pg_bump'), (19402, 'pg_kicker'))
+# ... and two more like a real road: a ripple field (asphalt pushed into waves by braking trucks: 4 m wide, 8 waves of
+# 6 cm every 3 m, 24 m long, one object: a wave each was 23,000 objects for 500 lanes and the object pool ran out) and a hump (a speed hump across the lane: 4 m wide, 3.5 m long, 12 cm)
+OBSTACLES = ((19401, 'pg_bump'), (19402, 'pg_kicker'), (19403, 'pg_ripple'), (19404, 'pg_hump'))
 OBST_TXD = 'pg_obst'
 
 
@@ -128,7 +130,7 @@ def bump_mesh():
     w, length, h, n = 1.0, 3.0, 0.18, 12
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
     zs = [h * math.sin(math.pi * i / n) for i in range(n + 1)]
-    return box_profile(w, ys, zs)
+    return tapered_profile(w, ys, zs, 0.3)
 
 
 def kicker_mesh():
@@ -136,6 +138,38 @@ def kicker_mesh():
     ys = [-length / 2 + length * i / 8 for i in range(9)]
     zs = [h * i / 8 for i in range(9)]                            # up all the way, then the drop at the back
     return box_profile(w, ys, zs)
+
+
+def ripple_mesh():
+    w, waves, every, h, per = 5.0, 8, 3.0, 0.06, 8
+    length = waves * every
+    n = waves * per
+    ys = [-length / 2 + length * i / n for i in range(n + 1)]
+    zs = [h * max(math.sin(math.pi * (i % per) / (per * 0.5)), 0.0) for i in range(n + 1)]  # a 1.5 m wave, 1.5 m flat
+    return tapered_profile(w, ys, zs, 0.5)
+
+
+def hump_mesh():
+    w, length, h, n = 5.0, 3.5, 0.12, 14
+    ys = [-length / 2 + length * i / n for i in range(n + 1)]
+    zs = [h * math.sin(math.pi * i / n) for i in range(n + 1)]
+    return tapered_profile(w, ys, zs, 0.5)
+
+
+def tapered_profile(w, ys, zs, taper):
+    """Only a top: the profile zs along ys, going down to the ground over 'taper' m at both sides (no wall a wheel
+    can trip on: the bumps' 18 cm sides rolled ~150 cars in 5 generations at the Duplo 90, where the racing line put a
+    wheel on their edge). Ripples and humps 5 m wide: the taper is outside the 4 m lane."""
+    verts, tris = [], []
+    xs = (-w / 2, -w / 2 + taper, w / 2 - taper, w / 2)
+    fs = (0.0, 1.0, 1.0, 0.0)
+    for k in range(len(ys) - 1):
+        for j in range(3):
+            i = len(verts)
+            verts.extend([(xs[j], ys[k], zs[k] * fs[j]), (xs[j + 1], ys[k], zs[k] * fs[j + 1]),
+                          (xs[j + 1], ys[k + 1], zs[k + 1] * fs[j + 1]), (xs[j], ys[k + 1], zs[k + 1] * fs[j])])
+            tris.extend([(i, i + 1, i + 2), (i, i + 2, i + 3)])
+    return verts, tris
 
 
 def box_profile(w, ys, zs):
@@ -234,7 +268,7 @@ def main(game_dir):
     open(os.path.join(stream, NAME + '.txd'), 'wb').write(txd(grid_texture()))
     # (the obstacles' collision in the platform's file: loaded wherever the platform is, as the obstacles need)
     cols = col()
-    for (mid, name), mesh in zip(OBSTACLES, (bump_mesh(), kicker_mesh())):
+    for (mid, name), mesh in zip(OBSTACLES, (bump_mesh(), kicker_mesh(), ripple_mesh(), hump_mesh())):
         verts, tris = mesh
         open(os.path.join(stream, name + '.dff'), 'wb').write(mesh_dff(name, OBST_TXD, verts, tris))
         cols += mesh_col(name, mid, verts, tris)

@@ -89,6 +89,7 @@ struct Settings {
     // its own line inside the road (a course with Width): LineBias -1..1 of the room to one side (right..left), LineCut
     // -0.5..1 towards the inside of the curves (< 0: the outside); the room = the half width - the car's - 0.1 m
     float lineBias = 0.0f, lineCut = 0.0f;
+    float lineRace = 1.0f; // its own line: how much of the racing line (RaceLine: wide in, the apex, wide out) it takes
     // mode gt4: how hard the speed profile accelerates (g); mode mpc: how far ahead it simulates (s), the weight of the
     // heading at the horizon
     float gtAccel = 0.6f, mpcHorizon = 0.8f, mpcWeight = 1.0f;
@@ -237,6 +238,7 @@ static void ReadSettings() {
     f(sp, "LearnRate", s.learnRate);
     f(st, "LineBias", s.lineBias);
     f(st, "LineCut", s.lineCut);
+    f(st, "LineRace", s.lineRace);
     f(st, "MpcHorizon", s.mpcHorizon);
     f(st, "MpcWeight", s.mpcWeight);
     f(sp, "GtAccel", s.gtAccel);
@@ -324,6 +326,7 @@ struct Course {
     std::vector<CVector2D> cones;  // world
     std::vector<float> vcap, vsud; // m/s at each point: a posted limit (planned for), a sudden one (seen only there)
     std::vector<float> wind;       // m/s2 of crosswind at each point (> 0: pushing to the course's left)
+    std::vector<char> centre;      // 1: the car's own line in the middle of the road here (the lane changes, the wind)
     std::vector<std::pair<float, std::string>> sections; // track: where each named part starts (m)
     struct Obstacle { int i, model; float lat; };
     std::vector<Obstacle> obst;    // track piece O: a bump or a kicker at point i, lat x the half width to the left
@@ -499,30 +502,91 @@ static void Geometry(Course& c) {
     }
 }
 
-// The car's own line inside the road (its genes LineBias, LineCut): every point moved across by the room x (bias + cut
-// x the curve's direction ahead and behind), smoothed over +-10 m (no step for the wheel), never past the room. The
-// car steers along it and plans its speed on it (a straighter line is a faster one); the road (R->road) stays what
-// its body is judged against
+// The racing line of a road: the offset across it (m, > 0 left) at each point, within +-room. An elastic band pulled
+// straight inside the road: each point moved toward the middle of its neighbours ahead and behind, from far apart
+// (64 points, 32 m) down to close (4 points), clamped to the room; what is left is the shortest, least curved line,
+// wide into a curve, on the inside at the apex, wide out of it (the user: "formato de corrida, fazendo curvas por
+// dentro"; the centre line was the car's own line before). The same for every lane (only moved over): worked out once
+// (pinned to 0 where the road says centre: the moose and the crosswind, the user: "o carro tem que realmente passar no
+// meio"; the band bends into and out of them by itself)
+static void Log(const std::string& s);
+static std::vector<float> raceOff;
+static std::map<std::string, std::vector<float>> raceCache; // (by the road and the room: worked out once each)
+static void RaceLine(const Course& rd, float room) {
+    const int n = static_cast<int>(rd.p.size());
+    const std::string key = Format("%d|%.2f|%.2f|%.2f|%.2f", n, room, rd.length, rd.head.empty() ? 0.0f : rd.head[n / 2], rd.curv.empty() ? 0.0f : rd.curv[n / 3]);
+    auto hit = raceCache.find(key);
+    if (hit != raceCache.end()) { raceOff = hit->second; return; }
+    raceOff.assign(n, 0.0f);
+    if (n < 50 || room <= 0.0f) { raceCache[key] = raceOff; return; }
+    const bool pins = static_cast<int>(rd.centre.size()) == n;
+    std::vector<CVector2D> nrm(n);
+    for (int i = 0; i < n; i++) nrm[i] = CVector2D(-std::sin(rd.head[i]), std::cos(rd.head[i]));
+    std::vector<float> next(n);
+    for (int span : { 64, 32, 16, 8, 4 })
+        for (int it = 0; it < 60; it++) {
+            next = raceOff;
+            for (int i = span; i < n - span; i++) {
+                const CVector2D a = rd.p[i - span] + nrm[i - span] * raceOff[i - span], b = rd.p[i + span] + nrm[i + span] * raceOff[i + span];
+                const CVector2D here = rd.p[i] + nrm[i] * raceOff[i];
+                const float want = raceOff[i] + CVector2D::Dot((a + b) * 0.5f - here, nrm[i]);
+                next[i] = pins && rd.centre[i] ? 0.0f : std::clamp(raceOff[i] + 0.6f * (want - raceOff[i]), -room, room);
+            }
+            raceOff.swap(next);
+        }
+    // (the ends where they are: the start box and the finish line in the middle)
+    for (int i = 0; i < n; i++) raceOff[i] *= std::clamp(std::min(i, n - 1 - i) / 64.0f, 0.0f, 1.0f);
+    raceCache[key] = raceOff;
+    // (the summary: how far off the middle it goes in each part, and how much of each part is kept in the middle)
+    for (size_t k = 0; k < rd.sections.size(); k++) {
+        const float s0 = rd.sections[k].first, s1 = k + 1 < rd.sections.size() ? rd.sections[k + 1].first : rd.length;
+        float most = 0.0f;
+        int in = 0, pinned = 0;
+        for (int i = 0; i < n; i++) if (rd.s[i] >= s0 && rd.s[i] < s1) { most = std::max(most, std::abs(raceOff[i])); in++; pinned += pins && rd.centre[i]; }
+        Log(Format("racing line (room %.2f m): %-16s up to %.2f m off the middle, %3.0f%% kept in it", room, rd.sections[k].second.c_str(), most,
+            in ? 100.0f * pinned / in : 0.0f));
+    }
+}
+
+// The car's own line inside the road (its genes LineRace, LineBias, LineCut): the racing line x LineRace, plus the
+// room x (bias + cut x the curve's direction ahead and behind), smoothed over +-10 m (no step for the wheel), never
+// past the room. The car steers along it and plans its speed on it (a straighter line is a faster one); the road
+// (R->road) stays what its body is judged against
 static void OwnLine() {
     const int n = static_cast<int>(course.p.size());
-    if (course.halfWidth <= 0.0f || n < 50 || (cfg.lineBias == 0.0f && cfg.lineCut == 0.0f) || (human && R == runners)) return;
-    const float room = std::max(course.halfWidth - R->bodyHalfW - 0.05f, 0.0f);
+    if (course.halfWidth <= 0.0f || n < 50 || (human && R == runners)) return;
+    if (cfg.lineBias == 0.0f && cfg.lineCut == 0.0f && cfg.lineRace == 0.0f) return;
+    const float body = R->bodyHalfW > 0.1f ? R->bodyHalfW : 1.0f; // (the first build, before the car is made)
+    const float room = std::max(course.halfWidth - body - 0.05f, 0.0f);
+    RaceLine(R->road, std::max(room - 0.1f, 0.0f)); // (a little inside the room: the smoothing and the wheel's error)
     std::vector<float> o(n), t(n);
     for (int i = 0; i < n; i++) {
         float k = 0.0f;
         int m = 0;
         for (int j = std::max(i - 24, 0); j <= std::min(i + 24, n - 1); j++, m++) k += course.curv[j];
         k /= std::max(m, 1);
-        o[i] = room * std::clamp(cfg.lineBias + cfg.lineCut * std::clamp(k * 25.0f, -1.0f, 1.0f), -1.0f, 1.0f);
+        const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * cfg.lineRace : 0.0f;
+        o[i] = std::clamp(race + room * (cfg.lineBias + cfg.lineCut * std::clamp(k * 25.0f, -1.0f, 1.0f)), -room, room);
     }
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 1; pass++) {
         for (int i = 0; i < n; i++) {
             float sum = 0.0f;
             int m = 0;
-            for (int j = std::max(i - 20, 0); j <= std::min(i + 20, n - 1); j++, m++) sum += o[j];
+            for (int j = std::max(i - 10, 0); j <= std::min(i + 10, n - 1); j++, m++) sum += o[j];
             t[i] = sum / std::max(m, 1);
         }
         o.swap(t);
+    }
+    // the centre stretches: nothing of the genes' own offsets there, faded over 40 m each side (80 points)
+    if (static_cast<int>(R->road.centre.size()) == n) {
+        std::vector<int> d(n, 1 << 20);
+        for (int i = 0, last = -(1 << 20); i < n; i++) { if (R->road.centre[i]) last = i; d[i] = i - last; }
+        for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (R->road.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
+        for (int i = 0; i < n; i++) {
+            const float w = std::clamp(1.0f - d[i] / 80.0f, 0.0f, 1.0f);
+            const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * cfg.lineRace : 0.0f;
+            o[i] = race + (o[i] - race) * (1.0f - w);
+        }
     }
     for (int i = 0; i < n; i++)
         course.p[i] += CVector2D(-std::sin(course.head[i]), std::cos(course.head[i])) * std::clamp(o[i], -room, room);
@@ -698,10 +762,19 @@ static void BuildCourse(const TestDef& d) {
             else if (kind == 'O') {
                 // O bump|kicker lateral: an obstacle here (tools/make_gridmap.py's models), across the road at lateral
                 // x the half width (> 0 left)
+                // O kind lateral [count spacing]: count of them every spacing m from here on (the points to come:
+                // the next pieces must be at least that long). Kinds: bump (one side, a wheel over it), kicker (a hop),
+                // ripple (a field of asphalt waves across the lane, 8 of 6 cm over 24 m: the braking zones, the ABS
+                // and the tyres lose the ground; one object, centred 12 m on), hump (a speed hump across the lane, 12 cm over 3.5 m: unsettles the car accelerating out)
                 const auto w = ParseWords(rest);
-                if (!w.empty())
-                    course.obst.push_back({ static_cast<int>(local.size()) - 1, w[0] == "kicker" ? 19402 : 19401,
-                        w.size() > 1 ? static_cast<float>(atof(w[1].c_str())) : 0.0f });
+                if (!w.empty()) {
+                    const int model = w[0] == "kicker" ? 19402 : w[0] == "ripple" ? 19403 : w[0] == "hump" ? 19404 : 19401;
+                    const float lat = w.size() > 1 ? static_cast<float>(atof(w[1].c_str())) : 0.0f;
+                    const int count = w.size() > 2 ? std::max(atoi(w[2].c_str()), 1) : 1;
+                    const float every = w.size() > 3 ? static_cast<float>(atof(w[3].c_str())) : 3.0f;
+                    for (int c = 0; c < count; c++)
+                        course.obst.push_back({ static_cast<int>(local.size()) - 1 + static_cast<int>(std::lround(c * every / 0.5f)), model, lat });
+                }
             }
             else if ((kind == 'V' || kind == 'B' || kind == 'X') && nums.size() >= 2)
                 zones.push_back({ static_cast<int>(local.size()) - 1, nums[1], nums[0], kind });
@@ -713,6 +786,8 @@ static void BuildCourse(const TestDef& d) {
             }
             else if (kind == 'J' && nums.size() >= 4) {
                 const float a = nums[0], o = std::max(nums[1], 1.0f), ho = nums[2], b = std::max(nums[3], 1.0f);
+                // (the moose: through the middle of the lane, the line its test is about; from 20 m before it)
+                zones.push_back({ std::max(static_cast<int>(local.size()) - 41, 0), o + ho + b + 20.0f, 0.0f, 'C' });
                 for (float x : { 0.0f, o, o + ho, o + ho + b })
                     for (float side : { -1.2f, 1.2f }) {
                         const float y = (x >= o - 0.1f && x <= o + ho + 0.1f) ? a : 0.0f;
@@ -751,13 +826,23 @@ static void BuildCourse(const TestDef& d) {
     course.vcap.assign(n, 1e9f);
     course.vsud.assign(n, 1e9f);
     course.wind.assign(n, 0.0f);
+    course.centre.assign(n, 0);
     for (const Zone& z : zones)
         for (int i = std::clamp(z.i, 0, n - 1); i < n && course.s[i] - course.s[z.i] <= z.len; i++) {
-            if (z.kind == 'X') { course.wind[i] = z.value; continue; }
+            if (z.kind == 'X') { course.wind[i] = z.value; course.centre[i] = 1; continue; }
+            if (z.kind == 'C') { course.centre[i] = 1; continue; }
             float& v = z.kind == 'B' ? course.vsud[i] : course.vcap[i];
             v = std::min(v, z.value / 3.6f);
         }
     for (const auto& nm : names) course.sections.emplace_back(course.s[std::clamp(nm.first, 0, n - 1)], nm.second);
+    // a part with a lane change or wind in it: all of it in the middle (the straights between the gusts too: the user
+    // wants the car through the middle of those tests, not cutting across them)
+    for (size_t k = 0; k < course.sections.size(); k++) {
+        const float s0 = course.sections[k].first, s1 = k + 1 < course.sections.size() ? course.sections[k + 1].first : course.length + 1.0f;
+        bool any = false;
+        for (int i = 0; i < n && !any; i++) any = course.s[i] >= s0 && course.s[i] < s1 && course.centre[i];
+        if (any) for (int i = 0; i < n; i++) if (course.s[i] >= s0 && course.s[i] < s1) course.centre[i] = 1;
+    }
     R->road = course;
     OwnLine();
     SpeedProfile(d);
@@ -971,13 +1056,16 @@ static void SpawnObstacles() {
     const Course& rd = R->road;
     const int n = static_cast<int>(rd.p.size());
     if (!R->obstacles.empty() || rd.obst.empty() || n < 2) return;
-    for (int m : { 19401, 19402 })
+    for (int m : { 19401, 19402, 19403, 19404 })
         if (!Command<COMMAND_HAS_MODEL_LOADED>(m)) { Command<COMMAND_REQUEST_MODEL>(m); Command<COMMAND_LOAD_ALL_MODELS_NOW>(); }
     for (const auto& o : rd.obst) {
         const int i = std::clamp(o.i, 0, n - 1);
         const float h = rd.head[i];
         const CVector2D q = rd.p[i] + CVector2D(-std::sin(h), std::cos(h)) * (o.lat * rd.halfWidth);
         int handle = -1;
+        // (a full object pool: the game's create command writes through a null object and crashes; 500 lanes of
+        // obstacles came to 23,000 objects: the crash at 20:17)
+        if (CPools::ms_pObjectPool->GetNoOfFreeSpaces() < 300) { Log("obstacles: the object pool is nearly full, the rest left out"); break; }
         Command<COMMAND_CREATE_OBJECT>(o.model, q.x, q.y, R->baseZ, &handle);
         if (handle < 0) continue;
         Command<COMMAND_SET_OBJECT_HEADING>(handle, h * 180.0f / 3.14159265f - 90.0f);
@@ -1867,6 +1955,7 @@ static const GeneDef kGenes[] = {
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
     { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "" },  // its own line: to one side of the road
     { "Steer", "LineCut", &Settings::lineCut, -1.0f, 1.0f, "" },    // ... into the inside of the curves (< 0: wide)
+    { "Steer", "LineRace", &Settings::lineRace, 0.0f, 1.0f, "" },   // ... the racing line's share (1: all of it)
     { "Steer", "MpcHorizon", &Settings::mpcHorizon, 0.3f, 2.0f, "mpc" }, // mpc: how far ahead it simulates (s)
     { "Steer", "MpcWeight", &Settings::mpcWeight, 0.0f, 5.0f, "mpc" },   // ... the weight of the heading there
     { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4" },      // gt4: its profile's acceleration (g)
@@ -1911,6 +2000,9 @@ static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePen
 // DevWeight: the time made longer by the mean deviation from the car's own line, in proportion (0.3: 0.1 m -> +3%): the
 // user, "o desvio deve ser levado em consideracao sempre, de maneira proporcional"; the line itself is free (any line in the lane)
 static float devWeight = 0.3f, loadedDev = -1.0f;
+// [GA] ScoreVersion: raised when the course changes (its times are not comparable): the record, history and report
+// start over (the brains are kept)
+static int scoreVersion = 1, loadedVer = 1;
 // steady state: parents from the best ParentTop of their algorithm's archive; sigma wider when stuck (SigmaMax)
 static float parentTop = 0.2f, sigmaMax = 0.15f;
 static int stall = 0;
@@ -1982,6 +2074,7 @@ static void Read(CIniReader& ini, const Settings& s) {
     offLimitGA = ini.ReadFloat("GA", "OffLimit", offLimitGA);
     meanPenalty = ini.ReadFloat("GA", "MeanPenalty", meanPenalty);
     devWeight = ini.ReadFloat("GA", "DevWeight", devWeight);
+    scoreVersion = ini.ReadInteger("GA", "ScoreVersion", 1);
     traceOn = ini.ReadInteger("GA", "Trace", 1) != 0;
     traceEvery = ini.ReadFloat("GA", "TraceEvery", 0.0f);
     parentTop = std::clamp(ini.ReadFloat("GA", "ParentTop", parentTop), 0.01f, 1.0f);
@@ -2131,7 +2224,7 @@ static void Save() {
     for (double h : history) f << " " << h;
     f << "\nhistory10";
     for (double h : history10) f << " " << h;
-    f << "\nscoring " << devWeight << "\n";
+    f << "\nscoring " << devWeight << " " << scoreVersion << "\n";
     // (steady state: the archive's brains, best first; they start the lanes on a resume)
     std::vector<const Genome*> out;
     if (steady && !archive.empty()) {
@@ -2175,7 +2268,7 @@ static bool Load() {
         else if (key == "sigma") is >> sigma;
         else if (key == "history") { double h; while (is >> h) history.push_back(h); }
         else if (key == "history10") { double h; while (is >> h) history10.push_back(h); }
-        else if (key == "scoring") is >> loadedDev;
+        else if (key == "scoring") { loadedVer = 1; is >> loadedDev; if (!(is >> loadedVer)) loadedVer = 1; }
         else if (key == "bestrun") is >> bestRes.time >> bestRes.mean >> bestRes.maxE >> bestRes.out;
         else if (key == "nn" && n > 0) for (int i = 0; i < kNN; i++) is >> pop[n - 1].nn[i];
         else if (key == "best" || key == "ind") {
@@ -2208,9 +2301,15 @@ static bool Load() {
             else if (n < numRunners) pop[n++] = g;
         }
     }
-    if (std::abs(loadedDev - devWeight) > 1e-4f) {
+    if (std::abs(loadedDev - devWeight) > 1e-4f || loadedVer != scoreVersion) {
         // scored another way: the old best and history are not comparable (the brains are kept)
-        Log(Format("GA: the score changed (DevWeight %.2f -> %.2f): best ever and history start over", loadedDev, devWeight));
+        Log(Format("GA: the score changed (DevWeight %.2f -> %.2f, version %d -> %d): best ever and history start over", loadedDev, devWeight,
+            loadedVer, scoreVersion));
+        if (loadedVer != scoreVersion) {
+            // (the report's rows too: kept aside under the old version's name)
+            const std::string rows = baseDir + "proving\\ga_generations.tsv";
+            MoveFileExA(rows.c_str(), (baseDir + Format("proving\\ga_generations_v%d.tsv", loadedVer)).c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
         bestScore = 1e18;
         bestGen = -1;
         bestRes = Result();
@@ -2254,6 +2353,7 @@ static void Start() {
     history.clear();
     history10.clear();
     loadedDev = -1.0f;
+    loadedVer = 1;
     stall = 0;
     stallRef = 1e18;
     ResetBatches();
@@ -3116,8 +3216,8 @@ static void Trace(CVehicle* v) {
 
 // --- Camera ----------------------------------------------------------------------------------------------------------
 // Auto (Home): the standout of the newest generation on the road: of the cars of the youngest generation driving (past
-// 300 m), the one heading for the best time; held until its run ends (and 2.5 s more: home or out), or until another
-// of them heads for a lap 3 s better (not sooner than 15 s). PageUp / PageDown: those cars one by one, best first.
+// 300 m), the one heading for the best time; held until its run ends (and 2.5 s more: home or out), then the best of
+// that same generation still driving, until it has none. PageUp / PageDown: those cars one by one, best first.
 // (It was on the leader: it got home, the lane started a new brain, the camera jumped to the next leader.) Car A is
 // CJ's: the game's own camera
 static unsigned int camSince = 0, camEndAt = 0;
@@ -3132,10 +3232,10 @@ static float PaceOf(int k) {
     R = keep;
     return p;
 }
-// the cars of the youngest generation driving, best pace first
-static std::vector<int> CamCandidates() {
-    int young = -1;
-    for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && runners[k].sMax > 300.0f) young = std::max(young, runners[k].bornGen);
+// the cars of a generation driving (gen < 0: the youngest one), best pace first
+static std::vector<int> CamCandidates(int gen = -1) {
+    int young = gen;
+    if (young < 0) for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && runners[k].sMax > 300.0f) young = std::max(young, runners[k].bornGen);
     std::vector<std::pair<float, int>> c;
     for (int k = 0; k < numRunners; k++)
         if (runners[k].bornGen == young) { const float pc = PaceOf(k); if (pc < 1e8f) c.push_back({ pc, k }); }
@@ -3198,13 +3298,13 @@ static void UpdateCamera(unsigned int now) {
         if (!camEndAt) camEndAt = now;
         if (now - camEndAt > 2500) keep = false;
     }
-    if (keep && camPick >= 0) return; // (picked by hand: held to its end)
-    if (keep && (!f.result.empty() || now - camSince < 15000)) return;
-    static unsigned int lastLook = 0;
-    if (keep && now - lastLook < 1000) return;
-    lastLook = now;
+    // held to the end of its run, by hand or not (the user: a car to the end of the lap, the last parts too; it changed
+    // to a better pace mid-lap before)
+    if (keep) return;
     camPick = -1;
-    const std::vector<int> c = CamCandidates();
+    // then the best of the same generation still on the road; the newest one when that generation has none left
+    std::vector<int> c = camGen >= 0 ? CamCandidates(camGen) : std::vector<int>();
+    if (c.empty()) c = CamCandidates();
     if (c.empty()) {
         if (keep) return;
         // nobody past 300 m yet: the one furthest on
@@ -3213,7 +3313,7 @@ static void UpdateCamera(unsigned int now) {
         if (lead >= 0) FollowCar(lead, now);
         return;
     }
-    if (!keep || PaceOf(c[0]) < PaceOf(camOn) - 3.0f) FollowCar(c[0], now);
+    FollowCar(c[0], now);
 }
 
 // --- Per frame -------------------------------------------------------------------------------------------------------
@@ -3402,7 +3502,8 @@ void Update() {
                 SpawnObstacles();
                 car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
                 car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
-                if (car->GetUp().z < 0.3f) { RemoveCar(); car = MakeCar(curModel); if (!car) { state = NEXT_CAR; return; } }
+                // (a rolled car is not made again: PlaceCar's heading puts it back on its wheels; made again, with a new
+                // driver, each took up to 140 ms, and the humps and the moose roll ~90 a generation: the stutters)
                 ResetLane();
             }
             continue;
