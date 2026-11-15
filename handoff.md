@@ -3,7 +3,35 @@
 State at the end of the 2026-11-14 session. Read this first, then `docs/sensores.html` (the progress checklist,
 published as https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; it was last updated before the race work below).
 
-## Where things stand (read this first)
+## Proving ground (2026-11-14, second session) - read this first
+
+A new flat test platform and a bench to learn GTA SA's real car physics, then the results ported to the AI.
+
+- Platform: `tools/make_gridmap.py` writes `modloader/RealTrafficFix ProvingGrid/` (model 19400 `pg_grid`, 100 m tiles
+  with a 10 m grid texture, tarmac collision overlapping 0.5 m, `Loader.txt` with the gta.dat lines: modloader needs it
+  for new .ide/.ipl). x 500..2900, y -2950..-2150, z 300, above the sea south of LS.
+- Bench: `ProvingGround.h`, active only while `scripts/RealTrafficFix.proving.ini` exists. `python tools/proving.py
+  start|push|stop|report`; `push` reloads the ini in the running game (no rebuild). Driver `cjai` = CJ at the wheel with
+  the AI's physics (status forced to STATUS_PHYSICS; the AI's SteerAICarWithPhysics call 0x6B52A8 is replaced). `AB = 1`:
+  a second car 40 m to the right with `[Steer.B]`/`[Speed.B]` (two hypotheses per run). Tests: slalom, zig-zag, moose,
+  Z turns, chicanes, hairpin after top speed, brake, top speed, open-loop steps/ramps. Logs: `scripts/proving/<stamp>/`.
+- What the physics is (code: gta-reversed CAutomobile::ProcessControl/ProcessCarWheelPair, CVehicle::ProcessWheel; and
+  measured): below the grip each wheel cancels its contact's sideways speed every frame: no slip, the car turns at
+  exactly v tan(steer)/L with no lag (measured L = wheelbase). AI grip = 10 x adhesive(4.5 tarmac) x tractionMult m/s2,
+  load-independent (the player's grip depends on suspension load and the game scales the player's steering down with
+  speed); in practice the front axle gives way first, ~1.6-2 g on an Infernus. No ABS: brake past a wheel's adhesion
+  locks it (Infernus from ~70% pedal) and it loses its steering. The AI Infernus reaches 385 km/h.
+- Best bench result (Infernus, kinematic steering, 42% of the formula grip, ABS, traction control): max offset 0.2-0.6 m
+  on zig-zag/slalom/Z/chicanes/hairpin.
+- Ported to the mod (ini: KinematicSteer, SteerBandwidth 1.5, AiABS, RacerGripShare 0.42): kinematic steering in
+  LaneControllerSteer, ABS for every AI car, racers' curve grip from the formula, learned grip capped by it (this also
+  lowers the stored limits file).
+- Grove -> Bayside, Infernus `maximo`, no traffic: 3.53 min, 0 collisions, 188 km/h average (route 11 km). Still leaves
+  the route at (2751, -1663), (1793, 892) and (-2743, 2336). At (1793, 892) the junction turn is steered by the game and
+  is not in the speed plan: it accelerated on full lock at 2.3 g, understeered 37 m and spun. Next step (written, not
+  tested, reverted): cap the speed to the turn the wheel asks for, v <= sqrt(G L / tan|steer|), in the AI hook.
+
+## Where things stand (before the proving ground)
 
 The user's current goal: an AI that races like they do. They race the AI side by side (race mode below), and the AI
 should learn from their driving. Their verdict on the last versions:

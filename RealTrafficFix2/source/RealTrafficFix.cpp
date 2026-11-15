@@ -486,6 +486,17 @@ static bool cfgRoutePlanning = true;
 static bool cfgRacingLine = true;
 static float cfgRacingLineMargin = 0.8f;   // m kept from the lane edges (besides half the vehicle width)
 static bool cfgAdaptiveLimits = true;
+// Proving ground results (ProvingGround.h, tools/proving.py on the proving grid):
+// - below the grip GTA's tyres don't slip at all: a car turns at exactly v tan(steer) / L with no lag, so the wheel for a
+//   line's curvature is known and only the error needs feeding back (kinematic steering)
+// - no ABS: a wheel braked past its adhesion locks at once and loses its sideways grip (the Infernus ran wide in every
+//   braked turn from ~70% pedal)
+// - the AI's grip: 10 x adhesive x tractionMult m/s2 from the formula, but the front axle saturates first; racing lines
+//   were followed within ~0.2-0.5 m at 42% of it (zig-zag, slalom, Z turns, chicanes, a hairpin after 385 km/h)
+static bool cfgKinematicSteer = true;
+static float cfgSteerBandwidth = 1.5f;   // rad/s: the error comes back like a critically damped spring at every speed
+static bool cfgAiAbs = true;
+static float cfgRacerGripShare = 0.42f;  // racing drivers' curve speeds: this share of the formula's AI grip
 static float cfgLearnedDecelUse = 0.85f;
 // Driver aids
 static bool cfgABS = true;
@@ -1365,7 +1376,13 @@ static void ApplyAiAbs(CVehicle* veh, float& brake) {
 
 static ModelLimits& GetModelLimits(CVehicle* veh) {
     auto it = learnedLimits.find(veh->m_nModelIndex);
-    if (it != learnedLimits.end()) return it->second;
+    if (it != learnedLimits.end()) {
+        // Never past the AI's own grip (proving ground): the learned grip came partly from the player's laps (2.6 g in an
+        // Infernus, the player's load-sensitive grip); the AI's front axle gave way at ~1.6-2 g and it ran 35 m wide in a
+        // junction turn taken at 2.2 g (Grove->Bayside 233409)
+        if (cfgRacerGripShare > 0.0f) it->second.grip = std::min(it->second.grip, cfgRacerGripShare * AiGripG(veh));
+        return it->second;
+    }
     ModelLimits limits;
     limits.grip = 0.85f * std::clamp(veh->m_pHandlingData->m_fTractionMultiplier, 0.5f, 1.5f);
     return learnedLimits[veh->m_nModelIndex] = limits;
@@ -1942,17 +1959,6 @@ static float curGripCeiling = 1000.0f;
 static bool cfgSteerModel = true;
 static bool cfgSteerRateLimit = true;
 static bool cfgLaneKeep = true;
-// Proving ground results (ProvingGround.h, tools/proving.py on the proving grid):
-// - below the grip GTA's tyres don't slip at all: a car turns at exactly v tan(steer) / L with no lag, so the wheel for a
-//   line's curvature is known and only the error needs feeding back (kinematic steering)
-// - no ABS: a wheel braked past its adhesion locks at once and loses its sideways grip (the Infernus ran wide in every
-//   braked turn from ~70% pedal)
-// - the AI's grip: 10 x adhesive x tractionMult m/s2 from the formula, but the front axle saturates first; racing lines
-//   were followed within ~0.2-0.5 m at 42% of it (zig-zag, slalom, Z turns, chicanes, a hairpin after 385 km/h)
-static bool cfgKinematicSteer = true;
-static float cfgSteerBandwidth = 1.5f;   // rad/s: the error comes back like a critically damped spring at every speed
-static bool cfgAiAbs = true;
-static float cfgRacerGripShare = 0.42f;  // racing drivers' curve speeds: this share of the formula's AI grip
 // The game moves every AI car one lane left or right at random every 4-7 nodes on straight stretches (PickNextNode*:
 // 0x427655, 0x42E962, and 1 in 4 nodes at 0x427C7C). With the denser nodes that was a lane every few seconds, and the
 // mod's keep-right moved it back: cars drifting a lane and back (284 "back to the right" in 6 min on an empty map,
