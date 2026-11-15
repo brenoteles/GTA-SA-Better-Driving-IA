@@ -6,7 +6,7 @@ published as https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; it was last upda
 ## 2026-11-15 session: Cadrona with traffic regressed - read this first
 
 Report page: `docs/avancos.html` (published https://claude.ai/artifact/5P8pM1RmV3BGzL4974qwYt): physics findings, what was
-ported, every test since 25/10 (data: `docs/test_history.json`, written by Gemini; its generator script was not saved).
+ported, every test since 25/10 (data: `docs/test_history.json`, from `python tools/test_history.py`, written by Gemini).
 
 Done this session:
 - `HoldUntilCollision` (RealTrafficFix.cpp): the race mode's fix generalised. AI cars with physics, over 120 m from the
