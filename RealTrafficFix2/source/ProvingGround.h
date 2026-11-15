@@ -81,6 +81,9 @@ struct Settings {
     // the grip by the kind of curve: x GripTight at a radius of 15 m and less, x 1 at 45 m, x GripFast at 150 m and more
     // (in between along the log of the radius); and how fast the car learns each kind itself while it drives (per s)
     float gripTight = 1.0f, gripFast = 1.0f, learnRate = 0.0f;
+    // its own line inside the road (a course with Width): LineBias -1..1 of the room to one side (right..left), LineCut
+    // -0.5..1 towards the inside of the curves (< 0: the outside); the room = the half width - the car's - 0.1 m
+    float lineBias = 0.0f, lineCut = 0.0f;
     // ABS: the pedal at AbsMargin of the wheels' lock point, x the friction circle's share by AbsCircle (0 = ignore the
     // curve, 1 = all of it); a lock takes AbsDrop off, AbsRecover a frame back
     float absMargin = 0.9f, absDrop = 0.15f, absRecover = 0.05f, absCircle = 1.0f;
@@ -113,12 +116,12 @@ static std::vector<std::string> ParseWords(const std::string& s) {
     return out;
 }
 
-// Up to 40 cars on the same course at once, each LaneShift m to the right of the one before, LanesPerDeck to a deck of
+// Up to 60 cars on the same course at once, each LaneShift m to the right of the one before, LanesPerDeck to a deck of
 // the platform, the next ones on the deck DeckHeight m above (A/B tests; the GA's population)
-static constexpr int kMaxRunners = 40;
+static constexpr int kMaxRunners = 60;
 static const char* const kTags[kMaxRunners] = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
     "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
-    "m", "n" };
+    "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7" };
 static int lanesPerDeck = 10;
 static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
@@ -186,6 +189,8 @@ static void ReadSettings() {
     f(sp, "GripTight", s.gripTight);
     f(sp, "GripFast", s.gripFast);
     f(sp, "LearnRate", s.learnRate);
+    f(st, "LineBias", s.lineBias);
+    f(st, "LineCut", s.lineCut);
     f(sp, "AbsMargin", s.absMargin);
     f(sp, "AbsDrop", s.absDrop);
     f(sp, "AbsRecover", s.absRecover);
@@ -327,6 +332,7 @@ struct Runner {
     std::string abortWhy;
     Stats stats;
     std::ofstream csv;
+    Course road;                    // the road itself (course is then the car's own line on it: OwnLine)
     // the run so far (HUD, GA)
     std::string result;             // how its run ended ("" while it runs)
     float endTime = 0.0f, sMax = 0.0f, slowTime = 0.0f;
@@ -404,6 +410,57 @@ static float WrapPi(float a) {
     while (a > 3.14159265f) a -= 6.2831853f;
     while (a < -3.14159265f) a += 6.2831853f;
     return a;
+}
+
+// Distance along, direction and curvature of a course from its points
+static void Geometry(Course& c) {
+    const int n = static_cast<int>(c.p.size());
+    c.s.resize(n);
+    c.head.resize(n);
+    c.curv.resize(n);
+    for (int i = 0; i < n; i++) c.s[i] = i ? c.s[i - 1] + (c.p[i] - c.p[i - 1]).Magnitude() : 0.0f;
+    c.length = c.s[n - 1] + (c.closed ? (c.p[0] - c.p[n - 1]).Magnitude() : 0.0f);
+    auto idx = [&](int i) { return c.closed ? ((i % n) + n) % n : std::clamp(i, 0, n - 1); };
+    for (int i = 0; i < n; i++) {
+        const CVector2D t = c.p[idx(i + 2)] - c.p[idx(i - 2)];
+        c.head[i] = std::atan2(t.y, t.x);
+    }
+    for (int i = 0; i < n; i++) {
+        // over +-3 m (6 points each way)
+        const int a = idx(i - 6), b = idx(i + 6);
+        const float ds = (c.p[b] - c.p[i]).Magnitude() + (c.p[i] - c.p[a]).Magnitude();
+        c.curv[i] = ds > 0.5f ? WrapPi(c.head[b] - c.head[a]) / ds : 0.0f;
+    }
+}
+
+// The car's own line inside the road (its genes LineBias, LineCut): every point moved across by the room x (bias + cut
+// x the curve's direction ahead and behind), smoothed over +-10 m (no step for the wheel), never past the room. The
+// car steers along it and plans its speed on it (a straighter line is a faster one); the road (R->road) stays what
+// its body is judged against
+static void OwnLine() {
+    const int n = static_cast<int>(course.p.size());
+    if (course.halfWidth <= 0.0f || n < 50 || (cfg.lineBias == 0.0f && cfg.lineCut == 0.0f)) return;
+    const float room = std::max(course.halfWidth - R->bodyHalfW - 0.1f, 0.0f);
+    std::vector<float> o(n), t(n);
+    for (int i = 0; i < n; i++) {
+        float k = 0.0f;
+        int m = 0;
+        for (int j = std::max(i - 24, 0); j <= std::min(i + 24, n - 1); j++, m++) k += course.curv[j];
+        k /= std::max(m, 1);
+        o[i] = room * std::clamp(cfg.lineBias + cfg.lineCut * std::clamp(k * 25.0f, -1.0f, 1.0f), -1.0f, 1.0f);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            float sum = 0.0f;
+            int m = 0;
+            for (int j = std::max(i - 20, 0); j <= std::min(i + 20, n - 1); j++, m++) sum += o[j];
+            t[i] = sum / std::max(m, 1);
+        }
+        o.swap(t);
+    }
+    for (int i = 0; i < n; i++)
+        course.p[i] += CVector2D(-std::sin(course.head[i]), std::cos(course.head[i])) * std::clamp(o[i], -room, room);
+    Geometry(course);
 }
 
 static void BuildCourse(const TestDef& d) {
@@ -568,23 +625,8 @@ static void BuildCourse(const TestDef& d) {
     }
     for (const auto& q : local) course.p.push_back(ToWorld(q));
     const int n = static_cast<int>(course.p.size());
-    course.s.resize(n);
-    course.head.resize(n);
-    course.curv.resize(n);
-    for (int i = 0; i < n; i++) course.s[i] = i ? course.s[i - 1] + (course.p[i] - course.p[i - 1]).Magnitude() : 0.0f;
-    course.length = course.s[n - 1] + (course.closed ? (course.p[0] - course.p[n - 1]).Magnitude() : 0.0f);
+    Geometry(course);
     course.halfWidth = 0.5f * d.width;
-    auto idx = [&](int i) { return course.closed ? ((i % n) + n) % n : std::clamp(i, 0, n - 1); };
-    for (int i = 0; i < n; i++) {
-        const CVector2D t = course.p[idx(i + 2)] - course.p[idx(i - 2)];
-        course.head[i] = std::atan2(t.y, t.x);
-    }
-    for (int i = 0; i < n; i++) {
-        // over +-3 m (6 points each way)
-        const int a = idx(i - 6), b = idx(i + 6);
-        const float ds = (course.p[b] - course.p[i]).Magnitude() + (course.p[i] - course.p[a]).Magnitude();
-        course.curv[i] = ds > 0.5f ? WrapPi(course.head[b] - course.head[a]) / ds : 0.0f;
-    }
     course.vcap.assign(n, 1e9f);
     course.vsud.assign(n, 1e9f);
     course.wind.assign(n, 0.0f);
@@ -595,6 +637,8 @@ static void BuildCourse(const TestDef& d) {
             v = std::min(v, z.value / 3.6f);
         }
     for (const auto& nm : names) course.sections.emplace_back(course.s[std::clamp(nm.first, 0, n - 1)], nm.second);
+    R->road = course;
+    OwnLine();
 }
 
 // Nearest course point to 'pos', searched around the last one (the course may cross itself: figure 8)
@@ -607,15 +651,15 @@ static float CurveGrip(float c) {
     return 1.0f + (cfg.gripFast - 1.0f) * (l - std::log(45.0f)) / (std::log(150.0f) - std::log(45.0f));
 }
 
-static int NearestIndex(const CVector2D& pos, int hint, int window) {
-    const int n = static_cast<int>(course.p.size());
+static int NearestIndexIn(const Course& c, const CVector2D& pos, int hint, int window) {
+    const int n = static_cast<int>(c.p.size());
     int best = hint;
     float bestD = 1e18f;
     for (int k = -window; k <= window; k++) {
         int i = hint + k;
-        if (course.closed) i = ((i % n) + n) % n;
+        if (c.closed) i = ((i % n) + n) % n;
         else if (i < 0 || i >= n) continue;
-        const float d = (course.p[i] - pos).MagnitudeSqr();
+        const float d = (c.p[i] - pos).MagnitudeSqr();
         if (d < bestD) { bestD = d; best = i; }
     }
     return best;
@@ -623,27 +667,30 @@ static int NearestIndex(const CVector2D& pos, int hint, int window) {
 // Where 'pos' is on the course between its points: offset (> 0 left), direction and curvature interpolated (the points'
 // own values step every 0.5 m, and the heading feedback shook the wheel every frame on those steps)
 struct OnCourse { int i; float frac, offset, head, curv; };
-static OnCourse Project(const CVector2D& pos, int hint) {
-    const int n = static_cast<int>(course.p.size());
-    auto at = [&](int k) { return course.closed ? ((k % n) + n) % n : std::clamp(k, 0, n - 1); };
-    OnCourse r{ hint, 0.0f, 0.0f, course.head[hint], course.curv[hint] };
+static OnCourse ProjectIn(const Course& c, const CVector2D& pos, int hint) {
+    const int n = static_cast<int>(c.p.size());
+    auto at = [&](int k) { return c.closed ? ((k % n) + n) % n : std::clamp(k, 0, n - 1); };
+    OnCourse r{ hint, 0.0f, 0.0f, c.head[hint], c.curv[hint] };
     for (int a : { at(hint - 1), hint }) {
         const int b = at(a + 1);
         if (a == b) continue;
-        const CVector2D ab = course.p[b] - course.p[a];
+        const CVector2D ab = c.p[b] - c.p[a];
         const float len2 = ab.MagnitudeSqr();
         if (len2 < 1e-6f) continue;
-        const float t = CVector2D::Dot(pos - course.p[a], ab) / len2;
+        const float t = CVector2D::Dot(pos - c.p[a], ab) / len2;
         if (t < 0.0f || t > 1.0f) continue;
         r.i = a;
         r.frac = t;
-        r.head = course.head[a] + WrapPi(course.head[b] - course.head[a]) * t;
-        r.curv = course.curv[a] + (course.curv[b] - course.curv[a]) * t;
+        r.head = c.head[a] + WrapPi(c.head[b] - c.head[a]) * t;
+        r.curv = c.curv[a] + (c.curv[b] - c.curv[a]) * t;
         break;
     }
-    r.offset = CVector2D::Dot(pos - course.p[hint], CVector2D(-std::sin(r.head), std::cos(r.head)));
+    r.offset = CVector2D::Dot(pos - c.p[hint], CVector2D(-std::sin(r.head), std::cos(r.head)));
     return r;
 }
+
+static int NearestIndex(const CVector2D& pos, int hint, int window) { return NearestIndexIn(course, pos, hint, window); }
+static OnCourse Project(const CVector2D& pos, int hint) { return ProjectIn(course, pos, hint); }
 
 static int Advance(int i, float meters) {
     const int n = static_cast<int>(course.p.size());
@@ -772,7 +819,8 @@ static float LineOut() { return course.halfWidth <= 0.0f ? std::abs(offsetNow) :
 static void LearnByResult(float speed, float dt, float brakeAsked) {
     const float step = 0.03f + 0.25f * cfg.learnRate;
     const float G = aiGripG * 9.81f;
-    // a curve: a trial per curve (a new one when the kind changes)
+    // a curve: a trial per curve (a new one when the kind changes); its grip only: the ABS and the TC keep the values
+    // its genes give all through the run (the user: the GA changes them between generations, the best brain wins)
     const float c = std::abs(course.curv[nearIdx]);
     const int band = c > 1.0f / 400.0f ? CurveBand(c) : -1;
     Trial& ct = R->curveTrial;
@@ -780,7 +828,7 @@ static void LearnByResult(float speed, float dt, float brakeAsked) {
         if (ct.band >= 0) EndTrial(ct, R->bandBase[ct.band]);
         if (band >= 0) {
             ct.band = band;
-            ct.which = LearnU() < 0.5f ? 0 : 1;
+            ct.which = 0;
             float* v = TrialValue(ct);
             ct.old = *v;
             const float lo = ct.which == 0 ? 0.6f : 0.5f, hi = ct.which == 0 ? 1.6f : 2.5f;
@@ -793,23 +841,6 @@ static void LearnByResult(float speed, float dt, float brakeAsked) {
         ct.maxOff = std::max(ct.maxOff, LineOut());
         ct.t += dt;
         ct.n++;
-    }
-    // a braking: a trial for the ABS
-    Trial& bt = R->absTrial;
-    const bool braking = brakeAsked > 0.3f;
-    if (braking && bt.band < 0) {
-        bt.band = 0;
-        bt.which = 2;
-        bt.old = R->absLearn;
-        R->absLearn = std::clamp(R->absLearn + (LearnU() < 0.5f ? -step : step), 0.5f, 1.5f);
-    }
-    else if (!braking && bt.band >= 0) EndTrial(bt, R->absBase);
-    if (bt.band >= 0) {
-        bt.sum += std::min(std::max(-R->aLongNow, 0.0f) / G, 2.0f);
-        bt.off += LinePenalty();
-        bt.maxOff = std::max(bt.maxOff, LineOut());
-        bt.t += dt;
-        bt.n++;
     }
 }
 
@@ -1163,7 +1194,7 @@ static void Record(CVehicle* v, float dt) {
         for (float fy : { R->bodyFront, R->bodyRear })
             for (float sx : { -1.0f, 1.0f }) {
                 const CVector2D corner = c0 + f * fy + rt * (sx * R->bodyHalfW);
-                const OnCourse oc = Project(corner, NearestIndex(corner, nearIdx, 16));
+                const OnCourse oc = ProjectIn(R->road, corner, NearestIndexIn(R->road, corner, nearIdx, 16));
                 worst = std::max(worst, std::abs(oc.offset));
             }
         R->marginNow = course.halfWidth - worst;
@@ -1246,7 +1277,7 @@ static const GeneDef kGenes[] = {
     { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f, "kinematic" },
     { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley" },
     // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
-    { "Steer", "LookaheadTime", &Settings::lookTime, 0.05f, 1.5f, "pursuit mod" }, // (mod: its fallback)
+    { "Steer", "LookaheadTime", &Settings::lookTime, 0.0f, 1.5f, "pursuit mod" }, // (mod: its fallback)
     { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
     { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod" },
@@ -1254,7 +1285,9 @@ static const GeneDef kGenes[] = {
     { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f, "" }, // curve speeds: share of the AI grip formula
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
     { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
-    { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 1.5f, "" },
+    { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
+    { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "" },  // its own line: to one side of the road
+    { "Steer", "LineCut", &Settings::lineCut, -0.5f, 1.0f, "" },    // ... into the inside of the curves
     { "Speed", "GripTight", &Settings::gripTight, 0.6f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this
     { "Speed", "GripFast", &Settings::gripFast, 0.6f, 1.6f, "" },   // ... in fast ones (>= 150 m)
     { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns curves, ABS and TC itself
@@ -1437,13 +1470,19 @@ static bool Load() {
             else if (n < numRunners) pop[n++] = g;
         }
     }
-    for (; n < numRunners; n++) pop[n] = Random();  // (a bigger population than the saved one)
-    // genes the file did not have (added since): the ini's value for the elite, drawn anew for the rest (all 40 with
-    // the same value, mutation alone took generations to spread them: S1 of Gemini's 4th review)
-    for (int i = 0; i < kNumGenes; i++) {
-        if (std::find(names.begin(), names.end(), std::string(kGenes[i].key)) != names.end()) continue;
-        for (int k = std::max(elite, 0); k < numRunners; k++) pop[k].g[i] = kGenes[i].lo + U() * (kGenes[i].hi - kGenes[i].lo);
+    // a bigger population than the saved one: copies of the saved brains, a little mutated (not random: no abrupt
+    // changes); none saved: random
+    const int saved = n;
+    for (; n < numRunners; n++) {
+        if (saved == 0) { pop[n] = Random(); continue; }
+        Genome g = pop[n % saved];
+        g.label.clear();
+        for (int i = 0; i < kNumGenes; i++)
+            if (Uses(i, g.mode)) g.g[i] = std::clamp(g.g[i] + N01() * sigma0 * (kGenes[i].hi - kGenes[i].lo), kGenes[i].lo, kGenes[i].hi);
+        pop[n] = g;
     }
+    // (genes the file did not have, added since: the ini's value for everyone; the user wants no abrupt changes in the
+    // brains, so not drawn at random)
     return true;
 }
 
@@ -1591,10 +1630,12 @@ static void NextGeneration() {
     size_t minorityChild = 0;
     for (int i = kept; i < n - imm; i++) {
         const int own = minorityChild < minorities.size() ? minorities[minorityChild++] : -1;
+        // (a minority's own child: one parent of its algorithm, the other the best overall: it keeps its algorithm and
+        // takes the shared genes, speed / ABS / TC, from the best; S1 of Gemini's 5th review)
         const Genome& a = pop[Tournament(avg, own)];
-        const Genome& b = pop[Tournament(avg, own)];
+        const Genome& b = pop[Tournament(avg, -1)];
         Genome c;
-        c.mode = U() < 0.5f ? a.mode : b.mode;
+        c.mode = own >= 0 ? own : U() < 0.5f ? a.mode : b.mode;
         // each gene from the parent whose algorithm reads it (from the one that ignores it, it only rode along)
         for (int g = 0; g < kNumGenes; g++) {
             const bool ua = Uses(g, a.mode), ub = Uses(g, b.mode);
@@ -1713,20 +1754,20 @@ static void OpenTrace() {
     courseWritten = true;
     Runner* keep = R;
     R = runners;
-    std::ofstream c(dir + "course.csv", std::ios::trunc);
+    std::ofstream c(dir + "R->road.csv", std::ios::trunc);
     c << "x,y,s,curv,vcap_kmh,vsud_kmh,wind,half_width\n";
-    for (size_t i = 0; i < course.p.size(); i += 2) {
-        const CVector2D q = ToLane(course.p[i]);
-        c << Format("%.2f,%.2f,%.1f,%.5f,%.0f,%.0f,%.1f,%.2f\n", q.x, q.y, course.s[i], course.curv[i],
-            course.vcap[i] < 1e8f ? course.vcap[i] * 3.6f : -1.0f, course.vsud[i] < 1e8f ? course.vsud[i] * 3.6f : -1.0f, course.wind[i],
-            course.halfWidth);
+    for (size_t i = 0; i < R->road.p.size(); i += 2) {
+        const CVector2D q = ToLane(R->road.p[i]);
+        c << Format("%.2f,%.2f,%.1f,%.5f,%.0f,%.0f,%.1f,%.2f\n", q.x, q.y, R->road.s[i], R->road.curv[i],
+            R->road.vcap[i] < 1e8f ? R->road.vcap[i] * 3.6f : -1.0f, R->road.vsud[i] < 1e8f ? R->road.vsud[i] * 3.6f : -1.0f, R->road.wind[i],
+            R->road.halfWidth);
     }
     std::ofstream s(dir + "sections.csv", std::ios::trunc);
     s << "s,name\n";
-    for (const auto& p : course.sections) s << Format("%.1f,%s\n", p.first, p.second.c_str());
+    for (const auto& p : R->road.sections) s << Format("%.1f,%s\n", p.first, p.second.c_str());
     std::ofstream k(dir + "cones.csv", std::ios::trunc);
     k << "x,y\n";
-    for (const auto& q : course.cones) { const CVector2D l = ToLane(q); k << Format("%.2f,%.2f\n", l.x, l.y); }
+    for (const auto& q : R->road.cones) { const CVector2D l = ToLane(q); k << Format("%.2f,%.2f\n", l.x, l.y); }
     R = keep;
 }
 
@@ -2282,8 +2323,9 @@ static void DrawHud() {
             Text(x + 16.0f, y + 166.0f, Format("aprendido (passo %.2f): curvas", 0.03f + 0.25f * cfg.learnRate), 0.64f, kDim);
             float tc = 0.0f;
             for (float m : R->tcBand) tc += m / 5.0f;
-            for (int b = 0; b < 7; b++) {
-                const float m = b < 5 ? R->learned[b] : b == 5 ? R->absLearn : tc;
+            (void)tc;
+            for (int b = 0; b < 5; b++) {
+                const float m = R->learned[b];
                 Text(x + 250.0f + 72.0f * b, y + 166.0f, Format("%s x%.2f", b < 5 ? kBandNames[b] : b == 5 ? "ABS" : "TC", m), 0.64f,
                     m > 1.02f ? CRGBA(120, 230, 120, 255) : m < 0.98f ? CRGBA(255, 120, 120, 255) : kWhite);
             }
@@ -2387,17 +2429,18 @@ void Draw() {
     if (std::abs(R->baseZ + 0.08f - z) > 1.0f) continue; // (another deck's: seen through the floor)
     const CRGBA col = ColorOf(R->index);
     const int n = static_cast<int>(course.p.size());
-    if (course.halfWidth > 0.0f && n > 4) {
+    const Course& rd = R->road;
+    if (rd.halfWidth > 0.0f && n > 4 && static_cast<int>(rd.p.size()) == n) {
         // A race track: asphalt between the edges (reddish where a sudden brake is, bluish in the crosswind), red and
         // white kerbs outside each edge, a white line on the edge, a chequered line at the start and the end
-        const float H = course.halfWidth, K = 0.6f, za = z + 0.04f, zk = z + 0.05f, zl = z + 0.06f;
-        auto normal = [&](int i) { return CVector2D(-std::sin(course.head[i]), std::cos(course.head[i])); };
+        const float H = rd.halfWidth, K = 0.6f, za = z + 0.04f, zk = z + 0.05f, zl = z + 0.06f;
+        auto normal = [&](int i) { return CVector2D(-std::sin(rd.head[i]), std::cos(rd.head[i])); };
         for (int i = 0; i < n - 1; i += 4) {
             const int j = std::min(i + 4, n - 1);
-            const CVector2D a = course.p[i], b = course.p[j];
+            const CVector2D a = rd.p[i], b = rd.p[j];
             if (!close(a)) continue;
             const CVector2D la = normal(i), lb = normal(j);
-            const CRGBA asphalt = course.vsud[i] < 1e8f ? CRGBA(120, 45, 45, 235) : course.wind[i] != 0.0f ? CRGBA(45, 70, 115, 235)
+            const CRGBA asphalt = rd.vsud[i] < 1e8f ? CRGBA(120, 45, 45, 235) : rd.wind[i] != 0.0f ? CRGBA(45, 70, 115, 235)
                 : CRGBA(52, 54, 60, 235);
             const CVector2D al = a + la * H, ar = a - la * H, bl = b + lb * H, br = b - lb * H;
             Quad3D({ ar.x, ar.y, za }, { al.x, al.y, za }, { bl.x, bl.y, za }, { br.x, br.y, za }, asphalt);
@@ -2409,9 +2452,9 @@ void Draw() {
             }
         }
         for (int at : { 0, n - 1 }) {
-            if (!close(course.p[at])) continue;
+            if (!close(rd.p[at])) continue;
             // chequered: 2 rows of squares across the road
-            const CVector2D o = course.p[at], f(std::cos(course.head[at]), std::sin(course.head[at])), l = normal(at);
+            const CVector2D o = rd.p[at], f(std::cos(rd.head[at]), std::sin(rd.head[at])), l = normal(at);
             const int cells = std::max(static_cast<int>(2.0f * H / 0.5f), 2);
             const float w = 2.0f * H / cells;
             for (int r = 0; r < 2; r++)
@@ -2421,6 +2464,9 @@ void Draw() {
                         (k + r) % 2 ? CRGBA(20, 20, 20, 255) : CRGBA(240, 240, 240, 255));
                 }
         }
+        // the car's own line, in its colour
+        for (int i = 0; i + 4 < n; i += 4)
+            if (close(course.p[i])) Line3D({ course.p[i].x, course.p[i].y, z + 0.07f }, { course.p[i + 4].x, course.p[i + 4].y, z + 0.07f }, Alpha(col, 170));
     }
     else for (int i = 0; i + 1 < n + (course.closed ? 1 : 0); i += 2) {
         const CVector2D a = course.p[i], b = course.p[(i + 2) % n];

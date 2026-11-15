@@ -40,17 +40,17 @@ REVIEWS = os.path.join(PROVING, 'ga_reviews')
 AGY = r'C:/Users/death/AppData/Local/agy/bin/agy'
 GEMINI_MODEL = 'gemini-4-argon-high'
 # the genes and their ranges (ProvingGround.h, GA::kGenes)
-RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.05, 1.5),
+RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.0, 1.5),
           'LookaheadMin': (1.5, 15.0), 'StanleyK': (0.3, 5.0), 'Gain': (0.5, 1.3), 'Smoothing': (0.0, 0.12),
-          'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 1.5),
+          'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 2.5),
           'GripTight': (0.6, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4), 'CruiseGas': (0.0, 0.4),
           'AbsMargin': (0.5, 1.2), 'AbsDrop': (0.02, 0.4), 'AbsRecover': (0.01, 0.2), 'AbsCircle': (0.0, 1.0),
           'TcSlip': (0.03, 1.0), 'TcMinGas': (0.0, 1.0), 'TcDrop': (0.0, 0.3), 'TcRecover': (0.01, 0.1),
-          'TcCircle': (0.0, 1.0)}
+          'TcCircle': (0.0, 1.0), 'LineBias': (-1.0, 1.0), 'LineCut': (-0.5, 1.0)}
 # (genes a generation did not have yet: the value they had before they were genes)
 DEFAULTS = {'GripTight': 1.0, 'GripFast': 1.0, 'LearnRate': 0.0, 'CruiseGas': 0.15, 'AbsMargin': 0.9, 'AbsDrop': 0.15,
             'AbsRecover': 0.05, 'AbsCircle': 1.0, 'TcSlip': 0.08, 'TcMinGas': 0.15, 'TcDrop': 0.1, 'TcRecover': 0.03,
-            'TcCircle': 1.0}
+            'TcCircle': 1.0, 'LineBias': 0.0, 'LineCut': 0.0}
 GENES = list(RANGES)
 
 SCHEMA = """
@@ -278,7 +278,7 @@ def ask_gemini(c, g0, g1):
         'o carro deve manter a carroceria inteira entre as duas bordas, a linha central so guia; o objetivo nao e o mais '
         'rapido, e o que fica com folga dentro da pista e ainda assim e rapido. Pontuacao (menor e melhor): tempo + 5 x '
         'm.s com a carroceria a menos de 0,3 m da borda + 10 x segundos com a carroceria fora da pista (o desvio do centro '
-        'nao conta). NAO altere nenhum arquivo: so leia e '
+        'nao conta). Cada cerebro tem a propria linha dentro da faixa (genes LineBias, LineCut); ABS e TC ficam fixos durante a volta. NAO altere nenhum arquivo: so leia e '
         'responda no terminal, em portugues.\n'
         f'Leia: {rep} (geracoes {g0}-{g1}: ranking, genes, e tempos por trecho da ultima), {HISTORY} (todas as geracoes), '
         f'{os.path.join(REPO, "RealTrafficFix2", "source", "ProvingGround.h")} (namespace GA: genes, faixas, pontuacao, '
