@@ -2243,6 +2243,7 @@ static void NextGeneration() {
 // every Nn2Cars of them. Every 'cars' runs make a "generation" for the logs (history, trace, Gemini).
 struct Done { Genome g; Result r; std::string id; };
 static std::vector<Done> batch;
+static float batchStart = 0.0f;    // the clock when the generation began
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
 static std::vector<float> pendingEps;   // a pair's + waiting for its -
@@ -2397,6 +2398,7 @@ static void EndBatch() {
           << Format(",%.3f,%d,%.3f,%.3f", x.score, 1, x.deficit, x.minMargin < 1e8 ? x.minMargin : 0.0) << "\n";
     }
     batch.clear();
+    batchStart = clockT;
     generation++;
     sigma = std::max(sigma * sigmaDecay, sigmaMin);
     Save();
@@ -2433,7 +2435,10 @@ static void Replace(int k) {
         esBatch.push_back({ r.score, nn2Eps[k] });
         if (static_cast<int>(esBatch.size()) >= nn2Cars) StepThetaBatch();
     }
-    if (static_cast<int>(batch.size()) >= numRunners) EndBatch();
+    // (a generation by time: 1.3 x the best lap, so every good car's run is in it; by count it closed on the quick
+    // failures before any car got home: Gemini's 10th review)
+    const float window = bestLapTime > 0.0f ? bestLapTime * std::max(cutoffFactor, 1.0f) : 200.0f;
+    if (clockT - batchStart >= window && !batch.empty()) EndBatch();
     Genome c = Child(k);
     AssignNn2Lane(c, k);
     pop[k] = c;
