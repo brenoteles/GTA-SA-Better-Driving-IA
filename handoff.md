@@ -52,7 +52,23 @@ Where it stands (generation 8, the first with learning by result and averaged el
 mean offset 0.066 m, the most precise yet), best ever 156.8 (gen 3, single runs then). Diversity up 0.08 -> 0.17,
 kinematic 3 -> 13 of 40. Pursuit led every generation.
 
+Update, 2026-11-15 third session (paused by the user, game closed, GA state at generation 7):
+- Now: 60 cars on 6 decks; a one-way 4 m lane drawn as a race track (kerbs); score = time + 5 x m.s closer than 0.3 m
+  to the edge + 40 x s with the body outside (the centre line no longer counts); each brain its own line inside the
+  lane (LineBias, LineCut); ABS/TC fixed during a run; gentle evolution (sigma 0.05, no immigrants/mode jumps); no top
+  speed (2 km braking horizon); no sudden brakes; 350 m start straight.
+- Algorithms: kinematic, stanley, pursuit, mod, gt4 (precomputed speed profile, GT4 style), mpc (15 simulated wheel
+  angles), neural (11 rays -> 10 tanh -> wheel/pedal, weights evolved; after LucasHJin/self-play-racing); islands of
+  at least 7 cars per algorithm (MinPerMode).
+- Driver = human: the user drives car A (countdown, logged as HUMANO, never selected). Test car: the Solair (458),
+  handling edited by the user several times (last: 2000 kg, turn mass 5500, traction 0.9, accel 240, top 600, 4x4).
+  Each handling change: best/history cleared in ga_state.txt, brains kept.
+- Gemini: 6 reviews validated in SQLite (none pending); the loop (ga_review.py wait) is stopped.
+
 Next:
+0. Restart (`python tools/proving.py start`, the loop in the background), let the user drive a lap, then write
+   tools/nn_clone.py: fit the neural driver's weights to the human's lap (trace columns in0..in17 + steer/gas/brake of
+   car A, mode "human") and save them to scripts\proving\nn_seed.txt (the neural island starts from it).
 1. Resume, let generations 9+ run; validate Gemini's review of 5-9 (the first with the learning by result): is
    learning by result helping (trials kept, learned values), does sliding pay (TC genes loosening)?
 2. The best brain into the mod's own driving (LaneControllerSteer is kinematic; pursuit won here) - not started.
