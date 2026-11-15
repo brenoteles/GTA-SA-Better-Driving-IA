@@ -125,7 +125,7 @@ static std::vector<std::string> ParseWords(const std::string& s) {
 
 // Up to 60 cars on the same course at once, each LaneShift m to the right of the one before, LanesPerDeck to a deck of
 // the platform, the next ones on the deck DeckHeight m above (A/B tests; the GA's population)
-static constexpr int kMaxRunners = 100;
+static constexpr int kMaxRunners = 300;
 // the cars' names: A..Z, a..z, 0..9, then AA, AB...
 static char kTagBuf[kMaxRunners][4];
 static const char* kTags[kMaxRunners];
@@ -2324,7 +2324,7 @@ static void OpenTrace() {
 
 static void Trace(CVehicle* v) {
     if (!trace.is_open() || runT < traceNext[R->index]) return;
-    traceNext[R->index] = runT + 0.25f;
+    traceNext[R->index] = runT + (numRunners > 100 ? 0.5f : 0.25f); // (2 a second above 100 cars: the file grows with them)
     const CVector2D q = ToLane(v->GetPosition().To2D());
     trace << Format("%d,%s,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.1f,%.2f,%.3f,%d,%d,%.2f", GA::on ? GA::generation : runCount,
         R->tag, human && R == runners ? "human" : cfg.mode.c_str(), runT, q.x, q.y, R->speedNow, targetKmh, offsetNow, v->m_fSteerAngle, gasOut, brakeOut, R->sMax,
