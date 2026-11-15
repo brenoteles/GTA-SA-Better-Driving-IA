@@ -1056,10 +1056,11 @@ static const GeneDef kGenes[] = {
     { "Steer", "Bandwidth", &Settings::bandwidth, 0.5f, 4.0f },       // kinematic
     { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f },           // kinematic
     { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f },           // kinematic, stanley
-    { "Steer", "LookaheadTime", &Settings::lookTime, 0.2f, 1.5f },    // pursuit, mod fallback
+    // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
+    { "Steer", "LookaheadTime", &Settings::lookTime, 0.05f, 1.5f },   // pursuit, mod fallback
     { "Steer", "LookaheadMin", &Settings::lookMin, 3.0f, 15.0f },     // pursuit
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f },         // stanley
-    { "Steer", "Gain", &Settings::gain, 0.7f, 1.3f },                 // all
+    { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f },                 // all
     { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f },      // all
     { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f },    // curve speeds: share of the AI grip formula
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f },        // braking planned for curves and limits
