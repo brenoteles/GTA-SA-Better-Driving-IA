@@ -993,7 +993,8 @@ static void Control(CVehicle* v) {
     const float gripG = d.gripG > 0.0f ? d.gripG : (d.gripG == 0.0f ? cfg.gripFactor * aiGripG : cfg.speedGripG), brakeG = d.brakeG > 0.0f ? d.brakeG : cfg.speedBrakeG;
     if (gripG > 0.0f && !openLoop) {
         // slower for the curves ahead: v2 = G g / k there, braking at BrakeG g to reach it
-        const float reach = std::clamp(speed * speed / (2.0f * brakeG * 9.81f) + 60.0f, 60.0f, 600.0f);
+        // (up to 2 km: with no top speed set, 450+ km/h needs 700+ m to brake for the U-turn)
+        const float reach = std::clamp(speed * speed / (2.0f * brakeG * 9.81f) + 60.0f, 60.0f, 2000.0f);
         for (float a = 0.0f; a < reach; a += 2.0f) {
             const int k = Advance(nearIdx, a);
             if (!course.closed && k >= static_cast<int>(course.p.size()) - 1) break;
@@ -2334,7 +2335,8 @@ static void DrawHud() {
         // speed
         Text(x + 150.0f, y + 66.0f, Format("%.0f", R->speedNow), 2.6f, kWhite, 2, FONT_PRICEDOWN);
         Text(x + 156.0f, y + 84.0f, "km/h", 0.8f, kDim);
-        Text(x + 156.0f, y + 110.0f, Format("alvo %.0f", targetKmh), 0.8f, targetKmh < R->speedNow - 5.0f ? CRGBA(255, 120, 120, 255) : kDim);
+        Text(x + 156.0f, y + 110.0f, targetKmh >= 2000.0f ? std::string("alvo livre") : Format("alvo %.0f", targetKmh), 0.8f,
+            targetKmh < R->speedNow - 5.0f ? CRGBA(255, 120, 120, 255) : kDim);
         // wheel, offset, sideways g
         const float bx = x + 270.0f, bw = 330.0f;
         const float lock = car->m_pHandlingData->m_fSteeringLock * 3.14159265f / 180.0f;
