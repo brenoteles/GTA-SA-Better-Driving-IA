@@ -1116,7 +1116,7 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
             // Regulated Pure Pursuit (ROS 2 Nav2): the look-ahead shortened where the line bends within it (RppCurv)
             float kMax = 0.0f;
             for (float a = 0.0f; a <= ld0; a += 2.0f) kMax = std::max(kMax, std::abs(course.curv[Advance(i, a)]));
-            d = pursuitTo(std::max(0.5f * cfg.lookMin, ld0 / (1.0f + cfg.rppCurv * kMax * ld0))) * cfg.gain;
+            d = pursuitTo(std::max(cfg.lookMin, ld0 / (1.0f + cfg.rppCurv * kMax * ld0))) * cfg.gain; // (never under LookaheadMin: S4)
         }
         else if (cfg.mode == "blend") {
             // pursuit and the kinematic law (feedforward of the curvature, the error as a damped spring) together
@@ -1144,7 +1144,7 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
                 for (float t = 2.0f; t <= 60.0f; t += 2.0f) {
                     const CVector2D pt = pos + dir * t;
                     hint = NearestIndexIn(rd, pt, hint, 10);
-                    if (std::abs(ProjectIn(rd, pt, hint).offset) > half - 0.5f * R->bodyHalfW) { dist = t; break; }
+                    if (std::abs(ProjectIn(rd, pt, hint).offset) > half - R->bodyHalfW - 0.1f) { dist = t; break; } // (the whole body inside: half of it let the car 0.5 m out, S1 of Gemini's 8th review)
                 }
                 const float score = dist / 60.0f - cfg.gapBias * std::abs(a - aLine);
                 if (score > bestScore) { bestScore = score; bestA = a; bestD = dist; }
