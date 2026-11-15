@@ -154,9 +154,17 @@ static float countdownS = 0.0f;
 // the GA evolves its weights (tools/nn_clone.py can start them from a human's lap)
 static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnHid + 1) * 2;
 // mode neural2: every sensor there is (63: rays, the road and its own line, curvature ahead, obstacles, the car's
-// motion, slip, attitude, each wheel) -> 24 tanh -> wheel and pedal; first taught by imitation (tools/nn2_train.py,
-// DAgger), then improved by evolution strategies in the game (GA::Nn2*)
+// motion, slip, attitude, each wheel, the teacher's wheel and the speed error) -> 24 tanh -> two residuals on its
+// teacher (pursuit with its genes, and the speed planner): wheel = teacher + kNn2SteerSpan x lock x o[0], target speed
+// x (1 + kNn2SpeedSpan x o[1]); the pedals, the ABS and the TC as for everyone. With zero output weights it IS its
+// teacher (home from its first run); the GA's ES then looks for what beats pursuit. Taught first by imitation
+// (tools/nn2_train.py: the residual the better finishers drove over pursuit), then by evolution strategies in the game.
+// (Before, its outputs were the whole wheel and pedal, taught by behaviour cloning, and it never got home: its inputs
+// n49..n51 were its own wheel and pedals, and the trace, written after Control, logged this frame's command there, so
+// the teachers' labels were these very inputs (correlation 1.000); the net learned to copy them, and in the loop it
+// twitched the wheel 10x more than pursuit on the straight before the 220 m bends and spun in them)
 static constexpr int kNn2In = 63, kNn2Hid = 24, kNN2 = (kNn2In + 1) * kNn2Hid + (kNn2Hid + 1) * 2;
+static constexpr float kNn2SteerSpan = 0.25f, kNn2SpeedSpan = 0.3f; // the most it can add: a quarter of the lock, 30% of the speed
 static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
 static void SetRunnerSettings(const Settings* rs);
@@ -165,6 +173,7 @@ static float laneShiftB = 40.0f;
 static void OpenTrace();
 namespace GA {
 static bool on = false;
+static bool traceOn = true; // ([GA] Trace)
 static void Read(CIniReader& ini, const Settings& s);
 static void Start();
 static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length,
@@ -389,8 +398,10 @@ struct Runner {
     float windNow = 0.0f;
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
-    float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake)
+    float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake); neural2: its speed residual, o[1]
     float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
+    float nnIn[kNn2In] = {};        // neural2's inputs as the net saw them this frame, before the command (Trace logs these:
+                                    // taken again after Control, n49..n51 held the command itself, the label: see kNn2In)
     std::vector<int> obstacles;     // its lane's obstacle objects (handles)
     float runT = 0.0f;              // s since its run started (steady state: every lane on its own clock)
     float doneAt = 0.0f;            // the clock when its run ended
@@ -1205,9 +1216,13 @@ static void Neural2Inputs(CVehicle* v, float* in) {
     in[k++] = std::atan2(vR - v->m_vecTurnSpeed.z * rearAxleY * GAME_SPEED_TO_MPS, std::max(std::abs(vF), 0.5f));
     in[k++] = v->GetRight().z;                              // roll
     in[k++] = v->GetForward().z;                            // pitch
-    in[k++] = v->m_fSteerAngle / HandlingLockRad(v);
-    in[k++] = gasOut;
-    in[k++] = brakeOut;
+    // the wheel it asked for last frame, what its teacher asks for now, how far it is from the planner's speed
+    // (steerOut and targetKmh are last frame's until Control writes this frame's, teacherSteer is this frame's (set
+    // just before, Neural2Snapshot): in the trace these are the numbers the net saw, nothing of this frame's command;
+    // the old gasOut / brakeOut here were that command)
+    in[k++] = steerOut / HandlingLockRad(v);
+    in[k++] = R->teacherSteer / HandlingLockRad(v);
+    in[k++] = std::clamp((targetKmh / 3.6f - CVector::Dot(v->m_vecMoveSpeed, v->GetForward()) * GAME_SPEED_TO_MPS) / 50.0f, -2.0f, 2.0f);
     // each wheel: its state (rolling, spinning, skidding, locked), its suspension, on the ground or not
     CAutomobile* a = static_cast<CAutomobile*>(v);
     int contact = 0;
@@ -1222,17 +1237,27 @@ static void Neural2Inputs(CVehicle* v, float* in) {
     while (k < kNn2In) in[k++] = 0.0f;
 }
 
-static float Neural2Steer(CVehicle* v, float vv, int i) {
-    float in[kNn2In], h[kNn2Hid];
-    Neural2Inputs(v, in);
+// neural2's teacher: what pursuit with this car's genes would steer here (DAgger's label, one of the inputs, and the
+// wheel its residual is added to). Worked out for every car the trace keeps neural2's sensors for (pursuit, rpp and
+// blend too), so their rows carry the same label: the residual they drove over pursuit is what tools/nn2_train.py learns
+static float PursuitSteer(CVehicle* v, float vv, int i) {
     const float lock = HandlingLockRad(v);
-    // the teacher: what pursuit with this car's genes would steer (DAgger's label; also neural2's fallback)
-    {
-        const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
-        const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), left(-fwd.y, fwd.x);
-        const CVector2D rel = course.p[Advance(i, ld)] - pos;
-        R->teacherSteer = std::clamp(std::atan2(2.0f * wheelBase * std::sin(std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd))), ld) * cfg.gain, -lock, lock);
-    }
+    const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
+    const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), left(-fwd.y, fwd.x);
+    const CVector2D rel = course.p[Advance(i, ld)] - pos;
+    return std::clamp(std::atan2(2.0f * wheelBase * std::sin(std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd))), ld) * cfg.gain, -lock, lock);
+}
+// the teacher, then the sensors of this frame (the teacher is one of them), kept for the net and for Trace
+static void Neural2Snapshot(CVehicle* v, float vv, int i) {
+    R->teacherSteer = PursuitSteer(v, vv, i);
+    Neural2Inputs(v, R->nnIn);
+}
+
+static float Neural2Steer(CVehicle* v, float vv, int i) {
+    float h[kNn2Hid];
+    Neural2Snapshot(v, vv, i);
+    const float* in = R->nnIn;
+    const float lock = HandlingLockRad(v);
     const std::vector<float>& w = cfg.nn;
     if (static_cast<int>(w.size()) < kNN2) { R->nnPedal = 0.0f; return R->teacherSteer; }
     for (int j = 0; j < kNn2Hid; j++) {
@@ -1248,8 +1273,9 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
         for (int j = 0; j < kNn2Hid; j++) sum += row[j] * h[j];
         o[m] = std::tanh(sum);
     }
+    // residuals on the teacher (zero output weights: the teacher itself)
     R->nnPedal = o[1];
-    return o[0] * lock;
+    return std::clamp(R->teacherSteer + kNn2SteerSpan * lock * o[0], -lock, lock);
 }
 
 static float NeuralSteer(CVehicle* v) {
@@ -1355,6 +1381,10 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
         d = Neural2Steer(v, vv, i);
         lookPoint = course.p[Advance(i, 0.5f * vv)];
     }
+    // (neural2's teachers: their rows in the trace carry what the net would have seen, and pursuit's wheel, before
+    // their own command of this frame is written)
+    // (only for the trace, neural2's lessons: 63 sensors a frame for ~350 cars cost frames with Trace = 0)
+    if (GA::traceOn && (cfg.mode == "pursuit" || cfg.mode == "rpp" || cfg.mode == "blend")) Neural2Snapshot(v, vv, i);
     else if (cfg.mode == "mpc") {
         // Predictive (sampling MPC): 15 wheel angles around the curvature's feedforward, each one driven ahead
         // MpcHorizon s with GTA's own turn (v tan(wheel) / L at the rear axle, no slip below the grip); the one whose
@@ -1561,13 +1591,22 @@ static void Control(CVehicle* v) {
         if (e > -0.5f) gas = std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f);
         if (e < -1.0f) brake = std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f);
     }
-    // mode neural / neural2: its own pedal (the speed plan is not its; for neural2 it is the teacher's)
+    // mode neural: its own pedal (the speed plan is not its)
     R->teacherPedal = gas - brake;
-    if (!openLoop && (cfg.mode == "neural" || (cfg.mode == "neural2" && !cfg.nn.empty()))) {
+    if (!openLoop && cfg.mode == "neural") {
         gas = std::max(R->nnPedal, 0.0f);
         brake = std::max(-R->nnPedal, 0.0f);
         // (below 18 km/h a launch: its teachers had nothing slower, and it never left the start)
         if (speed < 5.0f) { gas = std::max(gas, 0.8f); brake = 0.0f; }
+    }
+    // mode neural2: the planner's speed x (1 + kNn2SpeedSpan x its second output), through the same controller (then
+    // the ABS and the TC): the pedal itself was its output before, and a P-controller's output (CruiseGas + Kp x the
+    // speed error, each car's genes) never fit (R2 0.75, falling) nor launched. targetKmh stays the planner's: the
+    // trace logs it and the net reads it (n51)
+    if (!openLoop && cfg.mode == "neural2" && !cfg.nn.empty() && d.pedal == "hold") {
+        const float e = vt * (1.0f + kNn2SpeedSpan * std::clamp(R->nnPedal, -1.0f, 1.0f)) - speed;
+        gas = e > -0.5f ? std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f) : 0.0f;
+        brake = e < -1.0f ? std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f) : 0.0f;
     }
     const float brakeAsked = brake;
     if (!openLoop && cfg.abs && brake > 0.0f) {
@@ -1879,7 +1918,6 @@ static double stallRef = 1e18;
 static std::vector<double> history10; // steady state: each generation's mean of its 10 best runs
 // [GA] Trace = 0: no trace files (only the analysis tools read them: the viewer, Gemini, nn2_train); TraceEvery: s
 // between a car's rows (0: 0.25, or 0.5 above 100 cars)
-static bool traceOn = true;
 static float traceEvery = 0.0f;
 // CutoffFactor: once the first car is home, a car still running at that time x this is stopped (CUT) and scored by
 // the time it was heading for (its time x the course / how far it got) + CutPenalty (0: no cutoff)
@@ -2444,6 +2482,7 @@ static int NextBirth() {
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
 static std::vector<float> pendingEps;   // a pair's + waiting for its -
+static Genome pendingGenes;             // ... and the genes it drove with: its - drives the same (the pair differs by eps alone)
 
 static int ArchiveTournament(int mode) {
     std::vector<int> pool;
@@ -2535,8 +2574,14 @@ static void AssignNn2Lane(Genome& g, int k) {
     if (!IsNeural2(g)) return;
     LoadTheta();
     if (static_cast<int>(nn2Theta.size()) != kNN2) return;
-    if (!pendingEps.empty()) { nn2Eps[k] = pendingEps; for (float& e : nn2Eps[k]) e = -e; pendingEps.clear(); }
-    else { nn2Eps[k].resize(kNN2); for (float& e : nn2Eps[k]) e = N01(); pendingEps = nn2Eps[k]; }
+    if (!pendingEps.empty()) {
+        nn2Eps[k] = pendingEps;
+        for (float& e : nn2Eps[k]) e = -e;
+        pendingEps.clear();
+        // (the same genes as its +: bred anew, the pair's difference was as much the genes' (Kp, BrakeG, the ABS...) as eps's)
+        for (int q = 0; q < kNumGenes; q++) g.g[q] = pendingGenes.g[q];
+    }
+    else { nn2Eps[k].resize(kNN2); for (float& e : nn2Eps[k]) e = N01(); pendingEps = nn2Eps[k]; pendingGenes = g; }
     const float sg = nn2Es ? nn2Sigma : nn2Noise;
     for (int w = 0; w < kNN2; w++) g.nn[w] = nn2Theta[w] + sg * nn2Eps[k][w];
 }
@@ -2861,10 +2906,11 @@ static void Trace(CVehicle* v) {
     // (neural2's sensors only for its teachers and itself: they make the file 3x bigger)
     const bool n2 = cfg.mode == "neural2" || cfg.mode == "pursuit" || cfg.mode == "rpp" || cfg.mode == "blend";
     if (n2) {
-        float in2[kNn2In];
-        Neural2Inputs(v, in2);
-        for (int i = 0; i < kNn2In; i++) tail += Format(",%.3f", in2[i]);
-        tail += cfg.mode == "neural2" ? Format(",%.4f,%.3f", R->teacherSteer, R->teacherPedal) : Format(",%.4f,%.3f", v->m_fSteerAngle, gasOut - brakeOut);
+        // (the inputs as the net saw them before this frame's command, not taken again now: n49..n51 would be the
+        // command itself. teacher_steer is pursuit's wheel for every one of them, teacher_pedal the planner's pedal
+        // before the ABS and the TC; the car's own wheel and pedals are the steer, gas, brake columns)
+        for (int i = 0; i < kNn2In; i++) tail += Format(",%.3f", R->nnIn[i]);
+        tail += Format(",%.4f,%.3f", R->teacherSteer, R->teacherPedal);
     }
     else tail += std::string(kNn2In + 2, ',');
     row += tail;

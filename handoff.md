@@ -4,7 +4,33 @@ State at the end of the 2026-11-15 sessions. Read the GA section first (the late
 (the traffic regression, still open), then `docs/sensores.html` (the progress checklist, published as
 https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; behind: it predates the race, proving ground and GA work).
 
-## 2026-11-15 (second session): proving ground genetic algorithm - read this first
+## 2026-11-15 (evening): the GA runs with no LLM - read this first
+
+The proving ground's GA is entirely in the ASI: start the game (scripts\RealTrafficFix.proving.ini present, [GA]
+Enabled = 1, SteadyState = 1, Resume = 1) and it drives 500 cars, breeds, and saves its state every generation
+(scripts\proving\ga_state.txt, written to .tmp then renamed: closing the game at any time is safe; the next start
+resumes). No Python, Gemini or Claude needed. Optional helpers: `python tools/proving_watch.py` (restarts the game after
+a crash, i.e. a new crash log; Gemini reviews every 5 generations), `[GA] Trace = 1` for the trace files the analysis
+tools (viewer, ga_review.py, nn2_train.py) read (~50 MB a generation; off by default: it caused the freezes).
+
+What changed this evening (commits f5d7aca, ba8fa0b and the neural2 one after them):
+- Generations by birth: exactly Runners (500) brains each, closing when all of their runs ended; HUD bars per open
+  generation (born / ended). Score = time x (1 + DevWeight 0.3 x mean deviation from the car's own line) + OffPenalty
+  x s outside; not home = 1000 + 0.5 x m left (outside time no longer counted: crashing early scored better), CUT <= 999.
+  The score change reset the best ever and history (state line "scoring").
+- Evolution was stuck at 138-140 s for 8 generations: parents now from the best ParentTop (20%) of their algorithm,
+  elites re-run (none ever had been), sigma adaptive (x0.9 on progress, x1.5 after 3 generations without, SigmaMax).
+- Freezes (3.5-16 s): summary/state/history/trace writes moved to a disk thread (files kept open), the road cached per
+  lane (a new brain rebuilt it: 15-65 ms each), trail a deque. Perf lines in summary.txt every 10 s ("perf:"): 49-56
+  fps, the mod ~5 ms of ~19 ms a frame; the rest is GTA's own single-threaded physics of 500 cars (why CPU reads <50%).
+- HUD compact by default (F9: compact / full / off). Camera follows the best-pace car of the newest generation to the
+  end of its run (PgUp/PgDn: those cars, Home: auto).
+- neural2 (Fable's patch on Gemini's diagnosis): residual on pursuit (wheel +-25% of the lock) and on the planner's
+  target speed (+-30%); zero output weights = pursuit; the trace logs the inputs the net saw (the old n49..n51 leaked
+  the label); the 64th input written past the array removed; ES pairs share genes; Nn2Alpha 0.01. Reset with
+  `python tools/nn2_train.py --residual --epochs 0` (old theta: proving\nn2_central_before_residual.txt).
+
+## 2026-11-15 (second session): proving ground genetic algorithm
 
 The user's goal now: an AI that drives the proving ground's circuit fast AND close to the line, found by a genetic
 algorithm (GA) the user watches in the game. Stopped by the user at the end of generation 8 (game closed, the state
