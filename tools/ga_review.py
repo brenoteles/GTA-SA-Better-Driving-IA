@@ -277,7 +277,7 @@ def ask_gemini(c, g0, g1):
         'numa pista de testes (40 carros por geracao no mesmo circuito de 5,1 km). A pista e uma faixa de mao unica de 4 m (transito): '
         'o carro deve manter a carroceria inteira entre as duas bordas, a linha central so guia; o objetivo nao e o mais '
         'rapido, e o que fica com folga dentro da pista e ainda assim e rapido. Pontuacao (menor e melhor): tempo + 5 x '
-        'm.s com a carroceria a menos de 0,3 m da borda + 10 x segundos com a carroceria fora da pista (o desvio do centro '
+        'm.s com a carroceria a menos de 0,3 m da borda + 40 x segundos com a carroceria fora da pista (o desvio do centro '
         'nao conta). Cada cerebro tem a propria linha dentro da faixa (genes LineBias, LineCut); ABS e TC ficam fixos durante a volta. NAO altere nenhum arquivo: so leia e '
         'responda no terminal, em portugues.\n'
         f'Leia: {rep} (geracoes {g0}-{g1}: ranking, genes, e tempos por trecho da ultima), {HISTORY} (todas as geracoes), '
