@@ -18,7 +18,7 @@ static bool enabled = false;
 static std::string iniPath, baseDir, runDir;
 static FILETIME iniStamp{};
 static unsigned int lastIniCheck = 0;
-static std::ofstream summary, csv;
+static std::ofstream summary;
 
 // --- Settings (ini) --------------------------------------------------------------------------------------------------
 
@@ -77,7 +77,6 @@ struct Settings {
     float areaRadius = 1300.0f;                       // a run ends this far from the origin
     float carTraction = 0.0f;                         // > 0: CAutomobile::m_fCarTraction of the AI car (normally 1)
 };
-static Settings cfg;
 
 static std::vector<float> ParseFloats(const std::string& s) {
     std::vector<float> out;
@@ -100,6 +99,10 @@ static std::vector<std::string> ParseWords(const std::string& s) {
     return out;
 }
 
+static void SetRunnerSettings(const Settings& a, const Settings& b);
+static int numRunners = 1;
+static float laneShiftB = 40.0f;
+
 static void ReadSettings() {
     CIniReader ini(iniPath);
     Settings s;
@@ -121,32 +124,39 @@ static void ReadSettings() {
     b("Proving", "Pause", s.pause);
     f("Proving", "CarTraction", s.carTraction);
 
-    str("Steer", "Mode", s.mode);
-    f("Steer", "LookaheadTime", s.lookTime);
-    f("Steer", "LookaheadMin", s.lookMin);
-    f("Steer", "LookaheadMax", s.lookMax);
-    f("Steer", "Gain", s.gain);
-    f("Steer", "Bandwidth", s.bandwidth);
-    f("Steer", "Damping", s.damping);
-    f("Steer", "Preview", s.preview);
-    f("Steer", "StanleyK", s.stanleyK);
-    f("Steer", "StanleySoft", s.stanleySoft);
-    b("Steer", "FeedForward", s.feedForward);
-    f("Steer", "MaxSteer", s.maxSteer);
-    f("Steer", "SteerRate", s.steerRate);
-    f("Steer", "Smoothing", s.smoothing);
-    f("Steer", "GripClampG", s.gripClampG);
-    b("Steer", "Racer", s.racer);
+    auto control = [&](Settings& s, const std::string& suffix) {
+    const std::string st = "Steer" + suffix, sp = "Speed" + suffix;
+    auto f = [&](const std::string& sec, const char* key, float& v) { v = ini.ReadFloat(sec, key, v); };
+    auto b = [&](const std::string& sec, const char* key, bool& v) { v = ini.ReadInteger(sec, key, v ? 1 : 0) != 0; };
+    auto str = [&](const std::string& sec, const char* key, std::string& v) { v = ini.ReadString(sec, key, v); };
+    str(st, "Mode", s.mode);
+    f(st, "LookaheadTime", s.lookTime);
+    f(st, "LookaheadMin", s.lookMin);
+    f(st, "LookaheadMax", s.lookMax);
+    f(st, "Gain", s.gain);
+    f(st, "Bandwidth", s.bandwidth);
+    f(st, "Damping", s.damping);
+    f(st, "Preview", s.preview);
+    f(st, "StanleyK", s.stanleyK);
+    f(st, "StanleySoft", s.stanleySoft);
+    b(st, "FeedForward", s.feedForward);
+    f(st, "MaxSteer", s.maxSteer);
+    f(st, "SteerRate", s.steerRate);
+    f(st, "Smoothing", s.smoothing);
+    f(st, "GripClampG", s.gripClampG);
+    b(st, "Racer", s.racer);
 
-    f("Speed", "Kp", s.speedKp);
-    f("Speed", "BrakeKp", s.brakeKp);
-    f("Speed", "CruiseGas", s.cruiseGas);
-    f("Speed", "GripG", s.speedGripG);
-    f("Speed", "BrakeG", s.speedBrakeG);
-    f("Speed", "GripFactor", s.gripFactor);
-    b("Speed", "TractionControl", s.tractionControl);
-    b("Speed", "ABS", s.abs);
-    f("Speed", "AbortOffset", s.abortOffset);
+    f(sp, "Kp", s.speedKp);
+    f(sp, "BrakeKp", s.brakeKp);
+    f(sp, "CruiseGas", s.cruiseGas);
+    f(sp, "GripG", s.speedGripG);
+    f(sp, "BrakeG", s.speedBrakeG);
+    f(sp, "GripFactor", s.gripFactor);
+    b(sp, "TractionControl", s.tractionControl);
+    b(sp, "ABS", s.abs);
+    f(sp, "AbortOffset", s.abortOffset);
+    };
+    control(s, "");
     f("Proving", "AreaRadius", s.areaRadius);
 
     for (const std::string& t : s.tests) {
@@ -188,7 +198,12 @@ static void ReadSettings() {
         if (st.size() >= 3) { d.hasStart = true; d.start = CVector2D(st[0], st[1]); d.startHeading = st[2]; }
         s.defs[t] = d;
     }
-    cfg = s;
+    // A/B: a second car on the same course, LaneShift m to the right, with [Steer.B] / [Speed.B] over A's settings
+    numRunners = ini.ReadInteger("Proving", "AB", 0) ? 2 : 1;
+    laneShiftB = ini.ReadFloat("Proving", "LaneShift", laneShiftB);
+    Settings sb = s;
+    control(sb, ".B");
+    SetRunnerSettings(s, sb);
 }
 
 // --- Courses ---------------------------------------------------------------------------------------------------------
@@ -200,7 +215,84 @@ struct Course {
     bool closed = false;
     float length = 0.0f;
 };
-static Course course;
+
+struct Stats {
+    double n = 0, absE = 0, sqE = 0, maxE = 0, speedErr = 0, maxLatG = 0, steerAbs = 0, reversals = 0;
+    double skidFront = 0, skidRear = 0, spin = 0, time = 0;
+    double gainSum = 0, gainN = 0;  // yaw rate / (v tan(steer)): 1/L of the car's turn while the tyres hold
+    float lastSteerDelta = 0.0f, lastSign = 0.0f;
+    float maxSpeed = 0.0f;
+    float t100 = 0.0f;              // full-throttle tests: time to 100 km/h
+    float stopDist = 0.0f;          // brake tests
+};
+
+// One car on the course (A, and B for A/B tests): its settings, course, car and controller state
+struct Runner {
+    const char* tag = "A";
+    float laneShift = 0.0f;         // m to the right of the test's course
+    Settings cfg;
+    Course course;
+    CVehicle* car = nullptr;
+    int carHandle = -1, driverHandle = -1;
+    int nearIdx = 0;
+    float steerCmd = 0.0f, steerOut = 0.0f, gasOut = 0.0f, brakeOut = 0.0f;
+    bool handbrakeOut = false, brakeDone = false, finished = false;
+    float targetKmh = 0.0f, offsetNow = 0.0f, headErrNow = 0.0f, curvNow = 0.0f;
+    CVector prevVel;
+    bool havePrevVel = false;
+    float wheelBase = 2.7f, rearAxleY = -1.35f;    // m; the rear axle from the car's origin (along its forward)
+    float aiGripG = 1.0f, aiAdhesive = 1.0f;       // the AI's sideways grip limit (g) on tarmac, from the game's formula
+    float absScale = 1.0f, tcScale = 1.0f;
+    float playerSteerFactor = 1.0f;                // what the game keeps of a player's wheel at this speed (logged)
+    std::vector<CVector> trail;
+    CVector2D lookPoint;
+    std::string abortWhy;
+    Stats stats;
+    std::ofstream csv;
+};
+static Runner runners[2];
+static Runner* R = &runners[0];
+static void SetRunnerSettings(const Settings& a, const Settings& b) {
+    runners[0].cfg = a;
+    runners[1].cfg = b;
+    runners[0].tag = "A";
+    runners[1].tag = "B";
+    runners[1].laneShift = laneShiftB;
+}
+static Settings& CfgOf(int k) { return runners[k].cfg; }
+static CVehicle* CarOf(int k) { return runners[k].car; }
+// the current runner's state under the names the code had for one car
+#define cfg (R->cfg)
+#define course (R->course)
+#define car (R->car)
+#define carHandle (R->carHandle)
+#define driverHandle (R->driverHandle)
+#define nearIdx (R->nearIdx)
+#define steerCmd (R->steerCmd)
+#define steerOut (R->steerOut)
+#define gasOut (R->gasOut)
+#define brakeOut (R->brakeOut)
+#define handbrakeOut (R->handbrakeOut)
+#define brakeDone (R->brakeDone)
+#define targetKmh (R->targetKmh)
+#define offsetNow (R->offsetNow)
+#define headErrNow (R->headErrNow)
+#define curvNow (R->curvNow)
+#define prevVel (R->prevVel)
+#define havePrevVel (R->havePrevVel)
+#define wheelBase (R->wheelBase)
+#define rearAxleY (R->rearAxleY)
+#define aiGripG (R->aiGripG)
+#define aiAdhesive (R->aiAdhesive)
+#define absScale (R->absScale)
+#define tcScale (R->tcScale)
+#define playerSteerFactor (R->playerSteerFactor)
+#define trail (R->trail)
+#define lookPoint (R->lookPoint)
+#define abortWhy (R->abortWhy)
+#define stats (R->stats)
+#define csv (R->csv)
+#define forRunners for (Runner* rr = runners; rr < runners + numRunners && ((R = rr), true); rr++)
 
 // The course frame of the test being built (its Start, else the ini's Origin/Heading)
 static CVector2D frameOrigin;
@@ -221,6 +313,10 @@ static void BuildCourse(const TestDef& d) {
     course = Course();
     frameOrigin = d.hasStart ? d.start : CVector2D(cfg.origin.x, cfg.origin.y);
     frameHeading = d.hasStart ? d.startHeading : cfg.headingDeg;
+    if (R->laneShift != 0.0f) {
+        const float a = frameHeading * 3.14159265f / 180.0f;
+        frameOrigin += CVector2D(std::sin(a), -std::cos(a)) * R->laneShift;
+    }
     std::vector<CVector2D> local;
     const float kPi = 3.14159265f;
     auto smoothstep = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return 0.5f - 0.5f * std::cos(t * 3.14159265f); };
@@ -243,13 +339,15 @@ static void BuildCourse(const TestDef& d) {
     else if (d.shape == "slalom") {
         // run-in, then a sine through cones 'spacing' apart (cone k at x = runIn + k spacing, alternately left/right),
         // then a run-out
-        for (float x = 0.0f; x <= d.runIn + d.length + 60.0f; x += 0.5f) {
+        // (a whole number of gates: ending mid-wave the course jumped sideways by the amplitude)
+        const float len = std::max(std::round(d.length / d.spacing), 1.0f) * d.spacing;
+        for (float x = 0.0f; x <= d.runIn + len + 60.0f; x += 0.5f) {
             float y = 0.0f;
-            if (x > d.runIn && x < d.runIn + d.length) y = d.amplitude * std::sin(kPi * (x - d.runIn) / d.spacing);
+            if (x > d.runIn && x < d.runIn + len) y = d.amplitude * std::sin(kPi * (x - d.runIn) / d.spacing);
             local.emplace_back(x, y);
         }
         // the cones on the centre line, where the course passes them furthest out
-        for (float x = d.runIn + d.spacing * 0.5f; x < d.runIn + d.length; x += d.spacing) course.cones.push_back(ToWorld({ x, 0.0f }));
+        for (float x = d.runIn + d.spacing * 0.5f; x < d.runIn + len; x += d.spacing) course.cones.push_back(ToWorld({ x, 0.0f }));
     }
     else if (d.shape == "lanechange") {
         // ISO 3888 style: run-in, Out m over to 'amplitude', Hold m there, Back m back, run-out (moose test: 13.5 / 11 /
@@ -359,6 +457,31 @@ static int NearestIndex(const CVector2D& pos, int hint, int window) {
     }
     return best;
 }
+// Where 'pos' is on the course between its points: offset (> 0 left), direction and curvature interpolated (the points'
+// own values step every 0.5 m, and the heading feedback shook the wheel every frame on those steps)
+struct OnCourse { int i; float frac, offset, head, curv; };
+static OnCourse Project(const CVector2D& pos, int hint) {
+    const int n = static_cast<int>(course.p.size());
+    auto at = [&](int k) { return course.closed ? ((k % n) + n) % n : std::clamp(k, 0, n - 1); };
+    OnCourse r{ hint, 0.0f, 0.0f, course.head[hint], course.curv[hint] };
+    for (int a : { at(hint - 1), hint }) {
+        const int b = at(a + 1);
+        if (a == b) continue;
+        const CVector2D ab = course.p[b] - course.p[a];
+        const float len2 = ab.MagnitudeSqr();
+        if (len2 < 1e-6f) continue;
+        const float t = CVector2D::Dot(pos - course.p[a], ab) / len2;
+        if (t < 0.0f || t > 1.0f) continue;
+        r.i = a;
+        r.frac = t;
+        r.head = course.head[a] + WrapPi(course.head[b] - course.head[a]) * t;
+        r.curv = course.curv[a] + (course.curv[b] - course.curv[a]) * t;
+        break;
+    }
+    r.offset = CVector2D::Dot(pos - course.p[hint], CVector2D(-std::sin(r.head), std::cos(r.head)));
+    return r;
+}
+
 static int Advance(int i, float meters) {
     const int n = static_cast<int>(course.p.size());
     const int k = static_cast<int>(meters / 0.5f);
@@ -371,33 +494,10 @@ enum eState { WAIT_GAME, NEXT_CAR, WAIT_MODEL, START_RUN, RUNNING, BETWEEN, DONE
 static eState state = WAIT_GAME;
 static unsigned int stateTime = 0;
 static int carIdx = -1, testIdx = 0, speedIdx = 0, runCount = 0;
-static int carHandle = -1, driverHandle = -1;
-static CVehicle* car = nullptr;
-static int nearIdx = 0;
-static float runT = 0.0f, travelled = 0.0f;
-static float steerCmd = 0.0f, steerOut = 0.0f, gasOut = 0.0f, brakeOut = 0.0f;
-static bool handbrakeOut = false, brakeDone = false;
-static float targetKmh = 0.0f, offsetNow = 0.0f, headErrNow = 0.0f, curvNow = 0.0f;
-static CVector prevVel;
-static bool havePrevVel = false;
-static float wheelBase = 2.7f, rearAxleY = -1.35f; // m; the rear axle from the car's origin (along its forward)
-static float aiGripG = 1.0f, aiAdhesive = 1.0f, absScale = 1.0f, tcScale = 1.0f;                        // the AI's sideways grip limit (g) on tarmac, from the game's formula
-static float playerSteerFactor = 1.0f;              // what the game keeps of a player's wheel at this speed (logged)
-static std::vector<CVector> trail;
-static CVector2D lookPoint;
-static std::string abortWhy;
+static float runT = 0.0f;
 static const TestDef* curTest = nullptr;
 static int curModel = 0;
 
-struct Stats {
-    double n = 0, absE = 0, sqE = 0, maxE = 0, speedErr = 0, maxLatG = 0, steerAbs = 0, reversals = 0;
-    double skidFront = 0, skidRear = 0, spin = 0, time = 0;
-    double gainSum = 0, gainN = 0;  // yaw rate / (v tan(steer)): 1/L of the car's turn while the tyres hold
-    float lastSteerDelta = 0.0f;
-    float maxSpeed = 0.0f;
-    float t100 = 0.0f;              // full-throttle tests: time to 100 km/h
-    float stopDist = 0.0f;          // brake tests
-} stats;
 
 static unsigned int Now() { return CTimer::m_snTimeInMilliseconds; }
 
@@ -432,17 +532,20 @@ static void OpenRunDir() {
 }
 
 static void Restart() {
+    forRunners { RemoveCar(); if (csv.is_open()) csv.close(); }
+    R = runners;
     ReadSettings();
-    RemoveCar();
-    if (csv.is_open()) csv.close();
     OpenRunDir();
     carIdx = -1;
     runCount = 0;
     state = cfg.pause ? DONE : NEXT_CAR;
     stateTime = Now();
-    Log(Format("Proving ground: origin (%.1f, %.1f, %.1f) heading %.0f, driver %s, steer %s, %d cars x %d tests",
+    Log(Format("Proving ground: origin (%.1f, %.1f, %.1f) heading %.0f, driver %s, steer %s, %d cars x %d tests%s",
         cfg.origin.x, cfg.origin.y, cfg.origin.z, cfg.headingDeg, cfg.driver.c_str(), cfg.mode.c_str(),
-        static_cast<int>(cfg.cars.size()), static_cast<int>(cfg.tests.size())));
+        static_cast<int>(cfg.cars.size()), static_cast<int>(cfg.tests.size()), numRunners > 1 ? Format(
+            ", A/B: B %.0f m to the right, steer %s bandwidth %.2f/%.2f, grip factor %.2f/%.2f, brake g %.2f/%.2f", laneShiftB,
+            CfgOf(1).mode.c_str(), CfgOf(0).bandwidth, CfgOf(1).bandwidth, CfgOf(0).gripFactor,
+            CfgOf(1).gripFactor, CfgOf(0).speedBrakeG, CfgOf(1).speedBrakeG).c_str() : ""));
 }
 
 static bool IniChanged() {
@@ -492,11 +595,11 @@ static float ClosedLoopSteer(CVehicle* v, float speed) {
         // at every speed
         const CVector2D rear = pos + fwd * rearAxleY;
         const int ri = NearestIndex(rear, i, 40);
-        const CVector2D rd(std::cos(course.head[ri]), std::sin(course.head[ri]));
-        const float er = CVector2D::Dot(rear - course.p[ri], CVector2D(-rd.y, rd.x));
-        const float pr = WrapPi(carHead - course.head[ri]);
-        const int ahead = Advance(ri, cfg.preview * vv);
-        const float kRef = cfg.feedForward ? course.curv[ahead] : 0.0f;
+        const OnCourse oc = Project(rear, ri);
+        const float er = oc.offset;
+        const float pr = WrapPi(carHead - oc.head);
+        const int ahead = Advance(oc.i, cfg.preview * vv + oc.frac * 0.5f);
+        const float kRef = cfg.feedForward ? (cfg.preview > 0.0f ? course.curv[ahead] : oc.curv) : 0.0f;
         const float wn = cfg.bandwidth;
         const float k = kRef - wn * wn / (vv * vv) * er - 2.0f * cfg.damping * wn / vv * std::sin(pr);
         d = std::atan(L * k);
@@ -676,8 +779,11 @@ static void Control(CVehicle* v) {
 // CAutomobile::ProcessAI -> CCarCtrl::SteerAICarWithPhysics (0x6B52A8)
 static unsigned int steerAiOriginal = 0x437C20;
 static void __cdecl SteerAiHook(CVehicle* v) {
-    if (enabled && v == car && state == RUNNING && cfg.driver != "player" && curTest) { // ai, cjai
-        Control(v);
+    if (enabled && state == RUNNING && curTest) for (int k = 0; k < numRunners; k++) if (v == CarOf(k)) {
+        R = &runners[k];
+        if (R->finished) { v->m_fSteerAngle = 0.0f; v->m_fGasPedal = 0.0f; v->m_fBreakPedal = 1.0f; return; }
+        if (k == 0 && cfg.driver == "player") break; // (the player's car: after its inputs)
+        Control(v); // ai, cjai, and car B
         return;
     }
     reinterpret_cast<void(__cdecl*)(CVehicle*)>(steerAiOriginal)(v);
@@ -686,7 +792,10 @@ static void __cdecl SteerAiHook(CVehicle* v) {
 static unsigned int inputsOriginal = 0x6AD690;
 static void __fastcall InputsHook(CVehicle* v, void*, unsigned char pad) {
     reinterpret_cast<void(__thiscall*)(CVehicle*, unsigned char)>(inputsOriginal)(v, pad);
-    if (enabled && v == car && state == RUNNING && cfg.driver == "player" && curTest) Control(v);
+    if (enabled && state == RUNNING && curTest && v == CarOf(0) && CfgOf(0).driver == "player" && !runners[0].finished) {
+        R = &runners[0];
+        Control(v);
+    }
 }
 
 static void InstallHooks() {
@@ -711,7 +820,8 @@ static void InstallHooks() {
 
 static void StartCsv() {
     if (csv.is_open()) csv.close();
-    const std::string name = Format("%02d_%s_%d_%.0fkmh.csv", runCount, curTest->name.c_str(), curModel, curTest->speeds[speedIdx]);
+    const std::string name = Format("%02d_%s_%d_%.0fkmh%s.csv", runCount, curTest->name.c_str(), curModel, curTest->speeds[speedIdx],
+        numRunners > 1 ? (std::string("_") + R->tag).c_str() : "");
     csv.open(runDir + name, std::ios::trunc);
     csv << "t,dt,x,y,z,heading,speed_kmh,v_fwd,v_lat,yaw_rate,a_long,a_lat,steer_cmd,steer,gas,brake,handbrake,gear,"
            "offset,head_err,course_curv,target_kmh,ws_fl,ws_rl,ws_fr,ws_rr,susp_fl,susp_rl,susp_fr,susp_rr,contact,s,surface,player_factor,status\n";
@@ -760,11 +870,10 @@ static void Record(CVehicle* v, float dt) {
         stats.steerAbs += std::abs(v->m_fSteerAngle) * dt;
         const float dSteer = v->m_fSteerAngle - stats.lastSteerDelta;
         stats.lastSteerDelta = v->m_fSteerAngle;
-        static float lastSign = 0.0f;
         if (std::abs(dSteer) > 0.002f) {
             const float sgn = dSteer > 0.0f ? 1.0f : -1.0f;
-            if (lastSign != 0.0f && sgn != lastSign) stats.reversals++;
-            lastSign = sgn;
+            if (stats.lastSign != 0.0f && sgn != stats.lastSign) stats.reversals++;
+            stats.lastSign = sgn;
         }
         if (ws[0] || ws[2]) stats.skidFront += dt;
         if (ws[1] || ws[3]) stats.skidRear += dt;
@@ -780,9 +889,9 @@ static void Record(CVehicle* v, float dt) {
 static void EndRun(const char* why) {
     if (csv.is_open()) csv.close();
     const double T = std::max(stats.time, 0.001);
-    std::string line = Format("[%02d] %-12s model %3d %4.0f km/h  course %4.0f m  %-9s  offset mean %.2f rms %.2f max %.2f m | speed err %+.1f km/h max %.0f | "
+    std::string line = Format("[%02d%s] %-12s model %3d %4.0f km/h  course %4.0f m  %-9s  offset mean %.2f rms %.2f max %.2f m | speed err %+.1f km/h max %.0f | "
         "lat g max %.2f | steer mean %.3f rad, reversals %.1f/s | skid front %.0f%% rear %.0f%% | 1/L %.3f (L %.2f, model %.2f)",
-        runCount, curTest->name.c_str(), curModel, curTest->speeds[speedIdx], course.length, why, stats.absE / T, std::sqrt(stats.sqE / T), stats.maxE,
+        runCount, numRunners > 1 ? R->tag : "", curTest->name.c_str(), curModel, curTest->speeds[speedIdx], course.length, why, stats.absE / T, std::sqrt(stats.sqE / T), stats.maxE,
         stats.speedErr / T, stats.maxSpeed, stats.maxLatG, stats.steerAbs / T, stats.reversals / T, 100.0 * stats.skidFront / T,
         100.0 * stats.skidRear / T, stats.gainN ? stats.gainSum / stats.gainN : 0.0, stats.gainN ? stats.gainN / stats.gainSum : 0.0, wheelBase);
     if (stats.t100 > 0.0f) line += Format(" | 0-100 %.2f s", stats.t100);
@@ -800,7 +909,11 @@ static CVehicle* MakeCar(int model) {
     Command<COMMAND_SET_CAR_PROOFS>(carHandle, 1, 1, 1, 1, 1);
     CPlayerPed* player = FindPlayerPed();
     const int ph = CPools::GetPedRef(player);
-    if (cfg.driver == "player" || cfg.driver == "cjai") {
+    if (R != runners) {
+        Command<COMMAND_CREATE_RANDOM_CHAR_AS_DRIVER>(carHandle, &driverHandle);
+        Command<COMMAND_SET_CAR_CRUISE_SPEED>(carHandle, 0.0f);
+    }
+    else if (cfg.driver == "player" || cfg.driver == "cjai") {
         Command<COMMAND_WARP_CHAR_INTO_CAR>(ph, carHandle);
     }
     else {
@@ -829,9 +942,9 @@ static CVehicle* MakeCar(int model) {
         const float adhesive = reinterpret_cast<SurfaceInfos_c*>(0xB79538)->GetAdhesiveLimit(&cp);
         aiGripG = 10.0f * adhesive * h->m_fTractionMultiplier / 9.81f;
         aiAdhesive = adhesive;
-        Log(Format("  tarmac adhesive limit %.3f -> AI grip %.2f g", adhesive, aiGripG));
+        if (R == runners) Log(Format("  tarmac adhesive limit %.3f -> AI grip %.2f g", adhesive, aiGripG));
     }
-    Log(Format("\nModel %d: mass %.0f kg, turn mass %.0f, traction mult %.2f loss %.2f bias %.2f, steering lock %.1f deg, "
+    if (R == runners) Log(Format("\nModel %d: mass %.0f kg, turn mass %.0f, traction mult %.2f loss %.2f bias %.2f, steering lock %.1f deg, "
         "brake %.4f bias %.2f, susp force %.2f bias %.2f, CoM (%.2f, %.2f, %.2f), drive %c, wheelbase %.2f m",
         model, h->m_fMass, h->m_fTurnMass, h->m_fTractionMultiplier, h->m_fTractionLoss, h->m_fTractionBias, h->m_fSteeringLock,
         h->m_fBrakeDeceleration, h->m_fBrakeBias, h->m_fSuspensionForceLevel, h->m_fSuspensionBiasBetweenFrontAndRear,
@@ -882,7 +995,7 @@ void Update() {
         Command<COMMAND_FORCE_WEATHER_NOW>(0);
         for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
             CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
-            if (v && v != car && v->m_nCreatedBy == RANDOM_VEHICLE && v != player->m_pVehicle) spawnRemovals.push_back(v);
+            if (v && v->m_nCreatedBy == RANDOM_VEHICLE && v != player->m_pVehicle) spawnRemovals.push_back(v);
         }
         for (int i = 0; i < CPools::ms_pPedPool->m_nSize; i++) {
             CPed* p = CPools::ms_pPedPool->GetAt(i);
@@ -933,7 +1046,8 @@ void Update() {
         return;
 
     case NEXT_CAR:
-        RemoveCar();
+        forRunners RemoveCar();
+        R = runners;
         carIdx++;
         testIdx = 0;
         speedIdx = 0;
@@ -956,16 +1070,21 @@ void Update() {
             return;
         }
         curTest = &cfg.defs[cfg.tests[testIdx]];
-        BuildCourse(*curTest);
-        car = MakeCar(curModel);
-        if (!car) { Log(Format("model %d: could not create the car", curModel)); state = NEXT_CAR; return; }
+        forRunners {
+            BuildCourse(*curTest);
+            car = MakeCar(curModel);
+            if (!car) { Log(Format("model %d: could not create the car", curModel)); state = NEXT_CAR; return; }
+        }
+        R = runners;
         state = START_RUN;
         stateTime = now;
         return;
 
     case START_RUN: {
+        curTest = &CfgOf(0).defs[CfgOf(0).tests[testIdx]];
+        bool ready = true;
+        forRunners {
         if (!car || !CPools::ms_pVehiclePool->IsObjectValid(car)) { state = NEXT_CAR; return; }
-        curTest = &cfg.defs[cfg.tests[testIdx]];
         BuildCourse(*curTest);
         // the collision where it starts must be there first (it fell through the ground teleported 300 m away)
         {
@@ -979,35 +1098,43 @@ void Update() {
             if (!ground) {
                 if (now - stateTime > 8000) { Log("no ground at the start of this course: check Origin / Start"); state = NEXT_CAR; }
                 else if (now - stateTime > 1500 && now - stateTime < 1600) Command<COMMAND_LOAD_SCENE>(p0.x, p0.y, cfg.origin.z);
-                return;
+                ready = false;
             }
         }
-        if (now - stateTime < 500) return; // let the car settle after being made/moved
+        }
+        if (!ready || now - stateTime < 500) return; // (and let the cars settle after being made/moved)
         runCount++;
-        nearIdx = 0;
         runT = 0.0f;
-        travelled = 0.0f;
-        steerOut = steerCmd = 0.0f;
-        stats = Stats();
-        abortWhy.clear();
-        trail.clear();
-        havePrevVel = false;
-        PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
-        brakeDone = false;
-        StartCsv();
+        forRunners {
+            nearIdx = 0;
+            steerOut = steerCmd = 0.0f;
+            stats = Stats();
+            abortWhy.clear();
+            trail.clear();
+            havePrevVel = false;
+            absScale = tcScale = 1.0f;
+            R->finished = false;
+            PlaceCar(car, curTest->startSpeed >= 0.0f ? curTest->startSpeed : curTest->speeds[speedIdx]);
+            brakeDone = false;
+            StartCsv();
+        }
         state = RUNNING;
         stateTime = now;
         return;
     }
 
     case RUNNING: {
-        if (!car || !CPools::ms_pVehiclePool->IsObjectValid(car)) { Log("car lost"); state = NEXT_CAR; return; }
-        // CJ at the wheel of a car driven by the AI's code: the game's STATUS_PHYSICS (AI grip, no player steering
-        // limit, CCarCtrl::SteerAICarWithPhysics -> Control) before every physics frame
-        if (cfg.driver == "cjai") car->m_nStatus = STATUS_PHYSICS;
         const float dt = CTimer::ms_fTimeStep / GAME_SPEED_TO_MPS;
         if (CTimer::m_UserPause || CTimer::m_CodePause) return;
         runT += dt;
+        bool allDone = true;
+        forRunners {
+        if (!car || !CPools::ms_pVehiclePool->IsObjectValid(car)) { Log("car lost"); state = NEXT_CAR; return; }
+        // CJ at the wheel of a car driven by the AI's code: the game's STATUS_PHYSICS (AI grip, no player steering
+        // limit, CCarCtrl::SteerAICarWithPhysics -> Control) before every physics frame
+        if (cfg.driver == "cjai" && R == runners) car->m_nStatus = STATUS_PHYSICS;
+        if (R->finished) continue;
+        allDone = false;
         Record(car, dt);
         if (trail.empty() || (car->GetPosition() - trail.back()).Magnitude() > 1.0f) {
             trail.push_back(car->GetPosition());
@@ -1029,13 +1156,19 @@ void Update() {
         else if (car->GetPosition().z < cfg.origin.z - 5.0f) end = "FELL";
         if (end) {
             EndRun(end);
+            R->finished = true;
+        }
+        }
+        if (allDone) {
             speedIdx++;
             if (speedIdx >= static_cast<int>(curTest->speeds.size())) { speedIdx = 0; testIdx++; }
-            if (testIdx >= static_cast<int>(cfg.tests.size())) { state = NEXT_CAR; return; }
-            // stop the car before the next one
-            car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
-            car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
-            if (car->GetUp().z < 0.3f) { RemoveCar(); car = MakeCar(curModel); if (!car) { state = NEXT_CAR; return; } }
+            if (testIdx >= static_cast<int>(CfgOf(0).tests.size())) { state = NEXT_CAR; return; }
+            forRunners {
+                // stop the car before the next run
+                car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
+                car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
+                if (car->GetUp().z < 0.3f) { RemoveCar(); car = MakeCar(curModel); if (!car) { state = NEXT_CAR; return; } }
+            }
             state = START_RUN;
             stateTime = now;
         }
@@ -1073,18 +1206,19 @@ void Draw() {
         const CVector2D rel(cam.x - cfg.origin.x, cam.y - cfg.origin.y);
         const float cu = std::floor(CVector2D::Dot(rel, d) / cfg.gridSize) * cfg.gridSize;
         const float cv = std::floor(CVector2D::Dot(rel, l) / cfg.gridSize) * cfg.gridSize;
-        const float R = 150.0f;
-        for (float u = cu - R; u <= cu + R; u += cfg.gridSize) {
-            const CVector2D p0 = O + d * u + l * (cv - R), p1 = O + d * u + l * (cv + R);
+        const float span = 150.0f;
+        for (float u = cu - span; u <= cu + span; u += cfg.gridSize) {
+            const CVector2D p0 = O + d * u + l * (cv - span), p1 = O + d * u + l * (cv + span);
             const bool axis = std::abs(u) < 0.01f;
             Line3D({ p0.x, p0.y, z }, { p1.x, p1.y, z }, axis ? CRGBA(255, 80, 80, 200) : CRGBA(255, 255, 255, 70));
         }
-        for (float v = cv - R; v <= cv + R; v += cfg.gridSize) {
-            const CVector2D p0 = O + d * (cu - R) + l * v, p1 = O + d * (cu + R) + l * v;
+        for (float v = cv - span; v <= cv + span; v += cfg.gridSize) {
+            const CVector2D p0 = O + d * (cu - span) + l * v, p1 = O + d * (cu + span) + l * v;
             const bool axis = std::abs(v) < 0.01f;
             Line3D({ p0.x, p0.y, z }, { p1.x, p1.y, z }, axis ? CRGBA(80, 255, 80, 200) : CRGBA(255, 255, 255, 70));
         }
     }
+    forRunners {
     const int n = static_cast<int>(course.p.size());
     for (int i = 0; i + 1 < n + (course.closed ? 1 : 0); i += 2) {
         const CVector2D a = course.p[i], b = course.p[(i + 2) % n];
@@ -1097,6 +1231,8 @@ void Draw() {
         Line3D({ lookPoint.x, lookPoint.y, z }, { lookPoint.x, lookPoint.y, z + 2.5f }, CRGBA(255, 0, 0, 255));
         Line3D(car->GetPosition(), { lookPoint.x, lookPoint.y, z + 0.5f }, CRGBA(255, 0, 0, 160));
     }
+    }
+    R = runners;
 
     CFont::SetBackground(false, false);
     CFont::SetJustify(false);
@@ -1108,14 +1244,54 @@ void Draw() {
     CFont::SetScale(0.4f, 0.9f);
     std::string hud;
     if (state == DONE) hud = "PROVING GROUND: done - edit RealTrafficFix.proving.ini to run again";
-    else if (state == RUNNING && car && curTest) {
-        const float speed = car->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS * 3.6f;
-        hud = Format("PROVING %s  model %d  run %d  t %.1f s  %s %s  |  %.0f / %.0f km/h  offset %+.2f m  steer %+.3f  gas %.2f brake %.2f",
-            curTest->name.c_str(), curModel, runCount, runT, cfg.driver.c_str(), curTest->steer != "none" ? curTest->steer.c_str() : cfg.mode.c_str(),
-            speed, targetKmh, offsetNow, car->m_fSteerAngle, gasOut, brakeOut);
+    else if (state == RUNNING && curTest) {
+        float y = 40.0f;
+        forRunners {
+            if (!car) continue;
+            const float speed = car->m_vecMoveSpeed.Magnitude() * GAME_SPEED_TO_MPS * 3.6f;
+            hud = Format("%s %s  model %d  run %d  t %.1f s  %s  |  %.0f / %.0f km/h  offset %+.2f m (max %.2f)  steer %+.3f  gas %.2f brake %.2f%s",
+                R->tag, curTest->name.c_str(), curModel, runCount, runT, curTest->steer != "none" ? curTest->steer.c_str() : cfg.mode.c_str(),
+                speed, targetKmh, offsetNow, stats.maxE, car->m_fSteerAngle, gasOut, brakeOut, R->finished ? "  (done)" : "");
+            CFont::PrintString(10.0f, y, hud.c_str());
+            y += 22.0f;
+        }
+        R = runners;
+        return;
     }
     else hud = "PROVING GROUND: setting up";
     CFont::PrintString(10.0f, 40.0f, hud.c_str());
 }
 
 } // namespace ProvingGround
+
+#undef cfg
+#undef course
+#undef car
+#undef carHandle
+#undef driverHandle
+#undef nearIdx
+#undef steerCmd
+#undef steerOut
+#undef gasOut
+#undef brakeOut
+#undef handbrakeOut
+#undef brakeDone
+#undef targetKmh
+#undef offsetNow
+#undef headErrNow
+#undef curvNow
+#undef prevVel
+#undef havePrevVel
+#undef wheelBase
+#undef rearAxleY
+#undef aiGripG
+#undef aiAdhesive
+#undef absScale
+#undef tcScale
+#undef playerSteerFactor
+#undef trail
+#undef lookPoint
+#undef abortWhy
+#undef stats
+#undef csv
+#undef forRunners
