@@ -1607,6 +1607,7 @@ void Update() {
         out << Format("spawned cars given the speed of the traffic behind them: %d\n", spawnSpeedMatchCount);
         out << Format("game lane set to the lane the car is really in: %d\n", laneSyncCount);
         out << Format("cars created sunk into the road, put on their wheels: %d\n", sunkSpawnFixCount);
+        out << Format("AI vehicles held still until the map's collision loaded under them: %d; ambient cars made %d, buried at creation (removed) %d\n", collisionHolds, ambientSpawnCount, buriedSpawnCount);
         out << Format("lane board: signalled lane changes given up for a higher priority one: %d\n", boardPreempted);
         out << Format("cars created where they'd be hit and couldn't go with the traffic, removed: %d\n", spawnRemovedCount);
         out << Format("handbrake turns: %d\n", handbrakeTurnCount);

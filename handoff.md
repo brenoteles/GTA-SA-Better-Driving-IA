@@ -3,7 +3,39 @@
 State at the end of the 2026-11-14 session. Read this first, then `docs/sensores.html` (the progress checklist,
 published as https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; it was last updated before the race work below).
 
-## Proving ground (2026-11-14, second session) - read this first
+## 2026-11-15 session: Cadrona with traffic regressed - read this first
+
+Report page: `docs/avancos.html` (published https://claude.ai/artifact/5P8pM1RmV3BGzL4974qwYt): physics findings, what was
+ported, every test since 25/10 (data: `docs/test_history.json`, written by Gemini; its generator script was not saved).
+
+Done this session:
+- `HoldUntilCollision` (RealTrafficFix.cpp): the race mode's fix generalised. AI cars with physics, over 120 m from the
+  player, where `CColStore::HasCollisionLoaded` is false, are frozen (at most 10 s, then 30 s free), and the IPL/
+  collision/path loading is asked for at one of them per frame. Near the player it held a car for good (the queue behind
+  it never moved), hence the 120 m.
+- Ambient spawn: a model not loaded is requested and another spot tried (it used to end the spawn turn); `AmbientSpawnAhead`
+  skips 3 of 4 spots behind a moving player; spots need `HasCollisionLoaded`; the start speed is the mean speed of the cars
+  going that way within 120 m. `SET_LOAD_COLLISION_FOR_CAR_FLAG` on spawned cars made them appear inside the ground: removed.
+- Gemini (agy, gemini-3.8-flash-high) now has write access to this repo and command(*) in
+  `~/.gemini/antigravity-cli/settings.json` (the user asked for full rights). It wrote the history JSON and the HTML; its
+  draft had invented notes and wrong car models in the trip table, corrected before publishing: check its numbers.
+
+Results (Cadrona 527, FAST, Grove -> Bayside, traffic):
+- Before (02/11, 5 runs): 7.19-8.72 min, 1-2 test-car collisions, 0.67-4.62 traffic collisions/min.
+- 15/11 00:06, everything on: 13.66 min, 14 collisions, 5.78/min (79); 867 holds for 946 cars made. Regression.
+- 15/11 00:21, HoldUntilCollision and AmbientSpawnAhead off, stopped at 2.86 km: 3.39 min there with 0 collisions (the run
+  with everything on was at 4.55 min with 2). Better, still slower than 02/11 (~89 km/h average then).
+
+State: both new features are OFF in RealTrafficFix.ini (`HoldUntilCollision = 0`, `AmbientSpawnAhead = 0`); the other spawn
+changes stay on. KinematicSteer and AiABS (from the proving ground, tested without traffic only) are on for all traffic.
+
+Next:
+1. Full Cadrona FAST run with the current ini; if still over ~8.7 min, try `KinematicSteer = 0`, then `AiABS = 0` (or keep
+   both only for racing drivers).
+2. Then retry HoldUntilCollision for far cars only if they really sink (it is only needed where the player is not).
+3. The steer-based turn speed cap for the off-route spots (see the proving ground section below).
+
+## Proving ground (2026-11-14, second session)
 
 A new flat test platform and a bench to learn GTA SA's real car physics, then the results ported to the AI.
 

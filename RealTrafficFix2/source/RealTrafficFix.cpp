@@ -24,6 +24,8 @@
 #include "CWeather.h"
 #include "CWorld.h"
 #include "SurfaceInfos_c.h"
+#include "CColStore.h"
+#include "CIplStore.h"
 #include "CGame.h"
 #include "CCutsceneMgr.h"
 #include "CVehicleModelInfo.h"
@@ -494,6 +496,7 @@ static bool cfgAdaptiveLimits = true;
 // - the AI's grip: 10 x adhesive x tractionMult m/s2 from the formula, but the front axle saturates first; racing lines
 //   were followed within ~0.2-0.5 m at 42% of it (zig-zag, slalom, Z turns, chicanes, a hairpin after 385 km/h)
 static bool cfgKinematicSteer = true;
+static bool cfgAmbientSpawnAhead = true; // ambient cars mostly ahead of a moving player
 static float cfgSteerBandwidth = 1.5f;   // rad/s: the error comes back like a critically damped spring at every speed
 static bool cfgAiAbs = true;
 static float cfgRacerGripShare = 0.42f;  // racing drivers' curve speeds: this share of the formula's AI grip
@@ -1044,14 +1047,24 @@ static void UpdateAmbientSpawn() {
     // No more than the roads around hold (Bayside, a few one-lane roads, got 70 cars and locked up)
     if (ambientNear >= ambientCapacity) return;
 
+    // Where the player is going: cars made ahead of a moving player (made behind, a player at speed never met them)
+    CVector2D heading(0.0f, 0.0f);
+    {
+        CVehicle* pv = FindPlayerVehicle(-1, false);
+        const CVector vel = pv ? pv->m_vecMoveSpeed : player->m_vecMoveSpeed;
+        if (vel.Magnitude2D() * GAME_SPEED_TO_MPS > 8.0f) heading = vel.To2D() * (1.0f / vel.Magnitude2D());
+    }
     // A few tries at random spots this time
-    for (int attempt = 0; attempt < 6; attempt++) {
+    for (int attempt = 0; attempt < 8; attempt++) {
         const CNodeAddress addr = ambientNodes[CGeneral::GetRandomNumberInRange(0, static_cast<int>(ambientNodes.size()))];
         CPathNode* node = GetNode(addr);
         if (!node) continue;
         CVector nodePos = GetNodePos(node);
         float dist = (nodePos - center).Magnitude2D();
         if (dist < cfgAmbientMinDist || dist > cfgAmbientMaxDist || std::abs(nodePos.z - center.z) > 40.0f) continue;
+        // behind a moving player: mostly skipped (one in four kept: the roads behind aren't left empty)
+        if (cfgAmbientSpawnAhead && heading.MagnitudeSqr() > 0.5f && CVector2D::Dot((nodePos - center).To2D(), heading) < -0.3f * dist &&
+            CGeneral::GetRandomNumberInRange(0, 4) != 0) continue;
         // Which way: one of the two neighbours with lanes towards it
         int k = CGeneral::GetRandomNumberInRange(0, 2);
         CNodeAddress toAddr = GetAdjacentNode(node, addr, k);
@@ -1088,14 +1101,21 @@ static void UpdateAmbientSpawn() {
         bool groundFound = false;
         float groundZ = FindGroundZ({ pos.x, pos.y, pos.z + 2.0f }, &groundFound);
         if (!groundFound || std::abs(groundZ - nodePos.z) > 3.0f) continue; // collision not loaded there yet
+        if (!CColStore::HasCollisionLoaded(pos, 0)) continue;           // (nor its streamed part: the car would sink)
         // The model the game's population would pick here, loaded, a road vehicle
         int carClass = 0;
         int model = CCarCtrl::ChooseModel(&carClass);
-        if (model <= 0 || CStreaming::ms_aInfoForModel[model].m_nLoadState != LOADSTATE_LOADED) return;
+        if (model <= 0) continue;
+        if (CStreaming::ms_aInfoForModel[model].m_nLoadState != LOADSTATE_LOADED) {
+            // Asked for (the next ones get more variety than the few models loaded) and another spot tried: one model not
+            // loaded ended the whole spawn turn
+            CStreaming::RequestModel(model, 0);
+            continue;
+        }
         CBaseModelInfo* mi = CModelInfo::GetModelInfo(model);
-        if (!mi || mi->GetModelType() != MODEL_INFO_VEHICLE) return;
+        if (!mi || mi->GetModelType() != MODEL_INFO_VEHICLE) continue;
         int vtype = static_cast<CVehicleModelInfo*>(mi)->m_nVehicleType;
-        if (vtype != VEHICLE_AUTOMOBILE && vtype != VEHICLE_BIKE && vtype != VEHICLE_QUAD) return;
+        if (vtype != VEHICLE_AUTOMOBILE && vtype != VEHICLE_BIKE && vtype != VEHICLE_QUAD) continue;
 
         int handle = -1, driver = -1;
         Command<COMMAND_CREATE_CAR>(model, pos.x, pos.y, groundZ + 1.0f, &handle);
@@ -1135,8 +1155,21 @@ static void UpdateAmbientSpawn() {
         Command<COMMAND_CAR_WANDER_RANDOMLY>(handle);
         Command<COMMAND_SET_CAR_CRUISE_SPEED>(handle, 20.0f);
         Command<COMMAND_SET_CAR_DRIVING_STYLE>(handle, 0);
-        // Already moving with the traffic of that road
+        // Already moving with the traffic of that road: the speed of the cars going its way within 120 m, else the road's
         float speed = node->Speed >= 2 ? 22.0f : (node->Speed == 1 ? 12.0f : 7.0f);
+        {
+            float sum = 0.0f;
+            int n = 0;
+            for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
+                CVehicle* o = CPools::ms_pVehiclePool->GetAt(i);
+                if (!o || o == veh || !o->m_pDriver || (o->GetPosition() - pos).Magnitude2D() > 120.0f) continue;
+                const CVector2D ov = o->m_vecMoveSpeed.To2D() * GAME_SPEED_TO_MPS;
+                if (CVector2D::Dot(ov, d) < 3.0f || std::abs(o->GetPosition().z - pos.z) > 4.0f) continue;
+                sum += CVector2D::Dot(ov, d);
+                n++;
+            }
+            if (n >= 2) speed = std::clamp(sum / n, 5.0f, 35.0f);
+        }
         veh->m_vecMoveSpeed = CVector(d.x, d.y, 0.0f) * (speed / GAME_SPEED_TO_MPS);
         if (cfgAmbientKeepDist > 0.0f) {
             vehExData.Get(veh).forceDrive = true; // a mission car while it's kept: the mod drives it anyway
@@ -1291,6 +1324,64 @@ static void RemoveBrokenDown() {
 }
 
 // Cars created where they'd be hit (see MatchSpawnSpeed): removed the way the game removes distant cars
+// Cars on the map's collision only (race mode, generalised): the game loads the collision, the map's objects (IPLs: an
+// elevated road isn't there at all far from the player) and the road data around the player only, and a car where they
+// aren't fell through the road (the race AI's car at z -56, test 174139; cars made far out sank into the road). Every
+// AI vehicle with physics where the collision isn't loaded is held still (frozen) until it is, and the loading is asked
+// for where one of them is (one place a frame: the game keeps one such request)
+static int collisionHolds = 0;
+static std::unordered_map<CVehicle*, unsigned int> heldForCollision, releasedFromHold; // since when
+static bool cfgHoldUntilCollision = true;
+static void HoldUntilCollision() {
+    if (!cfgHoldUntilCollision) return;
+    CPlayerPed* player = FindPlayerPed();
+    if (!player) return;
+    static int rr = 0;
+    CVehicle* ask = nullptr;
+    int seen = 0;
+    for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
+        CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
+        if (!v) continue;
+        const bool held = heldForCollision.count(v) > 0;
+        // (only away from the player: around the player the game loads it anyway, and the check held a car there for good
+        // with the traffic queued behind it, test 235450; never more than 10 s)
+        const bool candidate = v->m_pDriver && !v->m_pDriver->IsPlayer() && v->m_nStatus == STATUS_PHYSICS &&
+            (v->m_nVehicleSubClass == VEHICLE_AUTOMOBILE || v->m_nVehicleSubClass == VEHICLE_BIKE || v->m_nVehicleSubClass == VEHICLE_QUAD) &&
+            (v->GetPosition() - player->GetPosition()).Magnitude() > 120.0f &&
+            (!held || CTimer::m_snTimeInMilliseconds - heldForCollision[v] < 10000) &&
+            (!releasedFromHold.count(v) || CTimer::m_snTimeInMilliseconds - releasedFromHold[v] > 30000);
+        if (!candidate && !held) continue;
+        const CVector at = v->GetPosition();
+        const bool loaded = CColStore::HasCollisionLoaded(at, 0);
+        const int handle = CPools::GetVehicleRef(v);
+        if (!loaded && candidate && !held) {
+            Command<COMMAND_FREEZE_CAR_POSITION>(handle, 1);
+            heldForCollision[v] = CTimer::m_snTimeInMilliseconds;
+            collisionHolds++;
+        }
+        else if (held && (loaded || !candidate)) {
+            Command<COMMAND_FREEZE_CAR_POSITION>(handle, 0);
+            heldForCollision.erase(v);
+            releasedFromHold[v] = CTimer::m_snTimeInMilliseconds;
+            continue;
+        }
+        if (!loaded && candidate) {
+            if (seen++ == rr % std::max(1, static_cast<int>(heldForCollision.size()))) ask = v;
+        }
+    }
+    // (vehicles gone while held)
+    for (auto it = heldForCollision.begin(); it != heldForCollision.end();)
+        if (!CPools::ms_pVehiclePool->IsObjectValid(it->first)) it = heldForCollision.erase(it); else ++it;
+    if (releasedFromHold.size() > 200) releasedFromHold.clear();
+    rr++;
+    if (ask) {
+        const CVector at = ask->GetPosition();
+        CIplStore::AddIplsNeededAtPosn(at);
+        CColStore::AddCollisionNeededAtPosn(at);
+        ThePaths.SetPathsNeededAtPosition(at);
+    }
+}
+
 static void RemoveBadSpawns() {
     for (CVehicle* veh : spawnRemovals) {
         if (!CPools::ms_pVehiclePool->IsObjectValid(veh) || veh->m_nCreatedBy != RANDOM_VEHICLE || veh->GetIsOnScreen()) continue;
@@ -4826,6 +4917,8 @@ public:
         ReadIniBool(ini, "SteerRateLimit", cfgSteerRateLimit);
         ReadIniBool(ini, "LaneKeep", cfgLaneKeep);
         ReadIniBool(ini, "KinematicSteer", cfgKinematicSteer);
+        ReadIniBool(ini, "HoldUntilCollision", cfgHoldUntilCollision);
+        ReadIniBool(ini, "AmbientSpawnAhead", cfgAmbientSpawnAhead);
         ReadIniFloat(ini, "SteerBandwidth", cfgSteerBandwidth);
         ReadIniBool(ini, "AiABS", cfgAiAbs);
         ReadIniFloat(ini, "RacerGripShare", cfgRacerGripShare);
@@ -5057,6 +5150,8 @@ public:
             RemoveBrokenDown();
             WdStage("RemoveBadSpawns");
             RemoveBadSpawns();
+            WdStage("HoldUntilCollision");
+            HoldUntilCollision();
             // MixSets writes its own out-of-sight despawn distance (0.6 x VehDespawnOffScr) after us: set ours again once
             // every mod has loaded. Only the opcode is checked ("mov dword ptr [esp+34h], imm32")
             if (frameCounter == 60 && cfgDespawnOffScreen > 0.0f) {
