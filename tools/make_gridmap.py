@@ -1,0 +1,164 @@
+"""The proving grid: a new, empty, flat map area (after BeamNG's 'Gridmap Small Pure') for the vehicle physics tests.
+
+A platform of 100 m tiles high above the sea south of Los Santos (nothing of the map reaches that height), textured with a
+10 m grid (a heavier line every 50 m), tarmac collision. Written from scratch as a modloader mod: the tile's model (.dff),
+texture (.txd), collision (.col), its object definition (.ide) and the tiles' placement (.ipl).
+
+python tools/make_gridmap.py [game dir]      -> <game>/modloader/RealTrafficFix ProvingGrid/
+"""
+import math
+import os
+import struct
+import sys
+
+import numpy as np
+
+MODEL_ID = 19400                 # free in the game's and the installed mods' .ide files (18631-19999 unused)
+NAME = 'pg_grid'
+TILE = 100.0                     # m
+X0, X1 = 500.0, 2900.0           # the platform (world): 2.4 km east-west
+Y0, Y1 = -2950.0, -2150.0        # 0.8 km north-south
+Z = 300.0                        # its surface
+RW = 0x1803FFFF                  # RenderWare 3.6.0.3 (San Andreas)
+TEX = 512                        # texture size: 50 m of ground (5 cells of 10 m)
+TEX_M = 50.0
+SURFACE_TARMAC = 1
+
+
+def chunk(kind, data):
+    return struct.pack('<III', kind, len(data), RW) + data
+
+
+def rw_string(s):
+    b = s.encode('ascii') + b'\0'
+    b += b'\0' * (-len(b) % 4)
+    return chunk(0x02, b)
+
+
+# --- Texture -------------------------------------------------------------------------------------------------------------
+
+def grid_texture():
+    rng = np.random.default_rng(1)
+    img = np.full((TEX, TEX, 3), 168.0)
+    img += rng.normal(0, 4, (TEX, TEX, 1))                        # a little grain
+    px = TEX / (TEX_M / 10.0)                                     # pixels per 10 m
+    for i in range(int(TEX_M / 10.0) + 1):
+        c = int(round(i * px)) % TEX
+        heavy = i == 0
+        w = 6 if heavy else 3
+        col = (40, 40, 40) if heavy else (85, 85, 85)
+        for k in range(-w // 2, w - w // 2):
+            img[(c + k) % TEX, :, :] = col
+            img[:, (c + k) % TEX, :] = col
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def txd(img):
+    levels = []
+    cur = img.astype(np.float32)
+    while True:
+        h, w = cur.shape[:2]
+        bgra = np.concatenate([cur[..., ::-1], np.full((h, w, 1), 255.0)], axis=2).astype(np.uint8)
+        levels.append(bgra.tobytes())
+        if w == 1:
+            break
+        cur = cur.reshape(h // 2, 2, w // 2, 2, 3).mean(axis=(1, 3))
+    name = NAME.encode().ljust(32, b'\0')
+    data = struct.pack('<II', 9, 0x1106)                          # D3D9; linear mip-mapped filter, wrap U/V
+    data += name + b'\0' * 32
+    data += struct.pack('<II', 0x0600 | 0x8000, 22)               # 888 with mip levels; D3DFMT_X8R8G8B8
+    data += struct.pack('<HHBBBB', TEX, TEX, 32, len(levels), 4, 0)
+    for lv in levels:
+        data += struct.pack('<I', len(lv)) + lv
+    native = chunk(0x15, chunk(0x01, data) + chunk(0x03, b''))
+    return chunk(0x16, chunk(0x01, struct.pack('<HH', 1, 0)) + native + chunk(0x03, b''))
+
+
+# --- Model ---------------------------------------------------------------------------------------------------------------
+
+def dff():
+    n = 11                                                        # 11 x 11 vertices: 10 m quads
+    verts, uvs = [], []
+    for j in range(n):
+        for i in range(n):
+            x = -TILE / 2 + TILE * i / (n - 1)
+            y = -TILE / 2 + TILE * j / (n - 1)
+            verts.append((x, y, 0.0))
+            uvs.append((x / TEX_M, y / TEX_M))                    # tiles start on a 50 m line: seamless
+    tris = []
+    for j in range(n - 1):
+        for i in range(n - 1):
+            a, b, c, d = j * n + i, j * n + i + 1, (j + 1) * n + i + 1, (j + 1) * n + i
+            tris += [(a, b, c), (a, c, d)]                        # counter-clockwise seen from above
+    nv, nt = len(verts), len(tris)
+    flags = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | (1 << 16)  # positions, textured, prelit, normals, light, modulate; 1 uv set
+    g = struct.pack('<Iiii', flags, nt, nv, 1)
+    g += b''.join(struct.pack('<4B', 255, 255, 255, 255) for _ in verts)
+    g += b''.join(struct.pack('<ff', u, v) for u, v in uvs)
+    for a, b, c in tris:
+        g += struct.pack('<HHHH', b, a, 0, c)                     # v1, v0, material, v2
+    g += struct.pack('<ffff', 0.0, 0.0, 0.0, TILE * 0.71)        # bounding sphere
+    g += struct.pack('<ii', 1, 1)
+    g += b''.join(struct.pack('<fff', *v) for v in verts)
+    g += b''.join(struct.pack('<fff', 0.0, 0.0, 1.0) for _ in verts)
+    tex = chunk(0x06, chunk(0x01, struct.pack('<HH', 0x1106, 1)) + rw_string(NAME) + rw_string('') + chunk(0x03, b''))
+    mat = chunk(0x07, chunk(0x01, struct.pack('<i4Biifff', 0, 255, 255, 255, 255, 0, 1, 1.0, 1.0, 1.0)) + tex + chunk(0x03, b''))
+    matlist = chunk(0x08, chunk(0x01, struct.pack('<ii', 1, -1)) + mat)
+    # Bin Mesh PLG: one triangle list
+    idx = [i for t in tris for i in t]
+    binmesh = chunk(0x50E, struct.pack('<III', 0, 1, len(idx)) + struct.pack('<II', len(idx), 0) +
+                    struct.pack(f'<{len(idx)}I', *idx))
+    geom = chunk(0x0F, chunk(0x01, g) + matlist + chunk(0x03, binmesh))
+    geomlist = chunk(0x1A, chunk(0x01, struct.pack('<i', 1)) + geom)
+    frame = struct.pack('<9f3fii', 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, -1, 0)
+    framename = chunk(0x0253F2FE, NAME.encode())                  # the game finds the model by its frame's name
+    framelist = chunk(0x0E, chunk(0x01, struct.pack('<i', 1) + frame) + chunk(0x03, framename))
+    atomic = chunk(0x14, chunk(0x01, struct.pack('<iiii', 0, 0, 5, 0)) + chunk(0x03, b''))
+    return chunk(0x10, chunk(0x01, struct.pack('<iii', 1, 0, 0)) + framelist + geomlist + atomic + chunk(0x03, b''))
+
+
+def col():
+    h = TILE / 2 + 0.5                                            # overlapping the neighbours: no seam for a wheel's ray
+    body = NAME.encode().ljust(22, b'\0') + struct.pack('<H', MODEL_ID)
+    body += struct.pack('<f3f3f3f', math.hypot(h, h), 0, 0, 0, -h, -h, -1.0, h, h, 1.0)
+    body += struct.pack('<I', 0)                                  # spheres
+    body += struct.pack('<I', 0)                                  # (unused)
+    body += struct.pack('<I', 0)                                  # boxes
+    vs = [(-h, -h, 0.0), (h, -h, 0.0), (h, h, 0.0), (-h, h, 0.0)]
+    body += struct.pack('<I', len(vs)) + b''.join(struct.pack('<3f', *v) for v in vs)
+    faces = [(0, 1, 2), (0, 2, 3)]
+    body += struct.pack('<I', len(faces))
+    for a, b, c in faces:
+        body += struct.pack('<3I4B', a, b, c, SURFACE_TARMAC, 0, 255, 0)
+    return b'COLL' + struct.pack('<I', len(body)) + body
+
+
+def main(game_dir):
+    out = os.path.join(game_dir, 'modloader', 'RealTrafficFix ProvingGrid')
+    stream = os.path.join(out, 'Stream')
+    os.makedirs(stream, exist_ok=True)
+    open(os.path.join(stream, NAME + '.dff'), 'wb').write(dff())
+    open(os.path.join(stream, NAME + '.txd'), 'wb').write(txd(grid_texture()))
+    open(os.path.join(stream, NAME + '.col'), 'wb').write(col())
+    with open(os.path.join(out, 'ProvingGrid.ide'), 'w', newline='\r\n') as f:
+        f.write(f'objs\n{MODEL_ID}, {NAME}, {NAME}, 299, 0\nend\n')
+    # modloader adds new .ide/.ipl files to gta.dat only through gta.dat lines in a text file of the mod
+    with open(os.path.join(out, 'Loader.txt'), 'w', newline='\r\n') as f:
+        f.write('IDE DATA\\MAPS\\ProvingGrid.ide\nIPL DATA\\MAPS\\ProvingGrid.ipl\n')
+    n = 0
+    with open(os.path.join(out, 'ProvingGrid.ipl'), 'w', newline='\r\n') as f:
+        f.write('inst\n')
+        y = Y0 + TILE / 2
+        while y < Y1:
+            x = X0 + TILE / 2
+            while x < X1:
+                f.write(f'{MODEL_ID}, {NAME}, 0, {x:.1f}, {y:.1f}, {Z:.1f}, 0, 0, 0, 1, -1\n')
+                n += 1
+                x += TILE
+            y += TILE
+        f.write('end\n')
+    print(f'{out}: {n} tiles of {TILE:.0f} m, platform x {X0:.0f}..{X1:.0f}, y {Y0:.0f}..{Y1:.0f}, z {Z:.0f}')
+
+
+if __name__ == '__main__':
+    main(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('GTA_SA_DIR', r'C:\Users\death\Games\GTA\GTA San Andreas'))

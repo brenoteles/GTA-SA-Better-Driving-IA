@@ -4625,6 +4625,7 @@ static void ReadProfiles(CIniReader& ini) {
 static std::string DriverTypeName(CVehicle* veh) { return profileNames[vehExData.Get(veh).profile]; }
 
 #include "AutoTest.h"
+#include "ProvingGround.h"
 
 class RealTrafficFix {
 public:
@@ -4645,6 +4646,7 @@ public:
         ReadIniInt(ini, "DebugLevel", cfgDebugLevel);
         cfgDebugLevel = std::clamp(cfgDebugLevel, 1, 2);
         AutoTest::Init(dir);
+        ProvingGround::Init(dir);
         ReadIniInt(ini, "DebugToggleKey", cfgDebugToggleKey);
         ReadIniFloat(ini, "DebugDistance", cfgDebugDistance);
         ReadIniBool(ini, "OnlyInNormal", cfgOnlyInNormal);
@@ -5028,6 +5030,8 @@ public:
             DrawIndicators();
             WdStage("AutoTest::Update");
             AutoTest::Update();
+            WdStage("ProvingGround::Update");
+            ProvingGround::Update();
             WdStage("game");
             // The mod's own time this frame: over 50 ms is a stutter (logged with what it did), the A* searches above all
             QueryPerformanceCounter(&frameT1);
@@ -5044,6 +5048,7 @@ public:
 
         Events::drawingEvent += DrawDebug;
         Events::drawingEvent += AutoTest::Draw;
+        Events::drawingEvent += ProvingGround::Draw;
         Events::menuDrawingEvent += [] { AutoTest::Menu(&FrontEndMenuManager); };
 
         Events::onPauseAllSounds += [] {
