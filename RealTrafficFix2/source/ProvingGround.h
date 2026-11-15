@@ -2826,6 +2826,9 @@ void Update() {
             if (GA::on && GA::steady && clockT - R->doneAt > 0.5f) {
                 // steady state: this run into the archive, a new brain on the lane, from the start again
                 GA::Replace(R->index);
+                // (curTest points into car A's settings, which a new brain on lane A replaces: the old pointer read freed
+                // memory, d.speeds empty -> null, and the game crashed; the crash logs of 15:31 and 15:36)
+                curTest = &CfgOf(0).defs[CfgOf(0).tests[testIdx]];
                 BuildCourse(*curTest);
                 SpawnObstacles();
                 car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
