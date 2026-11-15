@@ -9,6 +9,10 @@ validation of each review, and an HTML viewer of the course and every car's line
   python tools/ga_review.py validate <id> --verdict valid|partial|rejected --notes "..." [--claim "n|ok|evidence"]...
                                                    our check of Gemini's review, claim by claim
   python tools/ga_review.py html                   docs/ga_viewer.html (the data inside: open it in a browser)
+  python tools/ga_review.py pilots [--seed]        pilot profiles from the runs so far (the best balanced, the most
+                                                   precise, the fastest, the most aggressive, the best of each other
+                                                   algorithm) -> RealTrafficFix2/RealTrafficFix.pilots.ini and the
+                                                   database; --seed adds them to ga_state.txt (game closed)
 
 Database: scripts/proving/ga.sqlite (tables generations, individuals, trace, sections, reviews, claims).
 """
@@ -38,7 +42,8 @@ GEMINI_MODEL = 'gemini-4-argon-high'
 # the genes and their ranges (ProvingGround.h, GA::kGenes)
 RANGES = {'Bandwidth': (0.5, 4.0), 'Damping': (0.4, 2.0), 'Preview': (0.0, 0.3), 'LookaheadTime': (0.05, 1.5),
           'LookaheadMin': (3.0, 15.0), 'StanleyK': (0.3, 5.0), 'Gain': (0.5, 1.3), 'Smoothing': (0.0, 0.12),
-          'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 1.5)}
+          'GripFactor': (0.3, 0.75), 'BrakeG': (0.5, 1.6), 'Kp': (0.1, 1.0), 'BrakeKp': (0.2, 1.5),
+          'GripTight': (0.6, 1.6), 'GripFast': (0.6, 1.6), 'LearnRate': (0.0, 0.4)}
 GENES = list(RANGES)
 
 SCHEMA = """
@@ -55,12 +60,18 @@ CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, gen_fr
     created TEXT, model TEXT, prompt TEXT, gemini TEXT, verdict TEXT DEFAULT 'pending', notes TEXT, validated TEXT);
 CREATE TABLE IF NOT EXISTS claims (review_id INTEGER, n INTEGER, claim TEXT, verdict TEXT, evidence TEXT,
     PRIMARY KEY (review_id, n));
+CREATE TABLE IF NOT EXISTS pilots (name TEXT PRIMARY KEY, mode TEXT, genes TEXT, why TEXT, gen INTEGER, car TEXT,
+    score REAL, time_s REAL, mean_m REAL, max_m REAL, created TEXT);
 """
+PILOTS_INI = os.path.join(REPO, 'RealTrafficFix2', 'RealTrafficFix.pilots.ini')
+STATE = os.path.join(PROVING, 'ga_state.txt')
 
 
 def db():
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
+    if 'label' not in [r[1] for r in c.execute('PRAGMA table_info(individuals)')]:
+        c.execute('ALTER TABLE individuals ADD COLUMN label TEXT')
     return c
 
 
@@ -116,9 +127,10 @@ def ingest(quiet=False):
             by[(int(r['generation']), r['car'])] = r
         for (g, car), r in by.items():
             genes = {k: float(r[k]) for k in GENES if k in r}
-            c.execute('INSERT OR REPLACE INTO individuals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            c.execute('INSERT OR REPLACE INTO individuals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                       (g, int(r['rank']), car, r['mode'], float(r['score']), r['result'], float(r['time_s']),
-                       float(r.get('mean_m') or 0), float(r['rms_m']), float(r['max_m']), float(r['out_s']), float(r['reached_m']), json.dumps(genes)))
+                       float(r.get('mean_m') or 0), float(r['rms_m']), float(r['max_m']), float(r['out_s']), float(r['reached_m']),
+                       json.dumps(genes), r.get('label') or ''))
             gens.add(g)
         for g in gens:
             ind = c.execute('SELECT car, mode, score, result FROM individuals WHERE gen=? ORDER BY score', (g,)).fetchall()
@@ -203,10 +215,10 @@ def report(c, g0, g1):
             'WHERE gen BETWEEN ? AND ? ORDER BY gen', (g0, g1)):
         L.append(f'\n== Generation {g}: sigma {sigma:.3f}, best {best:.2f} (car {car}, {mode}), mean {mean:.1f}, '
                  f'{fin}/{pop} finished')
-        for r in c.execute('SELECT rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes FROM '
-                           'individuals WHERE gen=? ORDER BY rank', (g,)):
+        for r in c.execute('SELECT rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label '
+                           'FROM individuals WHERE gen=? ORDER BY rank', (g,)):
             genes = json.loads(r[11])
-            L.append(f'  {r[0]:2d}. {r[1]} {r[2]:<9} score {r[3]:8.2f} {r[4]:<7} {r[5]:6.1f} s offset mean {r[6]:.2f} rms {r[7]:.2f} '
+            L.append(f'  {r[0]:2d}. {r[1]} {r[2]:<9}' + (f' [{r[12]}]' if r[12] else '') + f' score {r[3]:8.2f} {r[4]:<7} {r[5]:6.1f} s offset mean {r[6]:.2f} rms {r[7]:.2f} '
                      f'max {r[8]:5.2f} out {r[9]:5.1f} s reached {r[10]:.0f} m | ' + ' '.join(f'{k} {v:.3g}' for k, v in genes.items()))
     g = g1
     rows = c.execute('SELECT car, section, idx, time_s, avg_kmh, mean_offset, max_offset, min_kmh FROM sections WHERE gen=? '
@@ -332,11 +344,11 @@ def write_html(c=None):
     gens = [dict(zip(('gen', 'stamp', 'sigma', 'best', 'car', 'mode', 'mean', 'finished', 'population'), r))
             for r in c.execute('SELECT * FROM generations ORDER BY gen')]
     inds = {}
-    for r in c.execute('SELECT gen, rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes FROM '
-                       'individuals ORDER BY gen, rank'):
+    for r in c.execute('SELECT gen, rank, car, mode, score, result, time_s, mean_m, rms_m, max_m, out_s, reached_m, genes, label '
+                       'FROM individuals ORDER BY gen, rank'):
         inds.setdefault(r[0], []).append({'rank': r[1], 'car': r[2], 'mode': r[3], 'score': r[4], 'result': r[5],
                                          'time': r[6], 'mean': r[7], 'rms': r[8], 'max': r[9], 'out': r[10], 'reached': r[11],
-                                         'genes': json.loads(r[12])})
+                                         'genes': json.loads(r[12]), 'label': r[13] or ''})
     traces = {}
     for g, car, t, x, y, v, off, s, br in c.execute(
             'SELECT gen, car, t, x, y, speed, offset, s, brake FROM trace WHERE CAST(ROUND(t * 4) AS INTEGER) % 2 = 0 '
@@ -365,9 +377,68 @@ def write_html(c=None):
           f'{len(reviews)} reviews')
 
 
+PROFILES = [
+    # name, why, pick from the cars that finished (rows: dicts)
+    ('Equilibrado', 'a melhor pontuacao (tempo + desvio)', lambda rs: min(rs, key=lambda r: r['score'])),
+    ('Preciso', 'o menor desvio medio entre os que nao foram mais lentos que a mediana',
+     lambda rs: min([r for r in rs if r['time'] <= sorted(x['time'] for x in rs)[len(rs) // 2]] or rs, key=lambda r: r['mean'])),
+    ('Veloz', 'o menor tempo com desvio medio ate 0,25 m e nunca mais de 2 m fora da linha',
+     lambda rs: min([r for r in rs if r['mean'] <= 0.25 and r['out'] == 0] or rs, key=lambda r: r['time'])),
+    ('Agressivo', 'a maior aderencia de curva (GripFactor) que chegou sem sair da linha',
+     lambda rs: max([r for r in rs if r['out'] == 0] or rs, key=lambda r: (r['genes']['GripFactor'], -r['score']))),
+]
+
+
+def pilots(seed):
+    c = ingest(quiet=True)
+    rows = [dict(zip(('gen', 'car', 'mode', 'score', 'time', 'mean', 'max', 'out', 'genes'), r)) for r in c.execute(
+        "SELECT gen, car, mode, score, time_s, mean_m, max_m, out_s, genes FROM individuals WHERE result='end'")]
+    for r in rows:
+        r['genes'] = json.loads(r['genes'])
+    if not rows:
+        sys.exit('no finished runs yet')
+    # each profile a car the ones before did not pick (the most aggressive was also the best balanced)
+    chosen = []
+    for name, why, pick in PROFILES:
+        free = [r for r in rows if all((r['gen'], r['car']) != (p[2]['gen'], p[2]['car']) for p in chosen)]
+        chosen.append((name, why, pick(free or rows)))
+    # the best of each algorithm that is not already there (the others went extinct: a way back for them)
+    for mode in sorted({r['mode'] for r in rows}):
+        if any(p[2]['mode'] == mode for p in chosen):
+            continue
+        chosen.append((f'Melhor {mode}', f'a melhor pontuacao do algoritmo {mode}',
+                       min([r for r in rows if r['mode'] == mode], key=lambda r: r['score'])))
+    now = datetime.datetime.now().isoformat(timespec='seconds')
+    with open(PILOTS_INI, 'w', encoding='utf-8') as f:
+        f.write('; Pilot profiles from the proving ground GA (tools/ga_review.py pilots, ' + now + '): the controller of a\n'
+                '; car that stood out, in the [Steer] / [Speed] keys of RealTrafficFix.proving.ini (copy the keys of a\n'
+                '; section there to drive with it). Score = time + 100 x mean offset (m) + 5 x s beyond 2 m, 5.1 km circuit.\n')
+        for name, why, r in chosen:
+            f.write(f'\n; {why}: generation {r["gen"]} car {r["car"]}, score {r["score"]:.1f}, {r["time"]:.1f} s, '
+                    f'mean offset {r["mean"]:.3f} m, max {r["max"]:.2f} m\n[Pilot.{name}]\nMode = {r["mode"]}\n')
+            for k in GENES:
+                f.write(f'{k} = {r["genes"][k]:.4g}\n')
+            c.execute('INSERT OR REPLACE INTO pilots VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                      (name, r['mode'], json.dumps(r['genes']), why, r['gen'], r['car'], r['score'], r['time'], r['mean'],
+                       r['max'], now))
+            print(f'{name:<18} {r["mode"]:<9} gen {r["gen"]:2d} {r["car"]}  score {r["score"]:6.1f}  {r["time"]:6.1f} s  '
+                  f'mean {r["mean"]:.3f}  max {r["max"]:.2f}')
+    c.commit()
+    print(PILOTS_INI)
+    if seed:
+        lines = open(STATE, encoding='utf-8').read().splitlines()
+        names = {name for name, _, _ in chosen}
+        lines = [l for l in lines if not (l.startswith('ind ') and l.split('| ')[-1] in names)]  # (an earlier seed of them)
+        last = max(i for i, l in enumerate(lines) if l.startswith('ind ') or l.startswith('genes'))
+        new = [f'ind {r["mode"]} ' + ' '.join(f'{r["genes"][k]:.4g}' for k in GENES) + f' | {name}' for name, _, r in chosen]
+        open(STATE, 'w', encoding='utf-8').write('\n'.join(lines[:last + 1] + new + lines[last + 1:]) + '\n')
+        print(f'{STATE}: + {len(new)} pilots')
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['ingest', 'wait', 'show', 'validate', 'html', 'report'])
+    ap.add_argument('cmd', choices=['ingest', 'wait', 'show', 'validate', 'html', 'report', 'pilots'])
+    ap.add_argument('--seed', action='store_true')
     ap.add_argument('id', nargs='?', type=int)
     ap.add_argument('--every', type=int, default=5)
     ap.add_argument('--timeout', type=float, default=3 * 3600)
@@ -384,6 +455,8 @@ if __name__ == '__main__':
         show(a.id)
     elif a.cmd == 'validate':
         validate(a.id, a.verdict, a.notes, a.claim)
+    elif a.cmd == 'pilots':
+        pilots(a.seed)
     elif a.cmd == 'report':
         g0, g1 = (int(x) for x in (a.gens or '0-0').split('-'))
         print(report(ingest(quiet=True), g0, g1))

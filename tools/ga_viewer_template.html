@@ -94,6 +94,7 @@ pre { white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospa
 const DATA = /*DATA*/null;
 const COLORS = { A: '#ffd60a', B: '#ff595e', C: '#36a2eb', D: '#4cd964', E: '#ff922b', F: '#af6eff', G: '#00dcdc', H: '#ff69c8', I: '#bee63c', J: '#9aa3b2',
   K: '#a0783c', L: '#788cff', M: '#ffb496', N: '#00a078', O: '#c83c8c', P: '#96c8ff', Q: '#e6d264', R: '#785ac8', S: '#ff7846', T: '#8c8c8c' };
+const colorOf = car => COLORS[car] || `hsl(${(car.charCodeAt(0) * 47) % 360}, 75%, 62%)`; // (cars 21-40)
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -191,13 +192,13 @@ function drawMap() {
     let last = null;
     for (let i = 1; i < pts.length && pts[i][0] <= t; i++) {
       const a = W2S(pts[i - 1][1], pts[i - 1][2]), b = W2S(pts[i][1], pts[i][2]);
-      ctx.strokeStyle = bySpeed ? speedColor(pts[i][3]) : COLORS[car];
+      ctx.strokeStyle = bySpeed ? speedColor(pts[i][3]) : colorOf(car);
       ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
       last = pts[i];
     }
     if (!last) last = pts[0];
     const p = W2S(last[1], last[2]);
-    ctx.fillStyle = COLORS[car]; ctx.strokeStyle = css('--canvas'); ctx.lineWidth = 2;
+    ctx.fillStyle = colorOf(car); ctx.strokeStyle = css('--canvas'); ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 7); ctx.fill(); ctx.stroke();
     ctx.fillStyle = css('--ink'); ctx.font = 'bold 12px system-ui';
     ctx.fillText(`${car} ${last[3]} km/h`, p[0] + 9, p[1] + 4);
@@ -231,7 +232,7 @@ $('play').onclick = () => {
 function renderCars() {
   const ind = DATA.individuals[gen] || [];
   $('cars').innerHTML = ind.slice().sort((a, b) => a.car.localeCompare(b.car)).map(i =>
-    `<span class="chip ${hidden.has(i.car) ? 'off' : ''}" data-car="${i.car}"><span class="dot" style="background:${COLORS[i.car]}"></span>${i.car} · ${esc(i.mode)}</span>`).join('');
+    `<span class="chip ${hidden.has(i.car) ? 'off' : ''}" data-car="${i.car}"><span class="dot" style="background:${colorOf(i.car)}"></span>${i.car} · ${esc(i.mode)}</span>`).join('');
   for (const el of $('cars').children) el.onclick = () => { const c = el.dataset.car; hidden.has(c) ? hidden.delete(c) : hidden.add(c); renderCars(); drawMap(); };
 }
 $('secButtons').innerHTML = DATA.sections.map(([s, n], i) => `<button class="ghost" data-i="${i}">${esc(n)}</button>`).join('');
@@ -247,7 +248,7 @@ function renderRanking() {
   if (!ind.length) { $('ranking').innerHTML = '<div class="empty">Sem dados desta geração.</div>'; return; }
   const genes = Object.keys(ind[0].genes);
   $('ranking').innerHTML = `<table><tr><th>#</th><th class="l">carro</th><th class="l">algoritmo</th><th>pontos</th><th class="l">fim</th><th>tempo</th><th>desvio médio</th><th>máx</th><th>fora</th>${genes.map(g => `<th>${g}</th>`).join('')}</tr>` +
-    ind.map(i => `<tr><td>${i.rank}</td><td class="l"><span class="dot" style="background:${COLORS[i.car]}"></span> ${i.car}</td><td class="l">${esc(i.mode)}</td><td><b>${fmt(i.score, 1)}</b></td>
+    ind.map(i => `<tr><td>${i.rank}</td><td class="l"><span class="dot" style="background:${colorOf(i.car)}"></span> ${i.car}</td><td class="l">${esc(i.mode)}${i.label ? ` <span class="badge b-valid">${esc(i.label)}</span>` : ''}</td><td><b>${fmt(i.score, 1)}</b></td>
       <td class="l ${i.result === 'end' ? 'ok' : 'ko'}">${i.result === 'end' ? 'chegou' : esc(i.result)}</td><td>${fmt(i.time, 1)}</td><td><b>${fmt(i.mean, 2)}</b></td><td>${fmt(i.max, 2)}</td><td>${fmt(i.out, 1)}</td>
       ${genes.map(g => `<td>${fmt(i.genes[g], 3)}</td>`).join('')}</tr>`).join('') + '</table>';
 }
@@ -266,7 +267,7 @@ function renderHeat() {
       return `<td title="média ${fmt(st[cars[k]][i][1], 0)} km/h, desvio médio ${fmt(st[cars[k]][i][3], 2)} m, máx ${fmt(off, 2)} m" style="background:hsla(${(1 - f) * 120},70%,45%,.28)">${fmt(v, 1)}${off > 2 ? ' ⚠' : ''}</td>`;
     }).join('') + '</tr>';
   }).join('');
-  $('heat').innerHTML = `<table class="heat"><tr><th class="l">trecho</th>${cars.map(c => `<th><span class="dot" style="background:${COLORS[c]}"></span> ${c}</th>`).join('')}</tr>${rows}</table>`;
+  $('heat').innerHTML = `<table class="heat"><tr><th class="l">trecho</th>${cars.map(c => `<th><span class="dot" style="background:${colorOf(c)}"></span> ${c}</th>`).join('')}</tr>${rows}</table>`;
 }
 
 function drawChart() {
