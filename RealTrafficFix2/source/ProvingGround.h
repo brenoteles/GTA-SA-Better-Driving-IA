@@ -401,6 +401,8 @@ struct Runner {
     float windNow = 0.0f;
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
+    float nnO0 = 0.0f, nnO1 = 0.0f; // neural2: its outputs, held a frame (Neural2Steer)
+    bool nnHeld = false;
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake); neural2: its speed residual, o[1]
     float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
     float nnIn[kNn2In] = {};        // neural2's inputs as the net saw them this frame, before the command (Trace logs these:
@@ -522,6 +524,15 @@ static void RaceLine(const Course& rd, float room) {
     const bool pins = static_cast<int>(rd.centre.size()) == n;
     std::vector<CVector2D> nrm(n);
     for (int i = 0; i < n; i++) nrm[i] = CVector2D(-std::sin(rd.head[i]), std::cos(rd.head[i]));
+    // the room each point may use: none in a centre part, opening over 150 m (300 points, a smoothstep) out of it (a
+    // hard pin made a kink where a part began: the user, "entre a reta e o vento")
+    std::vector<float> roomAt(n, room);
+    if (pins) {
+        std::vector<int> d(n, 1 << 20);
+        for (int i = 0, last = -(1 << 20); i < n; i++) { if (rd.centre[i]) last = i; d[i] = i - last; }
+        for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (rd.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
+        for (int i = 0; i < n; i++) { const float x = std::clamp(d[i] / 300.0f, 0.0f, 1.0f); roomAt[i] = room * x * x * (3.0f - 2.0f * x); }
+    }
     std::vector<float> next(n);
     for (int span : { 64, 32, 16, 8, 4 })
         for (int it = 0; it < 60; it++) {
@@ -530,7 +541,7 @@ static void RaceLine(const Course& rd, float room) {
                 const CVector2D a = rd.p[i - span] + nrm[i - span] * raceOff[i - span], b = rd.p[i + span] + nrm[i + span] * raceOff[i + span];
                 const CVector2D here = rd.p[i] + nrm[i] * raceOff[i];
                 const float want = raceOff[i] + CVector2D::Dot((a + b) * 0.5f - here, nrm[i]);
-                next[i] = pins && rd.centre[i] ? 0.0f : std::clamp(raceOff[i] + 0.6f * (want - raceOff[i]), -room, room);
+                next[i] = std::clamp(raceOff[i] + 0.6f * (want - raceOff[i]), -roomAt[i], roomAt[i]);
             }
             raceOff.swap(next);
         }
@@ -542,9 +553,13 @@ static void RaceLine(const Course& rd, float room) {
         const float s0 = rd.sections[k].first, s1 = k + 1 < rd.sections.size() ? rd.sections[k + 1].first : rd.length;
         float most = 0.0f;
         int in = 0, pinned = 0;
-        for (int i = 0; i < n; i++) if (rd.s[i] >= s0 && rd.s[i] < s1) { most = std::max(most, std::abs(raceOff[i])); in++; pinned += pins && rd.centre[i]; }
-        Log(Format("racing line (room %.2f m): %-16s up to %.2f m off the middle, %3.0f%% kept in it", room, rd.sections[k].second.c_str(), most,
-            in ? 100.0f * pinned / in : 0.0f));
+        float slope = 0.0f; // (the steepest the line crosses the road: cm a metre)
+        for (int i = 0; i < n; i++) if (rd.s[i] >= s0 && rd.s[i] < s1) {
+            most = std::max(most, std::abs(raceOff[i])); in++; pinned += pins && rd.centre[i];
+            if (i > 0 && rd.s[i] > rd.s[i - 1]) slope = std::max(slope, 100.0f * std::abs(raceOff[i] - raceOff[i - 1]) / (rd.s[i] - rd.s[i - 1]));
+        }
+        Log(Format("racing line (room %.2f m): %-16s up to %.2f m off the middle, %3.0f%% kept in it, steepest %.1f cm/m", room, rd.sections[k].second.c_str(), most,
+            in ? 100.0f * pinned / in : 0.0f, slope));
     }
 }
 
@@ -577,13 +592,13 @@ static void OwnLine() {
         }
         o.swap(t);
     }
-    // the centre stretches: nothing of the genes' own offsets there, faded over 40 m each side (80 points)
+    // the centre stretches: nothing of the genes' own offsets there, faded over 150 m each side (300 points, smoothstep)
     if (static_cast<int>(R->road.centre.size()) == n) {
         std::vector<int> d(n, 1 << 20);
         for (int i = 0, last = -(1 << 20); i < n; i++) { if (R->road.centre[i]) last = i; d[i] = i - last; }
         for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (R->road.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
         for (int i = 0; i < n; i++) {
-            const float w = std::clamp(1.0f - d[i] / 80.0f, 0.0f, 1.0f);
+            const float x = std::clamp(d[i] / 300.0f, 0.0f, 1.0f), w = 1.0f - x * x * (3.0f - 2.0f * x);
             const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * cfg.lineRace : 0.0f;
             o[i] = race + (o[i] - race) * (1.0f - w);
         }
@@ -1251,10 +1266,16 @@ static void Neural2Inputs(CVehicle* v, float* in) {
         const CVector2D dir(std::cos(a), std::sin(a));
         float dist = 60.0f;
         int hint = ni;
-        for (float t = 2.0f; t <= 60.0f && n > 1; t += 2.0f) {
+        // (every 4 m, then the 2 m before the first point out: the same answer as every 2 m, half the work; 160
+        // neural2 cars x 19 rays x 30 points took 5 ms a frame)
+        for (float t = 4.0f; t <= 60.0f && n > 1; t += 4.0f) {
             const CVector2D pt = pos + dir * t;
-            hint = NearestIndexIn(rd, pt, hint, 10);
-            if (std::abs(ProjectIn(rd, pt, hint).offset) > half) { dist = t; break; }
+            hint = NearestIndexIn(rd, pt, hint, 14);
+            if (std::abs(ProjectIn(rd, pt, hint).offset) > half) {
+                const CVector2D pb = pos + dir * (t - 2.0f);
+                dist = std::abs(ProjectIn(rd, pb, NearestIndexIn(rd, pb, hint, 8)).offset) > half ? t - 2.0f : t;
+                break;
+            }
         }
         in[k++] = dist / 60.0f;
     }
@@ -1343,9 +1364,16 @@ static void Neural2Snapshot(CVehicle* v, float vv, int i) {
 
 static float Neural2Steer(CVehicle* v, float vv, int i) {
     float h[kNn2Hid];
+    // the sensors and the net every other frame (lanes alternating), its two outputs held in between; the teacher
+    // every frame (the net's cost grew with the 160 neural2 cars the GA now breeds: 34 fps)
+    const float lock = HandlingLockRad(v);
+    if (R->nnHeld && ((R->index + static_cast<int>(CTimer::m_FrameCounter)) & 1)) {
+        R->teacherSteer = PursuitSteer(v, vv, i);
+        R->nnPedal = R->nnO1;
+        return std::clamp(R->teacherSteer + kNn2SteerSpan * lock * R->nnO0, -lock, lock);
+    }
     Neural2Snapshot(v, vv, i);
     const float* in = R->nnIn;
-    const float lock = HandlingLockRad(v);
     const std::vector<float>& w = cfg.nn;
     if (static_cast<int>(w.size()) < kNN2) { R->nnPedal = 0.0f; return R->teacherSteer; }
     for (int j = 0; j < kNn2Hid; j++) {
@@ -1363,6 +1391,9 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
     }
     // residuals on the teacher (zero output weights: the teacher itself)
     R->nnPedal = o[1];
+    R->nnO0 = o[0];
+    R->nnO1 = o[1];
+    R->nnHeld = true;
     return std::clamp(R->teacherSteer + kNn2SteerSpan * lock * o[0], -lock, lock);
 }
 
@@ -3103,6 +3134,7 @@ static void ResetLane() {
     runT = 0.0f;
     traceNext[R->index] = 0.0f;
     R->runId = ++GA::runIds;
+    R->nnHeld = false; // (a new brain: not the last one's outputs)
     R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
     nearIdx = 0;
     steerOut = steerCmd = 0.0f;
