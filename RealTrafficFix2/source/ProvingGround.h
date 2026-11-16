@@ -515,25 +515,29 @@ static void Geometry(Course& c) {
 static void Log(const std::string& s);
 static std::vector<float> raceOff;
 static std::map<std::string, std::vector<float>> raceCache; // (by the road and the room: worked out once each)
+static std::vector<float> raceRoom;                         // the room each point may use (0: a test in the middle)
+static std::map<std::string, std::vector<float>> raceRoomCache;
 static void RaceLine(const Course& rd, float room) {
     const int n = static_cast<int>(rd.p.size());
     const std::string key = Format("%d|%.2f|%.2f|%.2f|%.2f", n, room, rd.length, rd.head.empty() ? 0.0f : rd.head[n / 2], rd.curv.empty() ? 0.0f : rd.curv[n / 3]);
     auto hit = raceCache.find(key);
-    if (hit != raceCache.end()) { raceOff = hit->second; return; }
+    if (hit != raceCache.end()) { raceOff = hit->second; raceRoom = raceRoomCache[key]; return; }
     raceOff.assign(n, 0.0f);
     if (n < 50 || room <= 0.0f) { raceCache[key] = raceOff; return; }
     const bool pins = static_cast<int>(rd.centre.size()) == n;
     std::vector<CVector2D> nrm(n);
     for (int i = 0; i < n; i++) nrm[i] = CVector2D(-std::sin(rd.head[i]), std::cos(rd.head[i]));
-    // the room each point may use: none in a centre part, opening over 150 m (300 points, a smoothstep) out of it (a
-    // hard pin made a kink where a part began: the user, "entre a reta e o vento")
+    // the room each point may use: none in a test kept in the middle, opening over 80 m (160 points, a smoothstep) out
+    // of it (a hard pin made a kink where a part began: the user, "entre a reta e o vento"; 150 m closed it too early)
     std::vector<float> roomAt(n, room);
     if (pins) {
         std::vector<int> d(n, 1 << 20);
         for (int i = 0, last = -(1 << 20); i < n; i++) { if (rd.centre[i]) last = i; d[i] = i - last; }
         for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (rd.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
-        for (int i = 0; i < n; i++) { const float x = std::clamp(d[i] / 300.0f, 0.0f, 1.0f); roomAt[i] = room * x * x * (3.0f - 2.0f * x); }
+        for (int i = 0; i < n; i++) { const float x = std::clamp(d[i] / 160.0f, 0.0f, 1.0f); roomAt[i] = room * x * x * (3.0f - 2.0f * x); }
     }
+    raceRoom = roomAt;
+    raceRoomCache[key] = roomAt;
     std::vector<float> next(n);
     for (int span : { 64, 32, 16, 8, 4 })
         for (int it = 0; it < 60; it++) {
@@ -595,13 +599,13 @@ static void OwnLine() {
         }
         o.swap(t);
     }
-    // the centre stretches: nothing of the genes' own offsets there, faded over 150 m each side (300 points, smoothstep)
+    // the centre stretches: nothing of the genes' own offsets there, faded over 80 m each side (160 points, smoothstep)
     if (static_cast<int>(R->road.centre.size()) == n) {
         std::vector<int> d(n, 1 << 20);
         for (int i = 0, last = -(1 << 20); i < n; i++) { if (R->road.centre[i]) last = i; d[i] = i - last; }
         for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (R->road.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
         for (int i = 0; i < n; i++) {
-            const float x = std::clamp(d[i] / 300.0f, 0.0f, 1.0f), w = 1.0f - x * x * (3.0f - 2.0f * x);
+            const float x = std::clamp(d[i] / 160.0f, 0.0f, 1.0f), w = 1.0f - x * x * (3.0f - 2.0f * x);
             const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * (netLine ? 1.0f : cfg.lineRace) : 0.0f;
             o[i] = race + (o[i] - race) * (1.0f - w);
         }
@@ -853,14 +857,8 @@ static void BuildCourse(const TestDef& d) {
             v = std::min(v, z.value / 3.6f);
         }
     for (const auto& nm : names) course.sections.emplace_back(course.s[std::clamp(nm.first, 0, n - 1)], nm.second);
-    // a part with a lane change or wind in it: all of it in the middle (the straights between the gusts too: the user
-    // wants the car through the middle of those tests, not cutting across them)
-    for (size_t k = 0; k < course.sections.size(); k++) {
-        const float s0 = course.sections[k].first, s1 = k + 1 < course.sections.size() ? course.sections[k + 1].first : course.length + 1.0f;
-        bool any = false;
-        for (int i = 0; i < n && !any; i++) any = course.s[i] >= s0 && course.s[i] < s1 && course.centre[i];
-        if (any) for (int i = 0; i < n; i++) if (course.s[i] >= s0 && course.s[i] < s1) course.centre[i] = 1;
-    }
+    // (only the lane changes and the gusts themselves in the middle: their whole parts were, and the line closed in
+    // where nothing needed it, at the joins: the user)
     R->road = course;
     OwnLine();
     SpeedProfile(d);
@@ -1384,7 +1382,8 @@ static float PursuitSteer(CVehicle* v, float vv, int i) {
     if (R->nnLine != 0.0f && R->lineRoom > 0.0f) {
         // (the room is the lane's from the middle: the racing line's offset there already used part of it)
         const float base = at < static_cast<int>(raceOff.size()) ? raceOff[at] : 0.0f;
-        const float shift = std::clamp(base + R->nnLine * R->lineRoom, -R->lineRoom, R->lineRoom) - base;
+        const float lim = at < static_cast<int>(raceRoom.size()) ? std::min(raceRoom[at] + 0.1f, R->lineRoom) : R->lineRoom;
+        const float shift = std::clamp(base + R->nnLine * R->lineRoom, -lim, lim) - base;
         aim += CVector2D(-std::sin(course.head[at]), std::cos(course.head[at])) * shift;
     }
     const CVector2D rel = aim - pos;
