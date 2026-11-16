@@ -164,7 +164,7 @@ static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnH
 // n49..n51 were its own wheel and pedals, and the trace, written after Control, logged this frame's command there, so
 // the teachers' labels were these very inputs (correlation 1.000); the net learned to copy them, and in the loop it
 // twitched the wheel 10x more than pursuit on the straight before the 220 m bends and spun in them)
-static constexpr int kNn2In = 63, kNn2Hid = 24, kNN2 = (kNn2In + 1) * kNn2Hid + (kNn2Hid + 1) * 2;
+static constexpr int kNn2In = 85, kNn2Hid = 24, kNn2Out = 3, kNN2 = (kNn2In + 1) * kNn2Hid + (kNn2Hid + 1) * kNn2Out;
 static constexpr float kNn2SteerSpan = 0.25f, kNn2SpeedSpan = 0.3f; // the most it can add: a quarter of the lock, 30% of the speed
 static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
@@ -402,6 +402,7 @@ struct Runner {
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float nnO0 = 0.0f, nnO1 = 0.0f; // neural2: its outputs, held a frame (Neural2Steer)
+    float nnLine = 0.0f, lineRoom = 0.0f; // neural2: its line output (-1..1 of lineRoom, m, across from its own line)
     bool nnHeld = false;
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake); neural2: its speed residual, o[1]
     float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
@@ -574,14 +575,16 @@ static void OwnLine() {
     const float body = R->bodyHalfW > 0.1f ? R->bodyHalfW : 1.0f; // (the first build, before the car is made)
     const float room = std::max(course.halfWidth - body - 0.05f, 0.0f);
     RaceLine(R->road, std::max(room - 0.1f, 0.0f)); // (a little inside the room: the smoothing and the wheel's error)
+    R->lineRoom = room;
+    const bool netLine = cfg.mode == "neural2";
     std::vector<float> o(n), t(n);
     for (int i = 0; i < n; i++) {
         float k = 0.0f;
         int m = 0;
         for (int j = std::max(i - 24, 0); j <= std::min(i + 24, n - 1); j++, m++) k += course.curv[j];
         k /= std::max(m, 1);
-        const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * cfg.lineRace : 0.0f;
-        o[i] = std::clamp(race + room * (cfg.lineBias + cfg.lineCut * std::clamp(k * 25.0f, -1.0f, 1.0f)), -room, room);
+        const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * (netLine ? 1.0f : cfg.lineRace) : 0.0f;
+        o[i] = netLine ? race : std::clamp(race + room * (cfg.lineBias + cfg.lineCut * std::clamp(k * 25.0f, -1.0f, 1.0f)), -room, room);
     }
     for (int pass = 0; pass < 1; pass++) {
         for (int i = 0; i < n; i++) {
@@ -599,7 +602,7 @@ static void OwnLine() {
         for (int i = n - 1, last = 1 << 21; i >= 0; i--) { if (R->road.centre[i]) last = i; d[i] = std::min(d[i], last - i); }
         for (int i = 0; i < n; i++) {
             const float x = std::clamp(d[i] / 300.0f, 0.0f, 1.0f), w = 1.0f - x * x * (3.0f - 2.0f * x);
-            const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * cfg.lineRace : 0.0f;
+            const float race = i < static_cast<int>(raceOff.size()) ? raceOff[i] * (netLine ? 1.0f : cfg.lineRace) : 0.0f;
             o[i] = race + (o[i] - race) * (1.0f - w);
         }
     }
@@ -1341,8 +1344,31 @@ static void Neural2Inputs(CVehicle* v, float* in) {
     in[k++] = contact == 0 ? 1.0f : 0.0f;
     // the grip in use, the crosswind
     in[k++] = std::clamp(std::abs(R->latGNow) / std::max(aiGripG, 0.1f), 0.0f, 2.0f);
-    // (the wind was a 64th input, written past the end of in[63]: Gemini's neural2 review; it stays out until the
-    // network grows an input for it)
+    // 22 more (Gemini's list from the plugin-sdk headers, checked; the car's constants left out: one model, they never
+    // change): each wheel's slip (its rim speed against the ground's), its damper speed, the ground's tilt under it
+    const float vFGame = CVector::Dot(v->m_vecMoveSpeed, v->GetForward());
+    for (int w = 0; w < 4; w++)
+        in[k++] = std::clamp((a->m_fWheelSpeed[w] * 0.5f * v->m_fWheelScale - vFGame) * GAME_SPEED_TO_MPS / 20.0f, -1.0f, 1.0f);
+    for (int w = 0; w < 4; w++)
+        in[k++] = std::clamp((a->m_fWheelsSuspensionCompressionPrev[w] - a->m_fWheelsSuspensionCompression[w]) * 5.0f, -1.0f, 1.0f);
+    for (int w = 0; w < 4; w++) in[k++] = CVector::Dot(a->m_wheelColPoint[w].m_vecNormal, v->GetRight());
+    // the gearbox: the gear and how far into it (an rpm), the wheelspin and the skid the game hears, drive wheels down
+    const cTransmission& tr = v->m_pHandlingData->m_transmissionData;
+    const int gear = std::clamp<int>(v->m_nCurrentGear, 0, std::clamp<int>(tr.m_nNumberOfGears, 1, 5));
+    in[k++] = static_cast<float>(gear) / std::max<int>(tr.m_nNumberOfGears, 1);
+    in[k++] = std::clamp(vFGame / std::max(std::abs(tr.m_aGears[gear].m_fMaxVelocity), 0.05f), -1.0f, 1.0f);
+    in[k++] = std::clamp(v->m_fWheelSpinForAudio / 5.0f, 0.0f, 1.0f);
+    in[k++] = std::clamp(a->m_fGasPedalAudioRevs, 0.0f, 1.0f);
+    in[k++] = a->m_nNumDriveWheelsOnGroundLastFrame / 4.0f;
+    // what the tyres' friction took off the car this frame, sideways and in yaw
+    in[k++] = std::clamp(CVector::Dot(v->m_vecFrictionMoveSpeed, v->GetRight()) * GAME_SPEED_TO_MPS / 2.0f, -1.0f, 1.0f);
+    in[k++] = std::clamp(v->m_vecFrictionTurnSpeed.z * GAME_SPEED_TO_MPS / 0.5f, -1.0f, 1.0f);
+    // its line: the racing line's offset 20, 50 and 100 m on (of the room), the line it asked for last frame
+    for (float m : { 20.0f, 50.0f, 100.0f }) {
+        const int at = n ? Advance(ni, m) : 0;
+        in[k++] = at < static_cast<int>(raceOff.size()) && R->lineRoom > 0.0f ? raceOff[at] / R->lineRoom : 0.0f;
+    }
+    in[k++] = R->nnLine;
     while (k < kNn2In) in[k++] = 0.0f;
 }
 
@@ -1353,7 +1379,15 @@ static float PursuitSteer(CVehicle* v, float vv, int i) {
     const float lock = HandlingLockRad(v);
     const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
     const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), left(-fwd.y, fwd.x);
-    const CVector2D rel = course.p[Advance(i, ld)] - pos;
+    const int at = Advance(i, ld);
+    CVector2D aim = course.p[at];
+    if (R->nnLine != 0.0f && R->lineRoom > 0.0f) {
+        // (the room is the lane's from the middle: the racing line's offset there already used part of it)
+        const float base = at < static_cast<int>(raceOff.size()) ? raceOff[at] : 0.0f;
+        const float shift = std::clamp(base + R->nnLine * R->lineRoom, -R->lineRoom, R->lineRoom) - base;
+        aim += CVector2D(-std::sin(course.head[at]), std::cos(course.head[at])) * shift;
+    }
+    const CVector2D rel = aim - pos;
     return std::clamp(std::atan2(2.0f * wheelBase * std::sin(std::atan2(CVector2D::Dot(rel, left), CVector2D::Dot(rel, fwd))), ld) * cfg.gain, -lock, lock);
 }
 // the teacher, then the sensors of this frame (the teacher is one of them), kept for the net and for Trace
@@ -1376,15 +1410,17 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
         for (int q = 0; q < kNn2In; q++) sum += row[q] * in[q];
         h[j] = std::tanh(sum);
     }
-    float o[2];
-    for (int m = 0; m < 2; m++) {
+    float o[kNn2Out];
+    for (int m = 0; m < kNn2Out; m++) {
         const float* row = &w[kNn2Hid * (kNn2In + 1) + m * (kNn2Hid + 1)];
         float sum = row[kNn2Hid];
         for (int j = 0; j < kNn2Hid; j++) sum += row[j] * h[j];
         o[m] = std::tanh(sum);
     }
-    // residuals on the teacher (zero output weights: the teacher itself)
+    // residuals on the teacher (zero output weights: the teacher itself); the third: its line, across the lane from
+    // the racing line, up to the room (the user: the AI itself in charge of its line; next frame's teacher aims there)
     R->nnPedal = o[1];
+    R->nnLine = o[2];
     R->nnO0 = o[0];
     R->nnO1 = o[1];
     R->nnHeld = true;
@@ -1775,7 +1811,10 @@ static void Control(CVehicle* v) {
         R->tcOn = gas < gasAsked - 0.05f;
     }
     // (gt4 does not learn on the way: the same lap every time)
-    if (!openLoop && cfg.learnRate > 0.0f && speed > 5.0f && R->profile.empty() && cfg.mode != "neural") LearnByResult(speed, dt, brakeAsked);
+    // (not neural2: the speed multipliers by kind of curve changing in the run, the user did not like them; its net's
+    // speed output does that)
+    if (!openLoop && cfg.learnRate > 0.0f && speed > 5.0f && R->profile.empty() && cfg.mode != "neural" && cfg.mode != "neural2")
+        LearnByResult(speed, dt, brakeAsked);
     if (d.handbrakeAt && tp >= 0.0f) hb = true;
     gasOut = gas;
     brakeOut = brake;
@@ -1983,9 +2022,9 @@ static const GeneDef kGenes[] = {
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
     { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
-    { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "" },  // its own line: to one side of the road
-    { "Steer", "LineCut", &Settings::lineCut, -1.0f, 1.0f, "" },    // ... into the inside of the curves (< 0: wide)
-    { "Steer", "LineRace", &Settings::lineRace, 0.0f, 1.0f, "" },   // ... the racing line's share (1: all of it)
+    { "Steer", "LineBias", &Settings::lineBias, -1.0f, 1.0f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" },  // its own line: to one side of the road
+    { "Steer", "LineCut", &Settings::lineCut, -1.0f, 1.0f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" },    // ... into the inside of the curves (< 0: wide)
+    { "Steer", "LineRace", &Settings::lineRace, 0.0f, 1.0f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" },   // ... the racing line's share (1: all of it)
     { "Steer", "MpcHorizon", &Settings::mpcHorizon, 0.3f, 2.0f, "mpc" }, // mpc: how far ahead it simulates (s)
     { "Steer", "MpcWeight", &Settings::mpcWeight, 0.0f, 5.0f, "mpc" },   // ... the weight of the heading there
     { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4" },      // gt4: its profile's acceleration (g)
@@ -1994,7 +2033,7 @@ static const GeneDef kGenes[] = {
     { "Steer", "GapBias", &Settings::gapBias, 0.0f, 3.0f, "gap" },      // gap: the pull of its own line
     { "Speed", "GripTight", &Settings::gripTight, 0.35f, 1.6f, "" }, // the grip in tight curves (<= 15 m) x this (from 0.35: 24 of 60 at 0.6)
     { "Speed", "GripFast", &Settings::gripFast, 0.6f, 1.6f, "" },   // ... in fast ones (>= 150 m)
-    { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "" }, // how fast it learns curves, ABS and TC itself
+    { "Speed", "LearnRate", &Settings::learnRate, 0.0f, 0.4f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" }, // how fast it learns curves, ABS and TC itself
     { "Speed", "CruiseGas", &Settings::cruiseGas, 0.0f, 0.4f, "" },  // the speed controller's base gas
     { "Speed", "AbsMargin", &Settings::absMargin, 0.5f, 1.2f, "" },  // ABS: share of the lock point
     { "Speed", "AbsDrop", &Settings::absDrop, 0.02f, 0.4f, "" },
@@ -2177,6 +2216,19 @@ static void LoadTheta() {
     nn2Stamp = a.ftLastWriteTime;
     Log(Format("neural2: theta loaded (%d weights)", kNN2));
 }
+static void SaveTheta();
+// No theta of this size (a new network: more inputs, the line output): hidden weights small and random, the outputs 0
+// (the teacher itself until ES moves it); the ASI needs no tool for it
+static void InitTheta() {
+    if (static_cast<int>(nn2Theta.size()) == kNN2) return;
+    nn2Theta.assign(kNN2, 0.0f);
+    const float sc = 1.0f / std::sqrt(static_cast<float>(kNn2In));
+    std::mt19937 g(12345);
+    std::normal_distribution<float> nd(0.0f, sc);
+    for (int w = 0; w < kNn2Hid * (kNn2In + 1); w++) nn2Theta[w] = nd(g);
+    SaveTheta();
+    Log(Format("neural2: a new theta (%d inputs, %d hidden, %d outputs: %d weights), outputs 0: its teacher", kNn2In, kNn2Hid, kNn2Out, kNN2));
+}
 static void SaveTheta() {
     {
         std::ofstream f(Nn2Path(), std::ios::trunc);
@@ -2189,6 +2241,7 @@ static void SaveTheta() {
 // Theta and its perturbations onto the neural2 genomes (pairs: +eps, -eps; the first is theta itself)
 static void AssignNn2(Genome* g, int n) {
     LoadTheta();
+    InitTheta();
     const float sg = nn2Es ? nn2Sigma : nn2Noise;
     int j = 0;
     std::vector<float> eps(kNN2);
@@ -2449,8 +2502,10 @@ static int Tournament(const std::vector<double>& avg, int mode = -1) {
     return bestK;
 }
 
+static void ReportPop(int n);
 static void NextGeneration() {
     const int n = numRunners;
+    ReportPop(n);
     // ranked by the average of the generations each genome drove (a new one: this run)
     std::vector<double> avg(n);
     for (int k = 0; k < n; k++) {
@@ -2839,6 +2894,17 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
     WriteReport();
 }
 
+// a generation of the old kind (all its cars at once): its runs into the report
+static void ReportPop(int n) {
+    std::vector<Done> b;
+    for (int k = 0; k < n; k++) b.push_back({ pop[k], res[k], Format("%s", kTags[k]) });
+    std::sort(b.begin(), b.end(), [](const Done& x, const Done& y) { return x.r.score < y.r.score; });
+    double top10 = 0.0;
+    const int n10 = std::min<int>(10, static_cast<int>(b.size()));
+    for (int i = 0; i < n10; i++) top10 += b[i].r.score / std::max(n10, 1);
+    ReportGeneration(generation, b, top10);
+}
+
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
 static std::vector<float> pendingEps;   // a pair's + waiting for its -
@@ -2950,6 +3016,7 @@ static void AssignNn2Lane(Genome& g, int k) {
     nn2Eps[k].clear();
     if (!IsNeural2(g)) return;
     LoadTheta();
+    InitTheta();
     if (static_cast<int>(nn2Theta.size()) != kNN2) return;
     if (!pendingEps.empty()) {
         nn2Eps[k] = pendingEps;
@@ -3164,6 +3231,7 @@ static void ResetLane() {
     traceNext[R->index] = 0.0f;
     R->runId = ++GA::runIds;
     R->nnHeld = false; // (a new brain: not the last one's outputs)
+    R->nnLine = 0.0f;
     R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
     nearIdx = 0;
     steerOut = steerCmd = 0.0f;
