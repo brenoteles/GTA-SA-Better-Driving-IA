@@ -3451,22 +3451,17 @@ static void UpdateCamera(unsigned int now) {
         if (!camEndAt) camEndAt = now;
         if (now - camEndAt > 2500) keep = false;
     }
-    // held to the end of its run, by hand or not (the user: a car to the end of the lap, the last parts too; it changed
-    // to a better pace mid-lap before)
-    if (keep) return;
+    // picked by hand: held to the end of its run
+    if (keep && camPick >= 0) return;
     camPick = -1;
-    // then the best of the same generation still on the road; the newest one when that generation has none left
-    std::vector<int> c = camGen >= 0 ? CamCandidates(camGen) : std::vector<int>();
-    if (c.empty()) c = CamCandidates();
-    if (c.empty()) {
-        if (keep) return;
-        // nobody past 300 m yet: the one furthest on
-        int lead = -1;
-        for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && (lead < 0 || runners[k].sMax > runners[lead].sMax)) lead = k;
-        if (lead >= 0) FollowCar(lead, now);
-        return;
-    }
-    FollowCar(c[0], now);
+    // auto: the first car, the one furthest on of those still driving (the user: "sempre mostre o primeiro carro"); a
+    // new leader only 20 m ahead of the one followed (no jumping between two side by side); the leader home or out:
+    // 2.5 s on it, then the next one first
+    int lead = -1;
+    for (int k = 0; k < numRunners; k++) if (runners[k].result.empty() && (lead < 0 || runners[k].sMax > runners[lead].sMax)) lead = k;
+    if (lead < 0) return;
+    const bool onRoad = keep && f.result.empty();
+    if (!keep || (onRoad && lead != camOn && runners[lead].sMax > f.sMax + 20.0f)) FollowCar(lead, now);
 }
 
 // --- Per frame -------------------------------------------------------------------------------------------------------
