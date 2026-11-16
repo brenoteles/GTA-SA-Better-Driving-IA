@@ -1364,14 +1364,8 @@ static void Neural2Snapshot(CVehicle* v, float vv, int i) {
 
 static float Neural2Steer(CVehicle* v, float vv, int i) {
     float h[kNn2Hid];
-    // the sensors and the net every other frame (lanes alternating), its two outputs held in between; the teacher
-    // every frame (the net's cost grew with the 160 neural2 cars the GA now breeds: 34 fps)
+    // (every frame: its outputs held a frame in between, for speed, made it worse at once, g65: 19 of 340 home)
     const float lock = HandlingLockRad(v);
-    if (R->nnHeld && ((R->index + static_cast<int>(CTimer::m_FrameCounter)) & 1)) {
-        R->teacherSteer = PursuitSteer(v, vv, i);
-        R->nnPedal = R->nnO1;
-        return std::clamp(R->teacherSteer + kNn2SteerSpan * lock * R->nnO0, -lock, lock);
-    }
     Neural2Snapshot(v, vv, i);
     const float* in = R->nnIn;
     const std::vector<float>& w = cfg.nn;
@@ -2785,6 +2779,43 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
         if (d.r.why == "end" && (r.nnHome++ == 0 || d.r.score < r.nnBest)) r.nnBest = d.r.score;
     }
     r.nnReach = r.nnRuns ? reach / r.nnRuns : 0.0;
+    // neural2's best theta kept (proving
+n2_best.txt): a generation of it with 80% of the laps home and its best
+    // score; one under 50% home goes back to it (ES drifted it out of the lane twice, g58 and g65: unattended, it
+    // must not keep getting worse)
+    {
+        static std::vector<float> bestTheta;
+        static double bestNn = 1e18;
+        static bool loaded = false;
+        const std::string path = baseDir + "proving\nn2_best.txt";
+        if (!loaded) {
+            loaded = true;
+            std::ifstream f(path);
+            double sc = 0.0;
+            std::vector<float> w;
+            float x;
+            if (f >> sc) { while (f >> x) w.push_back(x); if (static_cast<int>(w.size()) == kNN2) { bestTheta = w; bestNn = sc; } }
+        }
+        const bool sized = static_cast<int>(nn2Theta.size()) == kNN2;
+        if (sized && r.nnRuns >= 10) {
+            const double home = static_cast<double>(r.nnHome) / r.nnRuns;
+            if (home >= 0.8 && r.nnBest < bestNn) {
+                bestNn = r.nnBest;
+                bestTheta = nn2Theta;
+                std::ostringstream o;
+                o << bestNn;
+                for (float w : bestTheta) o << " " << w;
+                Disk::Write(path, o.str() + "
+");
+                Log(Format("neural2: best theta kept (g%d: %d of %d home, best %.2f)", g, r.nnHome, r.nnRuns, r.nnBest));
+            }
+            else if (home < 0.5 && static_cast<int>(bestTheta.size()) == kNN2) {
+                nn2Theta = bestTheta;
+                SaveTheta();
+                Log(Format("neural2: g%d only %d of %d home: back to the best theta (%.2f)", g, r.nnHome, r.nnRuns, bestNn));
+            }
+        }
+    }
     if (static_cast<int>(nn2Theta.size()) == kNN2) {
         // the output layer's size: 0 = pursuit itself; how far the net has moved from its teacher
         const int out0 = (kNn2In + 1) * kNn2Hid;
