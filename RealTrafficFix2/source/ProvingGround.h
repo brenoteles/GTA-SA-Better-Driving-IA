@@ -1856,15 +1856,20 @@ static void Record(CVehicle* v, float dt) {
         // The road is a corridor between two edges: what has to stay inside is the whole body, not its centre. Each of
         // its four corners on the course (in a curve the body sweeps wider than its centre's path, and the room left
         // shrinks); the room = the edge's distance from the corner nearest to it
+        // (F1's track limits, the user: a wheel or three outside is fine, all four outside is not. The inner edge of
+        // each tyre on the road; the room = how far the one nearest the middle is from the edge it is going over;
+        // < 0: all four past the same edge. It was the body's corner nearest an edge before)
         const CVector2D c0 = v->GetPosition().To2D(), f = v->GetForward().To2D(), rt(f.y, -f.x);
-        float worst = 0.0f;
-        for (float fy : { R->bodyFront, R->bodyRear })
+        const float inner = std::max(R->bodyHalfW - 0.4f, 0.3f);
+        float lo = 1e9f, hi = -1e9f;
+        for (float fy : { rearAxleY + wheelBase, rearAxleY })
             for (float sx : { -1.0f, 1.0f }) {
-                const CVector2D corner = c0 + f * fy + rt * (sx * R->bodyHalfW);
-                const OnCourse oc = ProjectIn(R->road, corner, NearestIndexIn(R->road, corner, nearIdx, 16));
-                worst = std::max(worst, std::abs(oc.offset));
+                const CVector2D tyre = c0 + f * fy + rt * (sx * inner);
+                const OnCourse oc = ProjectIn(R->road, tyre, NearestIndexIn(R->road, tyre, nearIdx, 16));
+                lo = std::min(lo, oc.offset);
+                hi = std::max(hi, oc.offset);
             }
-        R->marginNow = course.halfWidth - worst;
+        R->marginNow = lo > 0.0f ? course.halfWidth - lo : hi < 0.0f ? course.halfWidth + hi : course.halfWidth;
         if (runT > 2.0f) {
             stats.deficit += std::max(edgeComfortGA - R->marginNow, 0.0f) * dt;
             stats.minMargin = std::min<double>(stats.minMargin, R->marginNow);
