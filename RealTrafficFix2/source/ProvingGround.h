@@ -2779,15 +2779,14 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
         if (d.r.why == "end" && (r.nnHome++ == 0 || d.r.score < r.nnBest)) r.nnBest = d.r.score;
     }
     r.nnReach = r.nnRuns ? reach / r.nnRuns : 0.0;
-    // neural2's best theta kept (proving
-n2_best.txt): a generation of it with 80% of the laps home and its best
+    // neural2's best theta kept (proving/nn2_best.txt): a generation of it with 80% of the laps home and its best
     // score; one under 50% home goes back to it (ES drifted it out of the lane twice, g58 and g65: unattended, it
     // must not keep getting worse)
     {
         static std::vector<float> bestTheta;
         static double bestNn = 1e18;
         static bool loaded = false;
-        const std::string path = baseDir + "proving\nn2_best.txt";
+        const std::string path = baseDir + "proving\\nn2_best.txt";
         if (!loaded) {
             loaded = true;
             std::ifstream f(path);
@@ -2805,8 +2804,7 @@ n2_best.txt): a generation of it with 80% of the laps home and its best
                 std::ostringstream o;
                 o << bestNn;
                 for (float w : bestTheta) o << " " << w;
-                Disk::Write(path, o.str() + "
-");
+                Disk::Write(path, o.str() + "\n");
                 Log(Format("neural2: best theta kept (g%d: %d of %d home, best %.2f)", g, r.nnHome, r.nnRuns, r.nnBest));
             }
             else if (home < 0.5 && static_cast<int>(bestTheta.size()) == kNN2) {
