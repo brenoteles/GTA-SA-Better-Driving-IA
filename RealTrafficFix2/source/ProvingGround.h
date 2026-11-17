@@ -2296,6 +2296,11 @@ static float nnSigma = 0.05f;  // mode neural: the mutation of a weight
 static bool nn2Es = false;
 static float nn2Sigma = 0.02f, nn2Alpha = 0.03f, nn2Noise = 0.01f;
 static int nn2Cars = 20;
+// The validation of the net (the user's guide: the best of the training is not the best; look at the validation, stop at
+// a plateau, prefer the stable): the car driving theta itself, unperturbed (AssignNn2's first), is its validation run
+static int thetaCar = -1;
+static double valScore = 0.0, std50Prev = 0.0;
+static bool valHome = false;
 static int nn2Min = 0;   // Nn2Min: at least this many neural2 brains in every generation (the user: 25, so it evolves)
 static float mutRate = 0.3f, sigma0 = 0.15f, sigmaDecay = 0.96f, sigmaMin = 0.03f, modeMutation = 0.1f;
 static float meanPenalty = 100.0f, offPenalty = 5.0f, rmsPenalty = 0.0f, edgePenalty = 1.0f;
@@ -2497,7 +2502,7 @@ static void AssignNn2(Genome* g, int n) {
         const float sign = j == 0 ? 0.0f : j % 2 == 1 ? 1.0f : -1.0f;
         nn2Eps[k].resize(kNN2);
         for (int w = 0; w < kNN2; w++) { nn2Eps[k][w] = sign * eps[w]; g[k].nn[w] = nn2Theta[w] + sg * nn2Eps[k][w]; }
-        if (j == 0) nn2Eps[k].clear();          // (theta itself: shown, not used for the step)
+        if (j == 0) { nn2Eps[k].clear(); thetaCar = k; } // (theta itself: shown, not used for the step: the validation)
         j++;
     }
 }
@@ -2751,6 +2756,8 @@ static int Tournament(const std::vector<double>& avg, int mode = -1) {
 static void ReportPop(int n);
 static void NextGeneration() {
     const int n = numRunners;
+    valHome = thetaCar >= 0 && thetaCar < n && res[thetaCar].why == "end";
+    valScore = thetaCar >= 0 && thetaCar < n ? res[thetaCar].score : 1e9;
     ReportPop(n);
     // ranked by the average of the generations each genome drove (a new one: this run)
     std::vector<double> avg(n);
@@ -2920,6 +2927,8 @@ static int NextBirth() {
 struct GenRow {
     int gen = 0, runs = 0, home = 0, nnRuns = 0, nnHome = 0, esSteps = 0;
     double score = 0.0, time = 0.0, mean = 0.0, top10 = 0.0, sigma = 0.0, nnBest = 0.0, nnReach = 0.0, nnOut = 0.0;
+    double std50 = 0.0, val = -1.0; // the spread of the 50 best; the validation run's score (-1: not home)
+    bool plateau = false;
     std::string stamp, id, mode, genes;
 };
 static std::vector<GenRow> genRows;
@@ -2942,6 +2951,7 @@ static void LoadRows() {
         r.top10 = std::atof(c[9].c_str()); r.sigma = std::atof(c[10].c_str()); r.nnRuns = std::atoi(c[11].c_str());
         r.nnHome = std::atoi(c[12].c_str()); r.nnBest = std::atof(c[13].c_str()); r.nnReach = std::atof(c[14].c_str());
         r.esSteps = std::atoi(c[15].c_str()); r.nnOut = std::atof(c[16].c_str()); r.genes = c[18];
+        if (c.size() >= 21) { r.std50 = std::atof(c[19].c_str()); r.val = std::atof(c[20].c_str()); }
         genRows.push_back(r);
     }
     if (!genRows.empty()) { esSteps = genRows.back().esSteps; WriteReport(); }
@@ -3070,12 +3080,13 @@ static void WriteReport() {
             sumBest, sumWin, sumWin - sumBest);
     }
     h << "<h2>Melhor carro de cada geracao</h2><div class=\"card tw\"><table><tr><th>geracao</th><th>quando</th><th>carro</th><th>algoritmo</th>"
-         "<th>pontos</th><th>tempo</th><th>desvio</th><th>top 10</th><th>chegaram</th><th>neural2</th><th>sigma</th><th>genes</th></tr>";
+         "<th>pontos</th><th>tempo</th><th>desvio</th><th>top 10</th><th>validacao</th><th>dispersao 50</th><th>chegaram</th><th>neural2</th><th>sigma</th><th>genes</th></tr>";
     for (auto it = genRows.rbegin(); it != genRows.rend(); ++it) {
         const GenRow& r = *it;
         h << Format("<tr><td>g%d</td><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%.2f</td><td class=\"num\">%.1f s</td><td class=\"num\">%.3f m</td>"
-                    "<td class=\"num\">%.2f</td><td class=\"num\">%d/%d</td><td class=\"num\">%d/%d%s</td><td class=\"num\">%.3f</td>",
-            r.gen, Html(r.stamp).c_str(), Html(r.id).c_str(), Html(r.mode).c_str(), r.score, r.time, r.mean, r.top10, r.home, r.runs, r.nnHome, r.nnRuns,
+                    "<td class=\"num\">%.2f</td><td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\">%d/%d</td><td class=\"num\">%d/%d%s</td><td class=\"num\">%.3f</td>",
+            r.gen, Html(r.stamp).c_str(), Html(r.id).c_str(), Html(r.mode).c_str(), r.score, r.time, r.mean, r.top10,
+            r.val > 0.0 ? Format("%.2f", r.val).c_str() : "-", Format("%.2f%s", r.std50, r.plateau ? " (plato)" : "").c_str(), r.home, r.runs, r.nnHome, r.nnRuns,
             r.nnHome > 0 ? Format(" (%.1f)", r.nnBest).c_str() : "", r.sigma) << "<td class=\"genes\">" << Html(r.genes) << "</td></tr>";
     }
     h << "</table></div></main></body></html>\n";
@@ -3093,6 +3104,18 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
     r.top10 = top10;
     r.sigma = sigma;
     r.esSteps = esSteps;
+    {
+        // the spread of its 50 best runs home (the stability)
+        std::vector<double> fin;
+        for (const Done& d : batch) if (d.r.why == "end") fin.push_back(d.r.score);
+        std::sort(fin.begin(), fin.end());
+        const int k50 = std::min<int>(50, static_cast<int>(fin.size()));
+        double mu = 0.0, var = 0.0;
+        for (int q = 0; q < k50; q++) mu += fin[q] / k50;
+        for (int q = 0; q < k50; q++) var += (fin[q] - mu) * (fin[q] - mu) / k50;
+        r.std50 = k50 > 1 ? std::sqrt(var) : 0.0;
+        r.val = valHome ? valScore : -1.0;
+    }
     double reach = 0.0;
     for (const Done& d : batch) {
         r.home += d.r.why == "end";
@@ -3120,23 +3143,39 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
             if (f >> sc) { while (f >> x) w.push_back(x); PadTheta(w); if (static_cast<int>(w.size()) == kNN2) { bestTheta = w; bestNn = sc; } }
         }
         const bool sized = static_cast<int>(nn2Theta.size()) == kNN2;
+        static int sinceBest = 0;
         if (sized && r.nnRuns >= 10) {
             const double home = static_cast<double>(r.nnHome) / r.nnRuns;
-            if (home >= 0.8 && r.nnBest < bestNn) {
-                bestNn = r.nnBest;
+            // kept: by its validation run (theta itself, not the luckiest perturbation), in a generation that got 80% home
+            // and did not get less steady (the spread of its 50 best no more than 1.5 x the one before)
+            const bool steadyGen = std50Prev <= 0.0 || r.std50 <= 1.5 * std50Prev;
+            if (home >= 0.8 && valHome && valScore < bestNn && steadyGen) {
+                bestNn = valScore;
                 bestTheta = nn2Theta;
+                sinceBest = 0;
                 std::ostringstream o;
                 o << bestNn;
                 for (float w : bestTheta) o << " " << w;
                 Disk::Write(path, o.str() + "\n");
-                Log(Format("neural2: best theta kept (g%d: %d of %d home, best %.2f)", g, r.nnHome, r.nnRuns, r.nnBest));
+                Log(Format("neural2: best theta kept (g%d: validation %.2f, %d of %d home, spread %.2f)", g, valScore, r.nnHome, r.nnRuns, r.std50));
             }
             else if (home < 0.5 && static_cast<int>(bestTheta.size()) == kNN2) {
                 nn2Theta = bestTheta;
                 SaveTheta();
                 Log(Format("neural2: g%d only %d of %d home: back to the best theta (%.2f)", g, r.nnHome, r.nnRuns, bestNn));
             }
+            else if (++sinceBest >= 5 && static_cast<int>(bestTheta.size()) == kNN2) {
+                // a plateau: 5 generations with no better validation; back to the best before the oscillation, and
+                // the genes searched wider
+                nn2Theta = bestTheta;
+                SaveTheta();
+                sigma = std::min(sigma * 1.5f, sigmaMax);
+                sinceBest = 0;
+                r.plateau = true;
+                Log(Format("neural2: a plateau (5 generations, validation best %.2f): back to the best theta, sigma %.3f", bestNn, sigma));
+            }
         }
+        std50Prev = r.std50;
     }
     if (static_cast<int>(nn2Theta.size()) == kNN2) {
         // the output layer's size: 0 = pursuit itself; how far the net has moved from its teacher
@@ -3173,7 +3212,7 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
     const bool fresh = GetFileAttributesA(RowsPath().c_str()) == INVALID_FILE_ATTRIBUTES && genRows.size() == 1;
     std::string line = fresh ? "gen\tstamp\truns\thome\tid\tmode\tscore\ttime\tmean\ttop10\tsigma\tnn_runs\tnn_home\tnn_best\tnn_reach\tes_steps\tnn_out\t-\tgenes\n" : "";
     line += Format("%d\t%s\t%d\t%d\t%s\t%s\t%.3f\t%.2f\t%.4f\t%.3f\t%.4f\t%d\t%d\t%.3f\t%.0f\t%d\t%.5f\t-\t", r.gen, r.stamp.c_str(), r.runs, r.home,
-        r.id.c_str(), r.mode.c_str(), r.score, r.time, r.mean, r.top10, r.sigma, r.nnRuns, r.nnHome, r.nnBest, r.nnReach, r.esSteps, r.nnOut) + r.genes + "\n";
+        r.id.c_str(), r.mode.c_str(), r.score, r.time, r.mean, r.top10, r.sigma, r.nnRuns, r.nnHome, r.nnBest, r.nnReach, r.esSteps, r.nnOut) + r.genes + Format("\t%.3f\t%.3f", r.std50, r.val) + "\n";
     Disk::Write(RowsPath(), line, true);
     WriteReport();
 }
