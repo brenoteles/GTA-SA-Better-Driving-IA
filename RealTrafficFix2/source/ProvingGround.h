@@ -1451,7 +1451,8 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
     // its lookahead, and the grip it takes for each kind of curve (the multipliers by radius the HUD showed: before
     // learned in the run, LearnByResult; now the net's, every frame, x e^(0.4 out), 0: the planner's own)
     R->nnLook = o[6];
-    for (int b = 0; b < 5; b++) R->learned[b] = std::exp(0.4f * o[7 + b]);
+    // (o[7..11] were the grip x for each kind of curve, through the planner's speed: 37 of 500 home in g115 and g116,
+    // and the user found speed by the curve's distance senseless; kept in the net, unused)
     std::memcpy(R->nnAct, h, sizeof(float) * kNn2Hid);
     std::memcpy(R->nnAct + kNn2Hid, h2, sizeof(float) * kNn2Hid2);
     std::memcpy(R->nnAct + kNn2Hid + kNn2Hid2, o, sizeof(float) * kNn2Out);
@@ -1786,10 +1787,16 @@ static void Control(CVehicle* v) {
     // the ABS and the TC): the pedal itself was its output before, and a P-controller's output (CruiseGas + Kp x the
     // speed error, each car's genes) never fit (R2 0.75, falling) nor launched. targetKmh stays the planner's: the
     // trace logs it and the net reads it (n51)
+    // (now its second output is on the pedal itself: up to half of it more gas or more brake over the teacher's; the
+    // planner's speed for the curves ahead only gives the teacher's pedal: the user, "a velocidade baseada na
+    // distancia da curva nao faz muito sentido")
     if (!openLoop && cfg.mode == "neural2" && !cfg.nn.empty() && d.pedal == "hold") {
-        const float e = vt * (1.0f + kNn2SpeedSpan * std::clamp(R->nnPedal, -1.0f, 1.0f)) - speed;
-        gas = e > -0.5f ? std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f) : 0.0f;
-        brake = e < -1.0f ? std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f) : 0.0f;
+        const float e = vt - speed;
+        const float g0 = e > -0.5f ? std::clamp(cfg.cruiseGas + cfg.speedKp * e, 0.0f, 1.0f) : 0.0f;
+        const float b0 = e < -1.0f ? std::clamp(cfg.brakeKp * (-e - 0.5f), 0.0f, 1.0f) : 0.0f;
+        const float pedal = std::clamp(g0 - b0 + kNn2SpeedSpan * std::clamp(R->nnPedal, -1.0f, 1.0f), -1.0f, 1.0f);
+        gas = std::max(pedal, 0.0f);
+        brake = std::max(-pedal, 0.0f);
     }
     const float brakeAsked = brake;
     if (!openLoop && cfg.abs && brake > 0.0f) {
@@ -1819,6 +1826,9 @@ static void Control(CVehicle* v) {
         R->absOn = brake > allowed;
         brake = std::min(brake, allowed);
     }
+    // (a direct TC for neural2, the rear slip past its target cutting the gas, came too late at 400 km/h: 23 of 500
+    // home in g118, spins in the fast straight; the TC that keeps the gas to the grip the curve leaves is back, the
+    // net still setting how much it takes, tcNet)
     if (!openLoop && cfg.tractionControl) {
         // The tyres share one grip between turning and driving (ProcessWheel: the thrust and the sideways pull are scaled
         // down together past the adhesion): gas only with the grip the curve leaves, none while sliding
@@ -3919,17 +3929,17 @@ static void DrawNetPanel() {
     grid("camada 2", R->nnAct + kNn2Hid, kNn2Hid2, 24);
     const float* o = R->nnAct + kNn2Hid + kNn2Hid2;
     const float lock = HandlingLockRad(car) * 180.0f / 3.14159265f;
-    const std::string names[kNn2Out] = { "volante", "velocidade", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente",
-        "curva < 12 m", "curva < 25 m", "curva < 60 m", "curva < 150 m", "curva > 150 m" };
+    const std::string names[kNn2Out] = { "volante", "acelerador / freio", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente",
+        "(reserva)", "(reserva)", "(reserva)", "(reserva)", "(reserva)" };
     std::string eff[kNn2Out];
     eff[0] = Format("%+.1f graus", o[0] * kNn2SteerSpan * lock);
-    eff[1] = Format("x%.2f", 1.0f + kNn2SpeedSpan * o[1]);
+    eff[1] = Format("pedal %+.2f", kNn2SpeedSpan * o[1]);
     eff[2] = Format("%+.2f m", o[2] * R->lineRoom);
     eff[3] = Format("x%.2f", std::exp(0.7f * o[3]));
     eff[4] = Format("x%.2f", std::exp(0.5f * o[4]));
     eff[5] = o[5] > 0.5f ? std::string("PUXADO") : std::string("-");
     eff[6] = Format("x%.2f", std::exp(0.5f * o[6]));
-    for (int b = 0; b < 5; b++) eff[7 + b] = Format("x%.2f", std::exp(0.4f * o[7 + b]));
+    for (int b = 0; b < 5; b++) eff[7 + b] = "sem uso";
     Text(x + 14.0f, y, "saidas (0 = o professor, pursuit)", 0.55f, kDim);
     y += 18.0f;
     for (int m = 0; m < kNn2Out; m++) {
