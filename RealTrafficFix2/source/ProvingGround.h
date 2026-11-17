@@ -165,8 +165,8 @@ static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnH
 // the teachers' labels were these very inputs (correlation 1.000); the net learned to copy them, and in the loop it
 // twitched the wheel 10x more than pursuit on the straight before the 220 m bends and spun in them)
 // (two hidden layers, 48 and 24: the user wants it more complex and faster; one of 24 before)
-// outputs: wheel, speed, line, TC, ABS, handbrake, lookahead, the grip x for each kind of curve (5: CurveBand)
-static constexpr int kNn2In = 80, kNn2Hid = 48, kNn2Hid2 = 24, kNn2Out = 12;
+// outputs: wheel, pedal, line, TC, ABS, handbrake, lookahead (the 5 grip x by kind of curve, unused, taken out)
+static constexpr int kNn2In = 80, kNn2Hid = 48, kNn2Hid2 = 24, kNn2Out = 7;
 static constexpr int kNn2L2 = (kNn2In + 1) * kNn2Hid, kNn2L3 = kNn2L2 + (kNn2Hid + 1) * kNn2Hid2;
 static constexpr int kNN2 = kNn2L3 + (kNn2Hid2 + 1) * kNn2Out;
 static constexpr float kNn2SteerSpan = 0.25f, kNn2SpeedSpan = 0.5f; // the most it can add: a quarter of the lock, 30% of the speed
@@ -409,7 +409,8 @@ struct Runner {
     float nnLine = 0.0f, lineRoom = 0.0f; // neural2: its line output (-1..1 of lineRoom, m, across from its own line)
     float nnTc = 0.0f, nnAbs = 0.0f, nnHb = 0.0f; // neural2: its TC, ABS (x e^(0.7 / 0.5 out)) and handbrake (> 0.5) outputs
     float nnLook = 0.0f;                          // ... its lookahead (x e^(0.5 out))
-    float nnAct[48 + 24 + 12] = {};               // ... the net's last activations: its layers and outputs (the HUD)
+    bool profileTried = false;                    // ... its speed profile worked out this run (Control)
+    float nnAct[48 + 24 + 7] = {};               // ... the net's last activations: its layers and outputs (the HUD)
     bool nnHeld = false;
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake); neural2: its speed residual, o[1]
     float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
@@ -557,6 +558,39 @@ static void RaceLine(const Course& rd, float room) {
             }
             raceOff.swap(next);
         }
+    // The minimum-curvature line (TUM's global_racetrajectory_optimization, opt_min_curv: the least sum of squared
+    // curvature with the car inside the road, a QP; here by projected gradient with Nesterov's momentum, from the band
+    // above): every 2 m (4 points), the curvature ~ the second difference of the path, each point within its room
+    {
+        const int st = 4, m = (n - 1) / st + 1;
+        std::vector<CVector2D> c(m), nn(m);
+        std::vector<float> x(m), y(m), prev(m), lim(m), g(m);
+        for (int j = 0; j < m; j++) {
+            const int i = std::min(j * st, n - 1);
+            c[j] = rd.p[i]; nn[j] = nrm[i]; x[j] = raceOff[i]; lim[j] = roomAt[i];
+        }
+        x[0] = x[m - 1] = 0.0f;
+        prev = x;
+        std::vector<CVector2D> P(m), D(m);
+        for (int it = 0; it < 4000; it++) {
+            const float mom = static_cast<float>(it) / (it + 3);
+            for (int j = 0; j < m; j++) y[j] = x[j] + mom * (x[j] - prev[j]);
+            for (int j = 0; j < m; j++) P[j] = c[j] + nn[j] * y[j];
+            for (int j = 1; j + 1 < m; j++) D[j] = P[j - 1] - P[j] * 2.0f + P[j + 1];
+            D[0] = CVector2D(0.0f, 0.0f);
+            D[m - 1] = CVector2D(0.0f, 0.0f);
+            prev = x;
+            for (int j = 1; j + 1 < m; j++) {
+                const CVector2D gd = (j > 1 ? D[j - 1] : CVector2D(0.0f, 0.0f)) - D[j] * 2.0f + (j + 2 < m ? D[j + 1] : CVector2D(0.0f, 0.0f));
+                x[j] = std::clamp(y[j] - (1.0f / 16.0f) * CVector2D::Dot(gd, nn[j]), -lim[j], lim[j]);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            const int j = std::min(i / st, m - 2);
+            const float t = std::clamp((i - j * st) / static_cast<float>(st), 0.0f, 1.0f);
+            raceOff[i] = x[j] + (x[j + 1] - x[j]) * t;
+        }
+    }
     // (the ends where they are: the start box and the finish line in the middle)
     for (int i = 0; i < n; i++) raceOff[i] *= std::clamp(std::min(i, n - 1 - i) / 64.0f, 0.0f, 1.0f);
     raceCache[key] = raceOff;
@@ -630,10 +664,15 @@ static void OwnLine() {
 static void SpeedProfile(const TestDef& d) {
     R->profile.clear();
     const int n = static_cast<int>(course.p.size());
-    if (cfg.mode != "gt4" || n < 2 || d.steer != "none") return;
+    // (gt4's, and neural2's: the speed its teacher drives is this profile of its own line, as TUM's calc_vel_profile:
+    // each point's most from its curvature and grip, then backwards the braking and forwards the acceleration inside
+    // the friction ellipse; the planner's look over the curves ahead not used then)
+    if ((cfg.mode != "gt4" && cfg.mode != "neural2") || n < 2 || d.steer != "none") return;
     const float G0 = (d.gripG > 0.0f ? d.gripG : d.gripG == 0.0f ? cfg.gripFactor * aiGripG : cfg.speedGripG) * 9.81f;
     if (G0 <= 0.0f) return;
-    const float brakeA = (d.brakeG > 0.0f ? d.brakeG : cfg.speedBrakeG) * 9.81f, accelA = cfg.gtAccel * 9.81f;
+    // (neural2: GtAccel x the grip, the GA finding how much pays: GtAccel's fraction of a g kept it off full throttle
+    // out of every curve, "muito medo de acelerar", the user, g140 142.9; all the grip spun 446 of 500, g141)
+    const float brakeA = (d.brakeG > 0.0f ? d.brakeG : cfg.speedBrakeG) * 9.81f, accelA = cfg.mode == "neural2" ? std::clamp(cfg.gtAccel, 0.3f, 1.0f) * G0 : cfg.gtAccel * 9.81f;
     auto gripAt = [&](int i) { const float c = std::abs(course.curv[i]); return G0 * (c > 1e-4f ? CurveGrip(c) : 1.0f); };
     std::vector<float>& v = R->profile;
     v.resize(n);
@@ -1732,6 +1771,9 @@ static void Control(CVehicle* v) {
     // pedals
     float vt = d.speeds[speedIdx] / 3.6f;
     const float gripG = d.gripG > 0.0f ? d.gripG : (d.gripG == 0.0f ? cfg.gripFactor * aiGripG : cfg.speedGripG), brakeG = d.brakeG > 0.0f ? d.brakeG : cfg.speedBrakeG;
+    // (neural2's profile once the car is made: the road can be built before, with no grip known yet)
+    // (once a run: an empty profile was worked out again every frame, 11,000 points x 500 cars: 12.7 ms a frame)
+    if (cfg.mode == "neural2" && R->profile.empty() && !R->profileTried && aiGripG > 0.0f && !openLoop) { R->profileTried = true; SpeedProfile(*curTest); }
     if (gripG > 0.0f && !openLoop && R->profile.empty()) {
         // slower for the curves ahead: v2 = G g / k there, braking at BrakeG g to reach it
         // (up to 2 km: with no top speed set, 450+ km/h needs 700+ m to brake for the U-turn)
@@ -2073,7 +2115,7 @@ static const GeneDef kGenes[] = {
     { "Steer", "LineRace", &Settings::lineRace, 0.0f, 1.0f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" },   // ... the racing line's share (1: all of it)
     { "Steer", "MpcHorizon", &Settings::mpcHorizon, 0.3f, 2.0f, "mpc" }, // mpc: how far ahead it simulates (s)
     { "Steer", "MpcWeight", &Settings::mpcWeight, 0.0f, 5.0f, "mpc" },   // ... the weight of the heading there
-    { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4" },      // gt4: its profile's acceleration (g)
+    { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4 neural2" },      // gt4: its profile's acceleration (g); neural2: x the grip (<= 1)
     { "Steer", "RppCurv", &Settings::rppCurv, 0.0f, 10.0f, "rpp" },     // rpp: a bend ahead shortens the look-ahead
     { "Steer", "BlendW", &Settings::blendW, 0.0f, 1.0f, "blend" },      // blend: the share of pursuit
     { "Steer", "GapBias", &Settings::gapBias, 0.0f, 3.0f, "gap" },      // gap: the pull of its own line
@@ -2254,6 +2296,8 @@ static std::string Nn2Path() { return baseDir + "proving\\nn2_central.txt"; }
 static bool PadTheta(std::vector<float>& w) {
     const int sz = static_cast<int>(w.size());
     if (sz < kNN2 && sz >= kNn2L3 + (kNn2Hid2 + 1) && (kNN2 - sz) % (kNn2Hid2 + 1) == 0) { w.resize(kNN2, 0.0f); return true; }
+    // (more outputs: the last ones dropped, the rest kept)
+    if (sz > kNN2 && (sz - kNN2) % (kNn2Hid2 + 1) == 0) { w.resize(kNN2); return true; }
     return false;
 }
 static void LoadTheta() {
@@ -2266,7 +2310,7 @@ static void LoadTheta() {
     // (fewer outputs: the same layers, the new output rows added at 0: what it learned kept)
     const int sz = static_cast<int>(w.size());
     if (PadTheta(w))
-        Log(Format("neural2: theta of %d outputs: %d new outputs added at 0 (what it learned kept)", (sz - kNn2L3) / (kNn2Hid2 + 1), (kNN2 - sz) / (kNn2Hid2 + 1)));
+        Log(Format("neural2: theta of %d outputs made %d (what it learned kept)", (sz - kNn2L3) / (kNn2Hid2 + 1), kNn2Out));
     if (static_cast<int>(w.size()) != kNN2) return;
     nn2Theta = w;
     nn2Stamp = a.ftLastWriteTime;
@@ -2834,8 +2878,8 @@ static void WriteReport() {
     std::strftime(stamp, sizeof(stamp), "%d/%m/%Y %H:%M", std::localtime(&now));
     h << "<h1>Proving Ground: algoritmo genetico</h1><div class=\"dim\">Gerado pelo RealTrafficFix.SA.asi em " << stamp
       << " ao fechar a geracao " << (genRows.empty() ? 0 : genRows.back().gen)
-      << " (a pagina recarrega a cada minuto). " << Html(Format("pontos = tempo x (1 + %.2f x desvio medio) + %.0f x s fora da pista; quem nao chega: 1000 + 0,5 x m que faltaram",
-             devWeight, offPenalty)) << "</div>";
+      << " (a pagina recarrega a cada minuto). " << Html(Format("pontos = tempo + %.0f x m.s com a roda mais de dentro alem da borda + %.0f x s com as 4 rodas fora (uma a tres "
+             "rodas fora nao custa nada); quem nao chega: 1000 + 0,5 x m que faltaram", edgePenalty, offPenalty)) << "</div>";
     h << "<div class=\"kpis\">";
     if (bestGen >= 0)
         h << Format("<div class=\"card kpi\"><span class=\"dim\">recorde (g%d)</span><b>%.2f</b>%s, %.1f s, desvio %.3f m</div>", bestGen, bestScore,
@@ -3289,6 +3333,7 @@ static void ResetLane() {
     R->runId = ++GA::runIds;
     R->nnHeld = false; // (a new brain: not the last one's outputs)
     R->nnLine = R->nnTc = R->nnAbs = R->nnHb = R->nnLook = 0.0f;
+    R->profileTried = false;
     for (float& x : R->nnAct) x = 0.0f;
     R->nnPedal = R->teacherSteer = R->teacherPedal = 0.0f; // (the last run's, read on the first frame before)
     R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
@@ -3929,8 +3974,7 @@ static void DrawNetPanel() {
     grid("camada 2", R->nnAct + kNn2Hid, kNn2Hid2, 24);
     const float* o = R->nnAct + kNn2Hid + kNn2Hid2;
     const float lock = HandlingLockRad(car) * 180.0f / 3.14159265f;
-    const std::string names[kNn2Out] = { "volante", "acelerador / freio", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente",
-        "(reserva)", "(reserva)", "(reserva)", "(reserva)", "(reserva)" };
+    const std::string names[kNn2Out] = { "volante", "acelerador / freio", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente" };
     std::string eff[kNn2Out];
     eff[0] = Format("%+.1f graus", o[0] * kNn2SteerSpan * lock);
     eff[1] = Format("pedal %+.2f", kNn2SpeedSpan * o[1]);
@@ -3939,7 +3983,6 @@ static void DrawNetPanel() {
     eff[4] = Format("x%.2f", std::exp(0.5f * o[4]));
     eff[5] = o[5] > 0.5f ? std::string("PUXADO") : std::string("-");
     eff[6] = Format("x%.2f", std::exp(0.5f * o[6]));
-    for (int b = 0; b < 5; b++) eff[7 + b] = "sem uso";
     Text(x + 14.0f, y, "saidas (0 = o professor, pursuit)", 0.55f, kDim);
     y += 18.0f;
     for (int m = 0; m < kNn2Out; m++) {
@@ -4026,7 +4069,7 @@ static void DrawHudCompact() {
             Text(x + 16.0f, y, Format("sigma %.3f%s   arquivo %d", GA::sigma, GA::stall > 0 ? Format(" (sem melhora %d)", GA::stall).c_str() : "",
                 static_cast<int>(GA::archive.size())), 0.56f, kDim);
             y += 18.0f;
-            Text(x + 16.0f, y, Format("pontos = tempo x (1 + %.2f x desvio medio) + %.0f x s fora", GA::devWeight, GA::offPenalty), 0.56f, kDim);
+            Text(x + 16.0f, y, Format("pontos = tempo + %.0f x m.s alem da borda + %.0f x s com 4 rodas fora", GA::edgePenalty, GA::offPenalty), 0.56f, kDim);
             y += 20.0f;
         }
         // the closing generation's 5 best so far
