@@ -873,7 +873,10 @@ static void BuildCourse(const TestDef& d) {
                 const float amp = nums[0], sp = std::max(nums[1], 2.0f);
                 const int gates = std::max(static_cast<int>(std::lround(nums[2])), 1);
                 for (int k = 0; k < gates; k++) course.cones.push_back(ToWorld(inFrame(sp * (k + 0.5f), 0.0f)));
-                sideways(sp * gates, [&](float x) { return amp * std::sin(kPi * x / sp); });
+                // (the sine eased in over the first half gate and out over the last: it began at its full slope, the road
+                // turning 13.5 degrees at once off the straight, "a entrada do primeiro slalom tem um join horrivel")
+                const float len = sp * gates;
+                sideways(len, [&](float x) { return amp * smoothstep(std::min(x, len - x) / (0.5f * sp)) * std::sin(kPi * x / sp); });
             }
             else if (kind == 'J' && nums.size() >= 4) {
                 const float a = nums[0], o = std::max(nums[1], 1.0f), ho = nums[2], b = std::max(nums[3], 1.0f);
