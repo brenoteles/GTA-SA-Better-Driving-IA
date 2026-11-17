@@ -94,6 +94,7 @@ struct Settings {
     // mode gt4: how hard the speed profile accelerates (g); mode mpc: how far ahead it simulates (s), the weight of the
     // heading at the horizon
     float gtAccel = 0.6f, mpcHorizon = 0.8f, mpcWeight = 1.0f;
+    float counterSteer = 0.8f; // neural2's teacher: its countersteer and yaw damping (Neural2Snapshot)
     // rpp: how much a bend ahead shortens the look-ahead; blend: the share of pursuit (the rest the kinematic law);
     // gap: how much its own line ahead pulls the chosen gap
     float rppCurv = 2.0f, blendW = 0.5f, gapBias = 0.5f;
@@ -248,6 +249,7 @@ static void ReadSettings() {
     f(st, "MpcHorizon", s.mpcHorizon);
     f(st, "MpcWeight", s.mpcWeight);
     f(sp, "GtAccel", s.gtAccel);
+    f(st, "CounterSteer", s.counterSteer);
     f(st, "RppCurv", s.rppCurv);
     f(st, "BlendW", s.blendW);
     f(st, "GapBias", s.gapBias);
@@ -1474,6 +1476,27 @@ static float PursuitSteer(CVehicle* v, float vv, int i) {
 // the teacher, then the sensors of this frame (the teacher is one of them), kept for the net and for Trace
 static void Neural2Snapshot(CVehicle* v, float vv, int i) {
     R->teacherSteer = PursuitSteer(v, vv, i);
+    // the recovery pursuit lacks (the user: it lost the car at high speed and did not get it back): the rear axle's
+    // slip angle past 0.08 rad steered against, and the rotation past what the line asks for at this speed (yaw rate
+    // - v x its curvature) taken off as the wheel that makes it (wheelbase x the excess / v): the damping acts before
+    // the slide grows. Steering > 0 is to the left; the rear going right (> 0) means the car turns left too much.
+    // CounterSteer: their strength (the GA's)
+    {
+        const float lock = HandlingLockRad(v);
+        const float vFwd = CVector::Dot(v->m_vecMoveSpeed, v->GetForward()) * GAME_SPEED_TO_MPS;
+        const float vRear = (CVector::Dot(v->m_vecMoveSpeed, v->GetRight()) - v->m_vecTurnSpeed.z * rearAxleY) * GAME_SPEED_TO_MPS;
+        const float beta = vFwd > 5.0f ? std::atan2(vRear, vFwd) : 0.0f;
+        const float betaEx = beta > 0.0f ? std::max(beta - 0.08f, 0.0f) : std::min(beta + 0.08f, 0.0f);
+        const float yaw = v->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS;
+        const float want = vFwd * (course.curv.empty() ? 0.0f : course.curv[std::clamp(i, 0, static_cast<int>(course.curv.size()) - 1)]);
+        float yawEx = yaw - want;
+        yawEx = yawEx > 0.0f ? std::max(yawEx - 0.05f, 0.0f) : std::min(yawEx + 0.05f, 0.0f);
+        // (only the rotation: the slip angle of the rear counted too, and a crosswind gust pushing the whole car sideways
+        // read as a slide, so it steered with the wind, out of the road at 450 km/h: 426-439 of 500 spun, g149-151)
+        (void)betaEx;
+        const float cs = cfg.counterSteer * (-yawEx * wheelBase / std::max(vFwd, 5.0f));
+        R->teacherSteer = std::clamp(R->teacherSteer + cs, -lock, lock);
+    }
     Neural2Inputs(v, R->nnIn);
 }
 
@@ -1932,7 +1955,12 @@ static void Control(CVehicle* v) {
     if (!openLoop && cfg.learnRate > 0.0f && speed > 5.0f && R->profile.empty() && cfg.mode != "neural" && cfg.mode != "neural2")
         LearnByResult(speed, dt, brakeAsked);
     if (d.handbrakeAt && tp >= 0.0f) hb = true;
-    if (cfg.mode == "neural2" && R->nnHb > 0.5f && speed > 5.0f) hb = true;
+    // (pulled a share of the frames, its output's (0..1): past 0.5 it was all or nothing, and the net's outputs start
+    // at 0 and move by tenths, so it never pulled it and could not learn what it does)
+    // (only under 80 km/h, the hairpins', and the share the square of the output: at the start of the learning +-0.1
+    // pulled it 1-10% of the frames at 400 km/h and 426 of 500 spun, g149)
+    if (cfg.mode == "neural2" && speed > 5.0f && speed < 22.0f && R->nnHb > 0.0f &&
+        static_cast<float>((CTimer::m_FrameCounter + R->index) % 20) < 20.0f * R->nnHb * R->nnHb) hb = true;
     gasOut = gas;
     brakeOut = brake;
     handbrakeOut = hb;
@@ -2130,12 +2158,14 @@ static const GeneDef kGenes[] = {
     { "Steer", "Damping", &Settings::damping, 0.4f, 2.0f, "kinematic gt4 blend" },
     { "Steer", "Preview", &Settings::preview, 0.0f, 0.3f, "kinematic stanley gt4 blend" },
     // (LookaheadTime and Gain from 0.2 and 0.7: generations 2-4 converged on those lower ends)
-    { "Steer", "LookaheadTime", &Settings::lookTime, 0.0f, 1.5f, "pursuit mod rpp blend gap" }, // (mod: its fallback)
-    { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod rpp blend gap" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
+    // (neural2 too, its teacher is pursuit: frozen at the old brains' 0.003 s it aimed 4.3 m ahead at 450 km/h and spun
+    // in the crosswind, g149-155; at least 0.3 s, 37 m there)
+    { "Steer", "LookaheadTime", &Settings::lookTime, 0.3f, 1.5f, "pursuit mod rpp blend gap neural2" }, // (mod: its fallback)
+    { "Steer", "LookaheadMin", &Settings::lookMin, 1.5f, 15.0f, "pursuit mod rpp blend gap neural2" }, // (from 3: 3.2 m strayed 3x less than 5.3 m in the U-turn)
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
     { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod rpp blend" },
     { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f, "" },
-    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.75f, "" }, // curve speeds: share of the AI grip formula
+    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.55f, "" }, // curve speeds: share of the AI grip formula
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
     { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
@@ -2144,7 +2174,8 @@ static const GeneDef kGenes[] = {
     { "Steer", "LineRace", &Settings::lineRace, 0.0f, 1.0f, "kinematic stanley pursuit mod rpp blend gap gt4 mpc" },   // ... the racing line's share (1: all of it)
     { "Steer", "MpcHorizon", &Settings::mpcHorizon, 0.3f, 2.0f, "mpc" }, // mpc: how far ahead it simulates (s)
     { "Steer", "MpcWeight", &Settings::mpcWeight, 0.0f, 5.0f, "mpc" },   // ... the weight of the heading there
-    { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4 neural2" },      // gt4: its profile's acceleration (g); neural2: x the grip (<= 1)
+    { "Speed", "GtAccel", &Settings::gtAccel, 0.2f, 1.2f, "gt4 neural2" },
+    { "Steer", "CounterSteer", &Settings::counterSteer, 0.0f, 2.0f, "neural2" },  // neural2: countersteer and yaw damping      // gt4: its profile's acceleration (g); neural2: x the grip (<= 1)
     { "Steer", "RppCurv", &Settings::rppCurv, 0.0f, 10.0f, "rpp" },     // rpp: a bend ahead shortens the look-ahead
     { "Steer", "BlendW", &Settings::blendW, 0.0f, 1.0f, "blend" },      // blend: the share of pursuit
     { "Steer", "GapBias", &Settings::gapBias, 0.0f, 3.0f, "gap" },      // gap: the pull of its own line
@@ -4012,7 +4043,7 @@ static void DrawNetPanel() {
     eff[2] = Format("%+.2f m", o[2] * R->lineRoom);
     eff[3] = Format("x%.2f", std::exp(0.7f * o[3]));
     eff[4] = Format("x%.2f", std::exp(0.5f * o[4]));
-    eff[5] = o[5] > 0.5f ? std::string("PUXADO") : std::string("-");
+    eff[5] = o[5] > 0.0f ? Format("%.0f%% abaixo de 80", 100.0f * std::min(o[5] * o[5], 1.0f)) : std::string("-");
     eff[6] = Format("x%.2f", std::exp(0.5f * o[6]));
     eff[7] = Format("x%.2f", std::exp(0.25f * o[7]));
     Text(x + 14.0f, y, "saidas (0 = o professor, pursuit)", 0.55f, kDim);
