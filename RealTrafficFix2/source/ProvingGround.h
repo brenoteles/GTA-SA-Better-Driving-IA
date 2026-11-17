@@ -186,6 +186,7 @@ static void Start();
 static void Score(int k, const std::string& why, float time, double mean, double rms, double maxE, double out, float sMax, float length,
     double deficit, double minMargin);
 static void NextGeneration();
+static void SetSectors(int k, const std::vector<float>& sec);
 }
 
 static void ReadSettings() {
@@ -407,6 +408,7 @@ struct Runner {
     float latGNow = 0.0f, slipNow = 0.0f, speedNow = 0.0f;
     bool skidFNow = false, skidRNow = false, absOn = false, tcOn = false;
     float windNow = 0.0f;
+    std::vector<float> secT;        // the time it reached the start of each part of the course (-1: not yet)
     float bodyFront = 2.2f, bodyRear = -2.2f, bodyHalfW = 1.0f; // the body's corners (m, car frame)
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float nnO0 = 0.0f, nnO1 = 0.0f; // neural2: its outputs, held a frame (Neural2Steer)
@@ -706,8 +708,10 @@ static void SpeedProfile(const TestDef& d) {
         v[i] = std::min(d.speeds[0] / 3.6f, course.vcap[i]);
         if (c > 1e-4f) v[i] = std::min(v[i], std::sqrt(gripAt(i) / c));
     }
+    // (the crosswind takes its share of the grip sideways too: braking for the spiral in the second gust at 450 km/h
+    // went past the friction ellipse, 119 of 500 off at 2400-2600 m, g159)
     auto room = [&](int i, float speed, float a) {
-        const float G = gripAt(i), lat = speed * speed * std::abs(course.curv[i]);
+        const float G = gripAt(i), lat = speed * speed * std::abs(course.curv[i]) + (course.wind.empty() ? 0.0f : std::abs(course.wind[i]));
         return a * std::sqrt(std::max(1.0f - (lat / G) * (lat / G), 0.0f));
     };
     for (int i = n - 2; i >= 0; i--) {
@@ -1449,7 +1453,8 @@ static void Neural2InputsTo(CVehicle* v, float* in) {
         const int at = n ? Advance(ni, m) : 0;
         in[k++] = at < static_cast<int>(raceOff.size()) && R->lineRoom > 0.0f ? raceOff[at] / R->lineRoom : 0.0f;
     }
-    in[k++] = R->nnLine;
+    // (the crosswind 0.15 s on, m/s2 / 3, in place of the line it asked for last frame: the net could not see the gusts)
+    in[k++] = course.wind.empty() ? 0.0f : course.wind[Advance(ni, std::max(std::abs(vFGame) * GAME_SPEED_TO_MPS, 5.0f) * 0.15f)] / 3.0f;
     if (k != nn2Count) { nn2Count = k; if (k != kNn2In) Log(Format("neural2: %d inputs written for %d: check Neural2InputsTo", k, kNn2In)); }
     while (k < kNn2In) in[k++] = 0.0f;
 }
@@ -1495,7 +1500,12 @@ static void Neural2Snapshot(CVehicle* v, float vv, int i) {
         // read as a slide, so it steered with the wind, out of the road at 450 km/h: 426-439 of 500 spun, g149-151)
         (void)betaEx;
         const float cs = cfg.counterSteer * (-yawEx * wheelBase / std::max(vFwd, 5.0f));
-        R->teacherSteer = std::clamp(R->teacherSteer + cs, -lock, lock);
+        // the crosswind fed forward: the wheel whose sideways pull (v^2 x steer / wheelbase) cancels the gust's push, from
+        // 0.15 s before it (the gusts are the course's: a driver leans into them; pushed first, 152 of 500 went off at
+        // 450 km/h, g156). (> 0 pushes to the left: the wheel to the right, < 0)
+        const float windAhead = course.wind.empty() ? 0.0f : course.wind[Advance(i, std::max(vFwd, 5.0f) * 0.15f)];
+        const float ff = -wheelBase * windAhead / std::max(vFwd * vFwd, 25.0f);
+        R->teacherSteer = std::clamp(R->teacherSteer + cs + ff, -lock, lock);
     }
     Neural2Inputs(v, R->nnIn);
 }
@@ -2061,6 +2071,11 @@ static void Record(CVehicle* v, float dt) {
     R->skidRNow = ws[1] || ws[3];
     if (!course.s.empty()) R->sMax = std::max(R->sMax, course.s[nearIdx]);
     if (R->sMax > R->progressS + 5.0f) { R->progressS = R->sMax; R->progressT = runT; }
+    // the sectors: the time it reached each part's start (the report: where the time is lost)
+    if (R->secT.size() != course.sections.size()) R->secT.assign(course.sections.size(), -1.0f);
+    for (size_t q = 0; q < course.sections.size(); q++)
+        // (the parts' starts are the road's metres, its progress its own line's, a little shorter: by the share of the lap)
+        if (R->secT[q] < 0.0f && R->sMax >= course.sections[q].first * course.length / std::max(R->road.length, 1.0f)) R->secT[q] = q == 0 ? 0.0f : runT;
     if (course.halfWidth > 0.0f && !course.p.empty()) {
         // The road is a corridor between two edges: what has to stay inside is the whole body, not its centre. Each of
         // its four corners on the course (in a curve the body sweeps wider than its centre's path, and the room left
@@ -2136,6 +2151,17 @@ static void EndRun(const char* why) {
     R->endTime = runT;
     if (GA::on) GA::Score(R->index, why, runT, stats.absE / T, std::sqrt(stats.sqE / T), stats.maxE, stats.outTime, R->sMax, course.length,
         stats.deficit, stats.minMargin);
+    if (GA::on) {
+        // each part's time (-1: not driven through)
+        std::vector<float> sec;
+        const bool home = !strcmp(why, "end");
+        sec.assign(R->secT.size(), -1.0f);
+        for (size_t q = 0; q < R->secT.size(); q++) {
+            const float a = R->secT[q], b = q + 1 < R->secT.size() ? R->secT[q + 1] : (home ? runT : -1.0f);
+            if (a >= 0.0f && b >= 0.0f) sec[q] = b - a;
+        }
+        GA::SetSectors(R->index, sec);
+    }
 }
 
 // --- Genetic algorithm -----------------------------------------------------------------------------------------------
@@ -2199,7 +2225,8 @@ constexpr int kNumGenes = sizeof(kGenes) / sizeof(kGenes[0]);
 // physics gave the same genome 156.8 and 158.2, more than between 1st and 3rd; its average is what ranks it)
 struct Genome { int mode = 0; float g[kNumGenes] = {}; std::string label; double sum = 0.0; int runs = 0; float nn[kNN2] = {};
                 int archiveId = -1; }; // archiveId: steady state, the archive entry it is (a re-run of an elite)
-struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0, deficit = 0.0, minMargin = 1e9; std::string why; int runs = 0; };
+struct Result { double score = 0.0, time = 0.0, mean = 0.0, rms = 0.0, maxE = 0.0, out = 0.0, reached = 0.0, deficit = 0.0, minMargin = 1e9; std::string why; int runs = 0;
+                std::vector<float> sectors; }; // (each part's time, s; -1: not driven through)
 
 static int elite = 2, tournament = 3, immigrants = 1, maxGenerations = 0;
 static int minPerMode = 0; // islands: every algorithm at least this many cars, bred among its own
@@ -2906,6 +2933,10 @@ static std::string Chart(const std::vector<std::pair<std::string, std::vector<do
         o += Format("<span><i style=\"background:%s\"></i>%s</span>", colors[si], Html(series[si].first).c_str());
     return o + Format("<span class=\"dim\">%s</span></div>", down ? "mais baixo = melhor" : "mais alto = melhor");
 }
+static std::vector<std::string> secNames;          // (the course's parts, for the report)
+static std::vector<float> secBest, secWin;          // ... the last generation's best of each and its winner's
+static std::vector<std::string> secBestId;
+static int secGen = -1;
 static void WriteReport() {
     std::vector<int> gens;
     std::vector<double> bestS, top10, nnBest, nnRate, nnReach, nnOut;
@@ -2963,6 +2994,24 @@ static void WriteReport() {
     h << "<div class=\"card\">" << Chart({ { "% das voltas que chegaram", nnRate } }, gens, kC3, "%", false) << "</div>";
     h << "<div class=\"card\">" << Chart({ { "distancia media percorrida (km)", nnReach }, { "tamanho da correcao (RMS da camada de saida)", nnOut } },
         gens, kC3, "", false) << "</div>";
+    if (!secNames.empty()) {
+        // where the time is: each part's best this generation (any car) against the winner's
+        double sumBest = 0.0, sumWin = 0.0;
+        h << Format("<h2>Setores da geracao %d</h2><div class=\"dim\">O melhor de cada trecho (qualquer carro) contra o vencedor da "
+                    "geracao: a soma dos melhores e o tempo possivel juntando os melhores trechos.</div><div class=\"card tw\"><table><tr>"
+                    "<th>trecho</th><th>melhor</th><th>de</th><th>vencedor</th><th>perde</th></tr>", secGen);
+        for (size_t q = 0; q < secNames.size(); q++) {
+            const float b = q < secBest.size() ? secBest[q] : -1.0f, w = q < secWin.size() ? secWin[q] : -1.0f;
+            if (b > 0.0f) sumBest += b;
+            if (w > 0.0f) sumWin += w;
+            h << "<tr><td>" << Html(secNames[q]) << "</td>"
+              << (b > 0.0f ? Format("<td class=\"num\">%.2f s</td><td>%s</td>", b, Html(secBestId[q]).c_str()) : std::string("<td>-</td><td></td>"))
+              << (w > 0.0f ? Format("<td class=\"num\">%.2f s</td>", w) : std::string("<td>-</td>"))
+              << (b > 0.0f && w > 0.0f ? Format("<td class=\"num\">%+.2f s</td>", w - b) : std::string("<td></td>")) << "</tr>";
+        }
+        h << Format("<tr><th>soma</th><th class=\"num\">%.2f s</th><th></th><th class=\"num\">%.2f s</th><th class=\"num\">%+.2f s</th></tr></table></div>",
+            sumBest, sumWin, sumWin - sumBest);
+    }
     h << "<h2>Melhor carro de cada geracao</h2><div class=\"card tw\"><table><tr><th>geracao</th><th>quando</th><th>carro</th><th>algoritmo</th>"
          "<th>pontos</th><th>tempo</th><th>desvio</th><th>top 10</th><th>chegaram</th><th>neural2</th><th>sigma</th><th>genes</th></tr>";
     for (auto it = genRows.rbegin(); it != genRows.rend(); ++it) {
@@ -3049,6 +3098,21 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
         for (int i = 0; i < kNumGenes; i++) if (Uses(i, b.g.mode)) r.genes += Format("%s%s %.3g", r.genes.empty() ? "" : ", ", kGenes[i].key, b.g.g[i]);
     }
     genRows.push_back(r);
+    {
+        // the sectors of this generation: the best of each part and the winner's
+        const Course& c0 = runners[0].road;
+        secNames.clear();
+        for (const auto& sc : c0.sections) secNames.push_back(sc.second);
+        secBest.assign(secNames.size(), -1.0f);
+        secBestId.assign(secNames.size(), std::string());
+        secWin.assign(secNames.size(), -1.0f);
+        for (const Done& d : batch)
+            for (size_t q = 0; q < d.r.sectors.size() && q < secNames.size(); q++)
+                if (d.r.sectors[q] > 0.0f && (secBest[q] < 0.0f || d.r.sectors[q] < secBest[q])) { secBest[q] = d.r.sectors[q]; secBestId[q] = d.id; }
+        if (!batch.empty() && batch[0].r.why == "end")
+            for (size_t q = 0; q < batch[0].r.sectors.size() && q < secNames.size(); q++) secWin[q] = batch[0].r.sectors[q];
+        secGen = g;
+    }
     const bool fresh = GetFileAttributesA(RowsPath().c_str()) == INVALID_FILE_ATTRIBUTES && genRows.size() == 1;
     std::string line = fresh ? "gen\tstamp\truns\thome\tid\tmode\tscore\ttime\tmean\ttop10\tsigma\tnn_runs\tnn_home\tnn_best\tnn_reach\tes_steps\tnn_out\t-\tgenes\n" : "";
     line += Format("%d\t%s\t%d\t%d\t%s\t%s\t%.3f\t%.2f\t%.4f\t%.3f\t%.4f\t%d\t%d\t%.3f\t%.0f\t%d\t%.5f\t-\t", r.gen, r.stamp.c_str(), r.runs, r.home,
@@ -3067,6 +3131,8 @@ static void ReportPop(int n) {
     for (int i = 0; i < n10; i++) top10 += b[i].r.score / std::max(n10, 1);
     ReportGeneration(generation, b, top10);
 }
+
+static void SetSectors(int k, const std::vector<float>& sec) { res[k].sectors = sec; }
 
 struct EsDone { double score; std::vector<float> eps; };
 static std::vector<EsDone> esBatch;
@@ -3396,6 +3462,7 @@ static void ResetLane() {
     R->nnHeld = false; // (a new brain: not the last one's outputs)
     R->nnLine = R->nnTc = R->nnAbs = R->nnHb = R->nnLook = R->nnAgg = 0.0f;
     R->profileTried = false;
+    R->secT.clear();
     for (float& x : R->nnAct) x = 0.0f;
     R->nnPedal = R->teacherSteer = R->teacherPedal = 0.0f; // (the last run's, read on the first frame before)
     R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
