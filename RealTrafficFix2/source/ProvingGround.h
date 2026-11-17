@@ -19,6 +19,8 @@
 #include <thread>
 #include <condition_variable>
 #include "CSprite2d.h"
+#include "CTimeCycle.h"
+#include <xmmintrin.h>
 
 namespace ProvingGround {
 
@@ -418,6 +420,7 @@ struct Runner {
     float nnTc = 0.0f, nnAbs = 0.0f, nnHb = 0.0f; // neural2: its TC, ABS (x e^(0.7 / 0.5 out)) and handbrake (> 0.5) outputs
     float nnLook = 0.0f;                          // ... its lookahead (x e^(0.5 out))
     bool profileTried = false;                    // ... its speed profile worked out this run (Control)
+    bool frozen = false;                          // its car out of the physics (a run ended badly; PlaceCar frees it)
     float nnAct[48 + 24 + 8] = {};
     float nnAgg = 0.0f;                           // ... its aggressiveness: the speed profile x e^(0.25 out)               // ... the net's last activations: its layers and outputs (the HUD)
     bool nnHeld = false;
@@ -1135,8 +1138,8 @@ static int Pending() { std::lock_guard<std::mutex> l(mtx); return static_cast<in
 // --- Perf: where a frame's time goes (the summary every 10 s, "perf:"; a frame over 150 ms on its own line) ----------
 // GTA runs on one thread: the CPU meter shows the machine's cores together, so a game stuck on one core reads ~10%
 namespace Perf {
-enum { UPDATE, CONTROL, DRAW, REPLACE, ENDBATCH, TRACE, HUD, N };
-static const char* const kNames[N] = { "update", "controle", "desenho", "troca de cerebro", "fim de geracao", "trace", "hud" };
+enum { UPDATE, CONTROL, DRAW, REPLACE, ENDBATCH, TRACE, HUD, NNIN, NNNET, N };
+static const char* const kNames[N] = { "update", "controle", "desenho", "troca de cerebro", "fim de geracao", "trace", "hud", "sensores da rede", "conta da rede" };
 static double cur[N] = {}, sum[N] = {}, peak[N] = {}, shown[N] = {};
 static double last = 0.0, windowStart = 0.0, frameSum = 0.0, frameMax = 0.0;
 static int frames = 0;
@@ -1550,33 +1553,45 @@ static void Neural2Snapshot(CVehicle* v, float vv, int i) {
     Neural2Inputs(v, R->nnIn);
 }
 
+// a dot product four at a time (SSE): the net's 5,264 multiplications for each of 500 cars every frame
+static inline float DotSse(const float* a, const float* b, int n) {
+    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
+    int q = 0;
+    for (; q + 8 <= n; q += 8) {
+        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_loadu_ps(a + q), _mm_loadu_ps(b + q)));
+        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_loadu_ps(a + q + 4), _mm_loadu_ps(b + q + 4)));
+    }
+    float t[4];
+    _mm_storeu_ps(t, _mm_add_ps(s0, s1));
+    float r = t[0] + t[1] + t[2] + t[3];
+    for (; q < n; q++) r += a[q] * b[q];
+    return r;
+}
 static float Neural2Steer(CVehicle* v, float vv, int i) {
     float h[kNn2Hid];
     // (every frame: its outputs held a frame in between, for speed, made it worse at once, g65: 19 of 340 home)
     const float lock = HandlingLockRad(v);
-    Neural2Snapshot(v, vv, i);
+    {
+        Perf::Scope perf(Perf::NNIN);
+        Neural2Snapshot(v, vv, i);
+    }
     const float* in = R->nnIn;
     const std::vector<float>& w = cfg.nn;
     if (static_cast<int>(w.size()) < kNN2) { R->nnPedal = 0.0f; return R->teacherSteer; }
+    Perf::Scope perfNet(Perf::NNNET);
     for (int j = 0; j < kNn2Hid; j++) {
         const float* row = &w[j * (kNn2In + 1)];
-        float sum = row[kNn2In];
-        for (int q = 0; q < kNn2In; q++) sum += row[q] * in[q];
-        h[j] = std::tanh(sum);
+        h[j] = std::tanh(row[kNn2In] + DotSse(row, in, kNn2In));
     }
     float h2[kNn2Hid2];
     for (int j = 0; j < kNn2Hid2; j++) {
         const float* row = &w[kNn2L2 + j * (kNn2Hid + 1)];
-        float sum = row[kNn2Hid];
-        for (int q = 0; q < kNn2Hid; q++) sum += row[q] * h[q];
-        h2[j] = std::tanh(sum);
+        h2[j] = std::tanh(row[kNn2Hid] + DotSse(row, h, kNn2Hid));
     }
     float o[kNn2Out];
     for (int m = 0; m < kNn2Out; m++) {
         const float* row = &w[kNn2L3 + m * (kNn2Hid2 + 1)];
-        float sum = row[kNn2Hid2];
-        for (int j = 0; j < kNn2Hid2; j++) sum += row[j] * h2[j];
-        o[m] = std::tanh(sum);
+        o[m] = std::tanh(row[kNn2Hid2] + DotSse(row, h2, kNn2Hid2));
     }
     // residuals on the teacher (zero output weights: the teacher itself); the third: its line, across the lane from
     // the racing line, up to the room (the user: the AI itself in charge of its line; next frame's teacher aims there)
@@ -3531,6 +3546,7 @@ static void ResetLane() {
 }
 
 static void PlaceCar(CVehicle* v, float kmh) {
+    if (R->frozen) { Command<COMMAND_FREEZE_CAR_POSITION>(carHandle, 0); R->frozen = false; }
     const CVector2D p0 = course.p[0];
     const float head = course.head[0];
     bool found = false;
@@ -3763,6 +3779,9 @@ void Update() {
     if (!player) return;
     const unsigned int now = Now();
 
+    // (the city 300 m below not drawn: the camera on the leader at 450 km/h over the airport and the docks made the game
+    // draw and stream them, frames of 85-190 ms in the fast straight and the wind, the mod's own time unchanged)
+    if (state == RUNNING) CTimeCycle::m_CurrentColours.m_fFarClip = std::min(CTimeCycle::m_CurrentColours.m_fFarClip, 400.0f);
     // nothing else about: no traffic, no people, midday, dry
     Command<COMMAND_SET_PED_DENSITY_MULTIPLIER>(0.0f);
     Command<COMMAND_SET_CAR_DENSITY_MULTIPLIER>(0.0f);
@@ -3913,7 +3932,13 @@ void Update() {
         // (and the other cars: far from the player the game would put them on its simple, rail-like movement)
         if (R != runners || cfg.driver == "cjai") car->m_nStatus = STATUS_PHYSICS;
         if (R->finished) {
-            if (R->result != "end") { car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f); car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f); }
+            if (R->result != "end") {
+                car->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
+                car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
+                // (out of the physics until its next run: rolled, hanging off an edge or against an obstacle, a hundred
+                // of them kept the game's collision busy, frames of 190-270 ms when the cars reached the wind)
+                if (!R->frozen) { Command<COMMAND_FREEZE_CAR_POSITION>(carHandle, 1); R->frozen = true; }
+            }
             if (GA::on && GA::steady && clockT - R->doneAt > 0.5f) {
                 // steady state: this run into the archive, a new brain on the lane, from the start again
                 Perf::Scope perf(Perf::REPLACE);
