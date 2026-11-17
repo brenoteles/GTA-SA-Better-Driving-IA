@@ -141,7 +141,7 @@ def kicker_mesh():
 
 
 def ripple_mesh():
-    w, waves, every, h, per = 5.0, 8, 3.0, 0.03, 8
+    w, waves, every, h, per = 7.0, 8, 3.0, 0.03, 8  # (the lane 6 m wide: the taper outside it)
     length = waves * every
     n = waves * per
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
@@ -150,7 +150,7 @@ def ripple_mesh():
 
 
 def hump_mesh():
-    w, length, h, n = 5.0, 3.5, 0.07, 14
+    w, length, h, n = 7.0, 3.5, 0.07, 14
     ys = [-length / 2 + length * i / n for i in range(n + 1)]
     zs = [h * math.sin(math.pi * i / n) for i in range(n + 1)]
     return tapered_profile(w, ys, zs, 0.5)

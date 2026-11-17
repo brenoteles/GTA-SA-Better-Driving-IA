@@ -2573,10 +2573,12 @@ static void Score(int k, const std::string& why, float time, double mean, double
     const bool cut = why == "CUT" && sMax > 50.0f;
     const double t = cut ? time * length / sMax : time;
     r.score += done || cut ? t * (1.0 + devWeight * mean) + meanPenalty * mean + edgePenalty * deficit + offPenalty * out + rmsPenalty * rms + (cut ? cutPenalty : 0.0)
-                           : 1000.0 + 0.5 * std::max(length - sMax, 0.0f);
-    // (not home: by how far it got only; the time outside the lane counted too, so crashing at 1.4 km scored better
-    // than driving on, outside, to 2.9 km; a CUT car, which drove on, always better than one that crashed)
-    if (cut) r.score = std::min(r.score, 999.0);
+                           : 400.0 + 600.0 * std::max(1.0 - sMax / std::max(length, 1.0f), 0.0) + 0.25 * std::min(time * length / std::max(sMax, 50.0f), 400.0f);
+    // (not home: 400 + 600 x the share of the lap left + a quarter of the time it was heading for at its pace (at most
+    // 100): further is always better, and at the same place the faster; 1000 + 0.5 x m left saw no speed. The time
+    // outside the lane not counted there: crashing early scored better than driving on, outside. A CUT car, which drove
+    // on, always better than one that crashed; any car home better than both)
+    if (cut) r.score = std::min(r.score, 399.0);
     r.mean = std::max(r.mean, mean);
     r.deficit += deficit;
     r.minMargin = std::min(r.minMargin, minMargin);
