@@ -4,7 +4,40 @@ State at the end of the 2026-11-15 sessions. Read the GA section first (the late
 (the traffic regression, still open), then `docs/sensores.html` (the progress checklist, published as
 https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; behind: it predates the race, proving ground and GA work).
 
-## 2026-11-15 (evening): the GA runs with no LLM - read this first
+## 2026-11-16/17: every AI a neural network, TUM line, sectors - read this first
+
+State (commit after 0d2b983): one generation at a time (SteadyState 0), 500 cars, all `neural2` (Modes = neural2), lane
+6 m (Width 6), ScoreVersion 7, best 113.38 s at g163 (356/500 home), ~44 fps. The ASI alone runs everything
+(scripts\proving\ga_state.txt, nn2_central.txt, nn2_best.txt, ga_report.html every generation).
+
+- neural2 = residual on pursuit: 80 inputs (Neural2InputsTo, into a buffer with room; the count logged if off) -> 48 ->
+  24 -> 8 outputs: wheel (+-1/4 lock), pedal (+-0.5 over the teacher's), line (across, within raceRoom), TC (x e^0.7o),
+  ABS (x e^0.5o), handbrake (share of frames, only < 80 km/h, o^2), lookahead (x e^0.5o), aggressiveness (profile x
+  e^0.25o). Zero outputs = the teacher. A theta with other output counts is padded/trimmed (PadTheta); InitTheta makes
+  one when none fits. ES over all 500 cars (Nn2Alpha 0.01, Sigma 0.02); best-theta guard (nn2_best.txt: kept at >=80%
+  home, back to it under 50%).
+- Teacher (Neural2Snapshot): PursuitSteer (lookahead genes now neural2's, LookaheadTime >= 0.3 s: frozen at 0.003 s it
+  aimed 4.3 m ahead at 450 km/h, the g149-155 collapse) + yaw-damping reflex (CounterSteer gene; the slip-angle term was
+  removed: a crosswind read as a slide) + crosswind feedforward (-wheelbase x wind / v^2, 0.15 s early).
+- Speed: SpeedProfile (TUM calc_vel_profile style) for neural2: grip GripFactor (<= 0.70) x aiGripG x CurveGrip, brake
+  up to the grip, accel GtAccel x grip, the wind counted in the friction ellipse; the old curve-scan planner not used.
+  LearnByResult off for neural2 (the user disliked the in-run multipliers).
+- Line: RaceLine = elastic band -> minimum curvature (projected gradient, Nesterov, every 2 m) -> minimum-time rounds
+  ([Steer] LineTime 2: curvature weighted by (40/v)^2, kept only if the estimated lap is shorter; ~0.4 s gain).
+  [Steer] LineRate (curvature-change term) = 0: 3 measured worse. Only the J/X stretches pinned to the middle (moose,
+  gusts), room opening over 80 m. The slalom's sine eased in/out (it began at full slope: the user's "horrible join").
+- Score (v7): finishers time + 20 x m.s of the innermost wheel past the edge (EdgeComfort 0, EdgePenalty 20) + 40 x s
+  with all four wheels out (marginNow by the tyres' inner edges, F1 rule: 1-3 wheels out cost nothing); not home:
+  400 + 600 x lap left + 1/4 of the projected time (<= 100); CUT <= 399.
+- Report: per-generation table + charts + sector table (best of each part vs the winner; secT per runner).
+- Obstacles: tapered (no walls), ripples 3 cm (24 m field, one object), humps 7 cm, 7 m wide; object pool guard.
+- Lessons: test one change at a time (several bundled changes cost generations to untangle); genes whose Uses mask
+  excludes the mode stay frozen at old values; the heredoc mangles \\n in Python edit scripts (write the scripts with the
+  Write tool); `Format` truncates at 4096 chars.
+- Next: watch GripFactor (GA exploring to 0.70: g163 had more OFF); FPS (~10 ms "controle": the 5k-weight net x 500,
+  could use SIMD); tools/nn2_train.py does not match the current net size.
+
+## 2026-11-15 (evening): the GA runs with no LLM
 
 The proving ground's GA is entirely in the ASI: start the game (scripts\RealTrafficFix.proving.ini present, [GA]
 Enabled = 1, SteadyState = 1, Resume = 1) and it drives 500 cars, breeds, and saves its state every generation
