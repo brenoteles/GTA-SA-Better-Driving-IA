@@ -165,7 +165,8 @@ static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnH
 // the teachers' labels were these very inputs (correlation 1.000); the net learned to copy them, and in the loop it
 // twitched the wheel 10x more than pursuit on the straight before the 220 m bends and spun in them)
 // (two hidden layers, 48 and 24: the user wants it more complex and faster; one of 24 before)
-static constexpr int kNn2In = 80, kNn2Hid = 48, kNn2Hid2 = 24, kNn2Out = 3;
+// outputs: wheel, speed, line, TC, ABS, handbrake, lookahead, the grip x for each kind of curve (5: CurveBand)
+static constexpr int kNn2In = 80, kNn2Hid = 48, kNn2Hid2 = 24, kNn2Out = 12;
 static constexpr int kNn2L2 = (kNn2In + 1) * kNn2Hid, kNn2L3 = kNn2L2 + (kNn2Hid + 1) * kNn2Hid2;
 static constexpr int kNN2 = kNn2L3 + (kNn2Hid2 + 1) * kNn2Out;
 static constexpr float kNn2SteerSpan = 0.25f, kNn2SpeedSpan = 0.5f; // the most it can add: a quarter of the lock, 30% of the speed
@@ -406,6 +407,9 @@ struct Runner {
     float marginNow = 99.0f;        // a corridor: the room between its nearest corner and the nearest edge (m)
     float nnO0 = 0.0f, nnO1 = 0.0f; // neural2: its outputs, held a frame (Neural2Steer)
     float nnLine = 0.0f, lineRoom = 0.0f; // neural2: its line output (-1..1 of lineRoom, m, across from its own line)
+    float nnTc = 0.0f, nnAbs = 0.0f, nnHb = 0.0f; // neural2: its TC, ABS (x e^(0.7 / 0.5 out)) and handbrake (> 0.5) outputs
+    float nnLook = 0.0f;                          // ... its lookahead (x e^(0.5 out))
+    float nnAct[48 + 24 + 12] = {};               // ... the net's last activations: its layers and outputs (the HUD)
     bool nnHeld = false;
     float nnPedal = 0.0f;           // mode neural: its pedal (> 0 gas, < 0 brake); neural2: its speed residual, o[1]
     float teacherSteer = 0.0f, teacherPedal = 0.0f; // mode neural2: what pursuit would do here (DAgger's labels)
@@ -1388,7 +1392,7 @@ static void Neural2InputsTo(CVehicle* v, float* in) {
 // blend too), so their rows carry the same label: the residual they drove over pursuit is what tools/nn2_train.py learns
 static float PursuitSteer(CVehicle* v, float vv, int i) {
     const float lock = HandlingLockRad(v);
-    const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax);
+    const float ld = std::clamp(cfg.lookTime * vv, cfg.lookMin, cfg.lookMax) * (cfg.mode == "neural2" ? std::exp(0.5f * R->nnLook) : 1.0f);
     const CVector2D pos = v->GetPosition().To2D(), fwd = v->GetForward().To2D(), left(-fwd.y, fwd.x);
     const int at = Advance(i, ld);
     CVector2D aim = course.p[at];
@@ -1440,6 +1444,17 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
     // the racing line, up to the room (the user: the AI itself in charge of its line; next frame's teacher aims there)
     R->nnPedal = o[1];
     R->nnLine = o[2];
+    // its traction control, its ABS, its handbrake (0: as the car's genes set them; the user wanted them the net's too)
+    R->nnTc = o[3];
+    R->nnAbs = o[4];
+    R->nnHb = o[5];
+    // its lookahead, and the grip it takes for each kind of curve (the multipliers by radius the HUD showed: before
+    // learned in the run, LearnByResult; now the net's, every frame, x e^(0.4 out), 0: the planner's own)
+    R->nnLook = o[6];
+    for (int b = 0; b < 5; b++) R->learned[b] = std::exp(0.4f * o[7 + b]);
+    std::memcpy(R->nnAct, h, sizeof(float) * kNn2Hid);
+    std::memcpy(R->nnAct + kNn2Hid, h2, sizeof(float) * kNn2Hid2);
+    std::memcpy(R->nnAct + kNn2Hid + kNn2Hid2, o, sizeof(float) * kNn2Out);
     R->nnO0 = o[0];
     R->nnO1 = o[1];
     R->nnHeld = true;
@@ -1800,7 +1815,7 @@ static void Control(CVehicle* v) {
         for (int w = 0; w < 4; w++) if (a->m_wheelState[w] == 3) locked = true;
         absScale = locked ? std::max(absScale - cfg.absDrop, 0.3f) : std::min(absScale + cfg.absRecover, 1.0f);
         // (x what the car learned of its ABS: LearnByResult)
-        const float allowed = pedalMax * absScale * R->absLearn;
+        const float allowed = pedalMax * absScale * R->absLearn * (cfg.mode == "neural2" ? std::exp(0.5f * R->nnAbs) : 1.0f);
         R->absOn = brake > allowed;
         brake = std::min(brake, allowed);
     }
@@ -1814,12 +1829,13 @@ static void Control(CVehicle* v) {
         const float gasAsked = gas;
         // (x the gas the car learned its tyres take in this kind of curve: LearnByResult)
         const float cNow = std::abs(course.curv[nearIdx]);
-        gas = std::min(gas, std::clamp(room * (cNow > 1.0f / 400.0f ? R->tcBand[CurveBand(cNow)] : 1.0f), cfg.tcMinGas, 1.0f));
+        const float tcNet = cfg.mode == "neural2" ? std::exp(0.7f * R->nnTc) : 1.0f; // (> 1: it lets more slip and gas)
+        gas = std::min(gas, std::clamp(room * tcNet * (cNow > 1.0f / 400.0f ? R->tcBand[CurveBand(cNow)] : 1.0f), cfg.tcMinGas, 1.0f));
         // sliding: at the rear axle (at the car's centre a tight turn at full lock reads ~0.25 rad with the tyres holding:
         // the gas went off and the car stopped in the 7 m U-turn), and not at walking pace
         const float vRightRear = CVector::Dot(v->m_vecMoveSpeed, v->GetRight()) - v->m_vecTurnSpeed.z * rearAxleY;
         const float slip = std::abs(std::atan2(vRightRear, std::max(std::abs(CVector::Dot(v->m_vecMoveSpeed, v->GetForward())), 0.02f)));
-        const bool sliding = slip > cfg.tcSlip && speed > 3.0f;
+        const bool sliding = slip > cfg.tcSlip * tcNet && speed > 3.0f;
         if (sliding) gas = 0.0f;
         // wheels spinning (4WD out of a tight turn: all four at full gas): the gas comes off until they grip again
         CAutomobile* a = static_cast<CAutomobile*>(v);
@@ -1835,6 +1851,7 @@ static void Control(CVehicle* v) {
     if (!openLoop && cfg.learnRate > 0.0f && speed > 5.0f && R->profile.empty() && cfg.mode != "neural" && cfg.mode != "neural2")
         LearnByResult(speed, dt, brakeAsked);
     if (d.handbrakeAt && tp >= 0.0f) hb = true;
+    if (cfg.mode == "neural2" && R->nnHb > 0.5f && speed > 5.0f) hb = true;
     gasOut = gas;
     brakeOut = brake;
     handbrakeOut = hb;
@@ -2223,6 +2240,12 @@ static std::vector<float> nn2Theta;
 static FILETIME nn2Stamp{};
 static std::vector<float> nn2Eps[kMaxRunners];     // the perturbation each car drove (empty: none)
 static std::string Nn2Path() { return baseDir + "proving\\nn2_central.txt"; }
+// a theta with fewer outputs (the same layers): the new output rows added at 0, what it learned kept
+static bool PadTheta(std::vector<float>& w) {
+    const int sz = static_cast<int>(w.size());
+    if (sz < kNN2 && sz >= kNn2L3 + (kNn2Hid2 + 1) && (kNN2 - sz) % (kNn2Hid2 + 1) == 0) { w.resize(kNN2, 0.0f); return true; }
+    return false;
+}
 static void LoadTheta() {
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExA(Nn2Path().c_str(), GetFileExInfoStandard, &a) || CompareFileTime(&a.ftLastWriteTime, &nn2Stamp) == 0) return;
@@ -2230,6 +2253,10 @@ static void LoadTheta() {
     std::vector<float> w;
     float x;
     while (f >> x) w.push_back(x);
+    // (fewer outputs: the same layers, the new output rows added at 0: what it learned kept)
+    const int sz = static_cast<int>(w.size());
+    if (PadTheta(w))
+        Log(Format("neural2: theta of %d outputs: %d new outputs added at 0 (what it learned kept)", (sz - kNn2L3) / (kNn2Hid2 + 1), (kNN2 - sz) / (kNn2Hid2 + 1)));
     if (static_cast<int>(w.size()) != kNN2) return;
     nn2Theta = w;
     nn2Stamp = a.ftLastWriteTime;
@@ -2867,7 +2894,8 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
             double sc = 0.0;
             std::vector<float> w;
             float x;
-            if (f >> sc) { while (f >> x) w.push_back(x); if (static_cast<int>(w.size()) == kNN2) { bestTheta = w; bestNn = sc; } }
+            // (the best of a smaller net too: padded like theta, or a bad generation had nothing to go back to, g115)
+            if (f >> sc) { while (f >> x) w.push_back(x); PadTheta(w); if (static_cast<int>(w.size()) == kNN2) { bestTheta = w; bestNn = sc; } }
         }
         const bool sized = static_cast<int>(nn2Theta.size()) == kNN2;
         if (sized && r.nnRuns >= 10) {
@@ -3250,7 +3278,8 @@ static void ResetLane() {
     traceNext[R->index] = 0.0f;
     R->runId = ++GA::runIds;
     R->nnHeld = false; // (a new brain: not the last one's outputs)
-    R->nnLine = 0.0f;
+    R->nnLine = R->nnTc = R->nnAbs = R->nnHb = R->nnLook = 0.0f;
+    for (float& x : R->nnAct) x = 0.0f;
     R->nnPedal = R->teacherSteer = R->teacherPedal = 0.0f; // (the last run's, read on the first frame before)
     R->bornGen = GA::on && GA::steady ? GA::NextBirth() : GA::generation;
     nearIdx = 0;
@@ -3861,8 +3890,60 @@ static int hudMode = 0;
 
 // The compact HUD: the GA's generations and how they evolve (top right), the car followed (bottom left), the course
 // strip (bottom)
+// The net of the car followed: its 80 inputs, its two layers and its 12 outputs (green > 0, red < 0, brighter the
+// bigger), each output with what it does to the car now
+static void DrawNetPanel() {
+    R = &runners[std::clamp(camOn, 0, numRunners - 1)];
+    if (cfg.mode != "neural2" || !car) return;
+    const float x = 20.0f, w = 440.0f;
+    float y = 20.0f;
+    const float ph = 470.0f;
+    Box(x, y, w, ph, kPanel);
+    Box(x, y, 4.0f, ph, CRGBA(120, 200, 255, 255));
+    Text(x + 14.0f, y + 6.0f, Format("REDE NEURAL  %d > %d > %d > %d", kNn2In, kNn2Hid, kNn2Hid2, kNn2Out), 0.8f, kWhite, 0, FONT_MENU);
+    Text(x + w - 12.0f, y + 9.0f, Format("carro %s.%d", R->tag, R->runId), 0.55f, kDim, 2);
+    y += 34.0f;
+    auto cell = [](float cx, float cy, float cw, float chh, float v) {
+        const float a = std::clamp(std::abs(v), 0.0f, 1.0f);
+        Box(cx, cy, cw, chh, v >= 0.0f ? CRGBA(80, 230, 120, static_cast<unsigned char>(40 + 215 * a)) : CRGBA(255, 90, 90, static_cast<unsigned char>(40 + 215 * a)));
+    };
+    auto grid = [&](const char* title, const float* v, int n, int cols) {
+        Text(x + 14.0f, y, title, 0.55f, kDim);
+        y += 16.0f;
+        const float cw = (w - 28.0f) / cols;
+        for (int i = 0; i < n; i++) cell(x + 14.0f + cw * (i % cols) + 1.0f, y + 12.0f * (i / cols), cw - 2.0f, 10.0f, v[i]);
+        y += 12.0f * ((n + cols - 1) / cols) + 6.0f;
+    };
+    grid("entradas: raios, pista, movimento, rodas, cambio, linha", R->nnIn, kNn2In, 20);
+    grid("camada 1", R->nnAct, kNn2Hid, 24);
+    grid("camada 2", R->nnAct + kNn2Hid, kNn2Hid2, 24);
+    const float* o = R->nnAct + kNn2Hid + kNn2Hid2;
+    const float lock = HandlingLockRad(car) * 180.0f / 3.14159265f;
+    const std::string names[kNn2Out] = { "volante", "velocidade", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente",
+        "curva < 12 m", "curva < 25 m", "curva < 60 m", "curva < 150 m", "curva > 150 m" };
+    std::string eff[kNn2Out];
+    eff[0] = Format("%+.1f graus", o[0] * kNn2SteerSpan * lock);
+    eff[1] = Format("x%.2f", 1.0f + kNn2SpeedSpan * o[1]);
+    eff[2] = Format("%+.2f m", o[2] * R->lineRoom);
+    eff[3] = Format("x%.2f", std::exp(0.7f * o[3]));
+    eff[4] = Format("x%.2f", std::exp(0.5f * o[4]));
+    eff[5] = o[5] > 0.5f ? std::string("PUXADO") : std::string("-");
+    eff[6] = Format("x%.2f", std::exp(0.5f * o[6]));
+    for (int b = 0; b < 5; b++) eff[7 + b] = Format("x%.2f", std::exp(0.4f * o[7 + b]));
+    Text(x + 14.0f, y, "saidas (0 = o professor, pursuit)", 0.55f, kDim);
+    y += 18.0f;
+    for (int m = 0; m < kNn2Out; m++) {
+        Text(x + 14.0f, y, names[m], 0.56f, kWhite);
+        Bar(x + 170.0f, y + 4.0f, 160.0f, 9.0f, std::clamp(o[m], -1.0f, 1.0f), o[m] >= 0.0f ? CRGBA(80, 230, 120, 230) : CRGBA(255, 90, 90, 230), true);
+        Text(x + w - 12.0f, y, eff[m], 0.56f, kWhite, 2);
+        y += 17.0f;
+    }
+    R = runners;
+}
+
 static void DrawHudCompact() {
     const float W = hudW, H = hudH;
+    DrawNetPanel();
     const CRGBA kGood(120, 230, 120, 255), kBad(255, 110, 110, 255), kGold(255, 214, 10, 255);
     if (GA::on) {
         const float gw = 420.0f, x = W - 20.0f - gw;
