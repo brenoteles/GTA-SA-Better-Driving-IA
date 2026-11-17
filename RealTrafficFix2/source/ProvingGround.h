@@ -28,6 +28,7 @@ static FILETIME iniStamp{};
 static unsigned int lastIniCheck = 0;
 static std::ofstream summary;
 static float lineRate = 3.0f; // [Steer] LineRate: the weight of the change of curvature in the racing line (0: curvature only)
+static int lineTime = 2;       // [Steer] LineTime: minimum-time rounds on the racing line (0: minimum curvature only)
 
 // --- Settings (ini) --------------------------------------------------------------------------------------------------
 
@@ -247,6 +248,7 @@ static void ReadSettings() {
     f(st, "LineCut", s.lineCut);
     f(st, "LineRace", s.lineRace);
     lineRate = ini.ReadFloat(st, "LineRate", lineRate);
+    lineTime = ini.ReadInteger(st, "LineTime", lineTime);
     f(st, "MpcHorizon", s.mpcHorizon);
     f(st, "MpcWeight", s.mpcWeight);
     f(sp, "GtAccel", s.gtAccel);
@@ -534,7 +536,7 @@ static std::vector<float> raceRoom;                         // the room each poi
 static std::map<std::string, std::vector<float>> raceRoomCache;
 static void RaceLine(const Course& rd, float room) {
     const int n = static_cast<int>(rd.p.size());
-    const std::string key = Format("%d|%.2f|%.2f|%.2f|%.2f|%.2f", n, room, rd.length, rd.head.empty() ? 0.0f : rd.head[n / 2], rd.curv.empty() ? 0.0f : rd.curv[n / 3], lineRate);
+    const std::string key = Format("%d|%.2f|%.2f|%.2f|%.2f|%.2f|%d", n, room, rd.length, rd.head.empty() ? 0.0f : rd.head[n / 2], rd.curv.empty() ? 0.0f : rd.curv[n / 3], lineRate, lineTime);
     auto hit = raceCache.find(key);
     if (hit != raceCache.end()) { raceOff = hit->second; raceRoom = raceRoomCache[key]; return; }
     raceOff.assign(n, 0.0f);
@@ -581,9 +583,15 @@ static void RaceLine(const Course& rd, float room) {
         // (+ kRate x the change of curvature between neighbours, squared: the line eases into and out of every curve
         // and every part, as a clothoid; with the curvature alone it bent at once where a straight met a curve or a
         // part kept in the middle began, the joins the user saw)
-        const float kRate = std::max(lineRate, 0.0f), stepLen = 1.0f / (16.0f + 64.0f * kRate);
+        const float kRate = std::max(lineRate, 0.0f);
         std::vector<CVector2D> P(m), D(m), Q(m);
-        for (int it = 0; it < 12000; it++) {
+        std::vector<float> wt(m, 1.0f); // (each point's weight: 1, minimum curvature; the minimum time rounds below)
+        auto solve = [&](int iters) {
+        float wMax = 1.0f;
+        for (float w : wt) wMax = std::max(wMax, w);
+        const float stepLen = 1.0f / (16.0f * wMax + 64.0f * kRate);
+        prev = x;
+        for (int it = 0; it < iters; it++) {
             const float mom = static_cast<float>(it % 3000) / (it % 3000 + 3); // (restarted now and then: steadier)
             for (int j = 0; j < m; j++) y[j] = x[j] + mom * (x[j] - prev[j]);
             for (int j = 0; j < m; j++) P[j] = c[j] + nn[j] * y[j];
@@ -593,7 +601,7 @@ static void RaceLine(const Course& rd, float room) {
             // the gradient of sum |D|^2 + kRate sum |D(j+1) - D(j)|^2 with respect to each D(j)
             for (int j = 0; j < m; j++) {
                 const CVector2D ePrev = j > 0 ? D[j] - D[j - 1] : CVector2D(0.0f, 0.0f), eNext = j + 1 < m ? D[j + 1] - D[j] : CVector2D(0.0f, 0.0f);
-                Q[j] = D[j] + (ePrev - eNext) * kRate;
+                Q[j] = D[j] * wt[j] + (ePrev - eNext) * kRate;
             }
             Q[0] = CVector2D(0.0f, 0.0f);
             Q[m - 1] = CVector2D(0.0f, 0.0f);
@@ -603,6 +611,38 @@ static void RaceLine(const Course& rd, float room) {
                 x[j] = std::clamp(y[j] - stepLen * CVector2D::Dot(gd, nn[j]), -lim[j], lim[j]);
             }
         }
+        };
+        // the lap time of a line, roughly (its curvature, 1.9 g of grip and of braking, 0.8 of it to speed up, 130 m/s
+        // at most: TUM's velocity profile, simplified) and each point's speed
+        std::vector<float> vel(m);
+        auto lapOf = [&]() {
+            for (int j = 0; j < m; j++) P[j] = c[j] + nn[j] * x[j];
+            const float G = 1.9f * 9.81f;
+            for (int j = 0; j < m; j++) {
+                const float k = j > 0 && j + 1 < m ? (P[j - 1] - P[j] * 2.0f + P[j + 1]).Magnitude() / 4.0f : 0.0f;
+                vel[j] = k > 1e-5f ? std::min(130.0f, std::sqrt(G / k)) : 130.0f;
+            }
+            for (int j = m - 2; j >= 0; j--) vel[j] = std::min(vel[j], std::sqrt(vel[j + 1] * vel[j + 1] + 2.0f * G * 2.0f));
+            for (int j = 1; j < m; j++) vel[j] = std::min(vel[j], std::sqrt(vel[j - 1] * vel[j - 1] + 2.0f * 0.8f * G * 2.0f));
+            double t = 0.0;
+            for (int j = 1; j < m; j++) t += (P[j] - P[j - 1]).Magnitude() / std::max(0.5f * (vel[j] + vel[j - 1]), 1.0f);
+            return t;
+        };
+        solve(12000);
+        const double tCurv = lapOf();
+        // Minimum time (TUM's opt_mintime, approximated): the curvature weighted by how slow the car is there, (40 m/s
+        // / its speed)^2 between 0.3 and 3, solved again from the line before; the slow curves count more, the fast
+        // parts give up a little straightness for them ([Steer] LineTime: the rounds, 0: minimum curvature only)
+        double tTime = tCurv;
+        for (int round = 0; round < lineTime; round++) {
+            for (int j = 0; j < m; j++) wt[j] = std::clamp((40.0f / std::max(vel[j], 5.0f)) * (40.0f / std::max(vel[j], 5.0f)), 0.3f, 3.0f);
+            const std::vector<float> keep = x;
+            solve(8000);
+            const double t2 = lapOf();
+            if (t2 > tTime) { x = keep; lapOf(); break; } // (no better: the line before)
+            tTime = t2;
+        }
+        Log(Format("racing line: minimum curvature ~%.1f s a lap, minimum time ~%.1f s (%d rounds)", tCurv, tTime, lineTime));
         for (int i = 0; i < n; i++) {
             const int j = std::min(i / st, m - 2);
             const float t = std::clamp((i - j * st) / static_cast<float>(st), 0.0f, 1.0f);
@@ -2191,7 +2231,9 @@ static const GeneDef kGenes[] = {
     { "Steer", "StanleyK", &Settings::stanleyK, 0.3f, 5.0f, "stanley" },
     { "Steer", "Gain", &Settings::gain, 0.5f, 1.3f, "pursuit mod rpp blend" },
     { "Steer", "Smoothing", &Settings::smoothing, 0.0f, 0.12f, "" },
-    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.55f, "" }, // curve speeds: share of the AI grip formula
+    // (0.55 while the teacher aimed 4.3 m ahead and the gusts threw it out; 0.70 with those fixed: the GA goes as close
+    // to the grip as pays, the user's item 5)
+    { "Speed", "GripFactor", &Settings::gripFactor, 0.3f, 0.70f, "" }, // curve speeds: share of the AI grip formula
     { "Speed", "BrakeG", &Settings::speedBrakeG, 0.5f, 1.6f, "" },    // braking planned for curves and limits
     { "Speed", "Kp", &Settings::speedKp, 0.1f, 1.0f, "" },
     { "Speed", "BrakeKp", &Settings::brakeKp, 0.2f, 2.5f, "" },   // (to 2.5: 10 of 40 at 1.5, the 1st among them)
