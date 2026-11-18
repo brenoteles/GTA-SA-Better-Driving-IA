@@ -4447,10 +4447,14 @@ static void DrawHudCompact(bool full = false) {
         const int rows = std::min<int>(full ? 16 : 8, numRunners);
         Box(x, y, w, 20.0f + rows * 15.0f, kPanel);
         Text(x + 10.0f, y + 3.0f, "LIDERES", 0.5f, kWhite);
-        for (int i = 0; i < rows; i++) {
+        // (the car followed shown at its place even when it is not among them: the last row)
+        int camPos = 0;
+        for (int i = 0; i < static_cast<int>(order.size()); i++) if (order[i] == camOn) camPos = i;
+        for (int row = 0; row < rows; row++) {
+            const int i = row == rows - 1 && camPos >= rows ? camPos : row;
             const int k = order[i];
             const Runner& rr = runners[k];
-            const float ry = y + 19.0f + i * 15.0f;
+            const float ry = y + 19.0f + row * 15.0f;
             if (k == camOn) Box(x + 4.0f, ry, w - 8.0f, 14.0f, CRGBA(255, 255, 255, 28));
             Box(x + 10.0f, ry + 3.0f, 8.0f, 8.0f, ColorOf(k));
             Text(x + 22.0f, ry, Format("%d. %s", i + 1, rr.tag), 0.46f, kWhite);
@@ -4503,6 +4507,20 @@ static void DrawHudCompact(bool full = false) {
         line("sigma dos genes", Format("%.3f", GA::sigma), kWhite);
         line("GA / ES", GA::splitEvery > 1 ? Format("%d / %d carros", (numRunners + GA::splitEvery - 1) / GA::splitEvery, numRunners - (numRunners + GA::splitEvery - 1) / GA::splitEvery) : std::string("juntos"), kWhite);
         line("ms por quadro: sensores / rede", Format("%.1f / %.1f", Perf::shown[Perf::NNIN], Perf::shown[Perf::NNNET]), kWhite);
+        // the records
+        const float ry0 = y + 134.0f;
+        Box(x, ry0, w, 84.0f, kPanel);
+        Box(x, ry0, 3.0f, 84.0f, kGold);
+        Text(x + 10.0f, ry0 + 3.0f, "RECORDES", 0.5f, kWhite);
+        ly = ry0 + 20.0f;
+        line("recorde (pontos)", GA::bestGen >= 0 ? Format("%.2f  g%d", GA::bestScore, GA::bestGen) : std::string("-"), kGold);
+        if (GA::bestGen >= 0) line("  a volta dele", Format("%.2f s, desvio %.2f m, %.1f s fora", GA::bestRes.time, GA::bestRes.mean, GA::bestRes.out), kWhite);
+        line("melhor validacao da rede", nn2BestScore < 1e17 ? Format("%.2f", nn2BestScore) : std::string("-"), kWhite);
+        {
+            double sb = 0.0;
+            for (float v : GA::secBest) if (v > 0.0f) sb += v;
+            line("soma dos melhores setores", sb > 0.0 ? Format("%.2f (g%d)", sb, GA::secGen) : std::string("-"), kWhite);
+        }
     }
 
     // --- the car followed, bottom left, and its net above it
@@ -4528,10 +4546,26 @@ static void DrawHudCompact(bool full = false) {
         Text(x + w - 8.0f, y + 38.0f, Format("%.1f g", std::abs(R->latGNow)), 0.46f, kDim, 2);
         Text(x + w - 8.0f, y + 51.0f, Format("%s%s%s", R->absOn ? "ABS " : "", R->tcOn ? "TC " : "", R->skidFNow || R->skidRNow ? "DESLIZA" : ""), 0.46f, kGold, 2);
         if (full) {
-            const float ex = x, ey = y - 34.0f;
-            Box(ex, ey, w, 30.0f, kPanel);
-            Text(ex + 10.0f, ey + 2.0f, Format("mira %.2f s  aderencia %.2f  contra %.2f  acel %.2f", cfg.lookTime, cfg.gripFactor, cfg.counterSteer, cfg.gtAccel), 0.42f, kDim);
-            Text(ex + 10.0f, ey + 15.0f, Format("rotacao %+.2f rad/s  deslize %.2f rad  vento %+.1f", car->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS, R->slipNow, R->windNow), 0.42f, kDim);
+            const float ex = x, ey = y - 62.0f;
+            Box(ex, ey, w, 58.0f, kPanel);
+            // its place among all, the gap to the one furthest on
+            const std::vector<int> ord = Standings();
+            int pos = 0;
+            float lead = 0.0f;
+            for (int i = 0; i < static_cast<int>(ord.size()); i++) if (ord[i] == R->index) pos = i + 1;
+            for (int k = 0; k < numRunners; k++) if (runners[k].result.empty()) lead = std::max(lead, runners[k].sMax);
+            std::string l1 = Format("posicao %d de %d", pos, numRunners);
+            if (R->result.empty() && lead > R->sMax + 1.0f) l1 += Format("   %.0f m atras do primeiro", lead - R->sMax);
+            // its sector now against the last generation's best of it
+            int q = -1;
+            for (int i = 0; i < static_cast<int>(R->secT.size()); i++) if (R->secT[i] >= 0.0f) q = i;
+            if (R->result.empty() && q >= 0 && q < static_cast<int>(GA::secBest.size()) && GA::secBest[q] > 0.0f)
+                l1 += Format("   %s %.1f s (melhor %.2f)", GA::secNames[q].c_str(), runT - R->secT[q], GA::secBest[q]);
+            Text(ex + 10.0f, ey + 2.0f, l1, 0.42f, kWhite);
+            Text(ex + 10.0f, ey + 15.0f, Format("penalidades: %.1f s com 4 rodas fora, %.1f m.s alem da borda   agora %.0f km/h", stats.outTime, stats.deficit,
+                R->speedNow), 0.42f, stats.outTime > 0.0 ? kBad : kDim);
+            Text(ex + 10.0f, ey + 28.0f, Format("mira %.2f s  aderencia %.2f  contra %.2f  acel %.2f", cfg.lookTime, cfg.gripFactor, cfg.counterSteer, cfg.gtAccel), 0.42f, kDim);
+            Text(ex + 10.0f, ey + 41.0f, Format("rotacao %+.2f rad/s  deslize %.2f rad  vento %+.1f", car->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS, R->slipNow, R->windNow), 0.42f, kDim);
             DrawNetPanel(x, ey - 6.0f, true);
         }
         else DrawNetPanel(x, y - 6.0f);
@@ -4557,9 +4591,9 @@ static void DrawHud() {
     if (hudMode == 2) { Text(W - 20.0f, H - 30.0f, "F9: HUD", 0.5f, kDim, 2); return; }
     // (the compact and full HUDs 25% bigger, text and panels together: the text was too small, the user)
     if (hudMode == 0 || hudMode == 1) {
-        hudU *= 1.25f;
+        hudU *= 1.4f; // (1.25 still too small, the user)
         hudW = static_cast<float>(RsGlobal.maximumWidth) / hudU;
-        hudH = 1080.0f / 1.25f;
+        hudH = 1080.0f / 1.4f;
     }
     if (hudMode == 0) { DrawHudCompact(); return; }
     // (the full HUD: the compact one with more in it; the old full one took most of the screen, the user)
