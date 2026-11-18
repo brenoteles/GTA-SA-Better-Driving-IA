@@ -2299,6 +2299,12 @@ static int nn2Cars = 20;
 // The validation of the net (the user's guide: the best of the training is not the best; look at the validation, stop at
 // a plateau, prefer the stable): the car driving theta itself, unperturbed (AssignNn2's first), is its validation run
 static int thetaCar = -1;
+// [GA] SplitEvery: every that many lanes one tries the teacher's genes (the GA, with theta itself), the others theta's
+// perturbations (the ES, with the champion's genes): each car tests one thing, its score no longer the two mixed (1: off).
+// [GA] ValCars: the ES's cars driving theta itself, unperturbed: the validation is their median (one run was luck)
+static int splitEvery = 5, valCars = 5;
+static std::vector<int> valIdx;
+static bool IsGaLane(int k) { return splitEvery > 1 && k % splitEvery == 0; }
 static double valScore = 0.0, std50Prev = 0.0;
 static bool valHome = false;
 static int nn2Min = 0;   // Nn2Min: at least this many neural2 brains in every generation (the user: 25, so it evolves)
@@ -2371,6 +2377,8 @@ static void Read(CIniReader& ini, const Settings& s) {
     nn2Noise = ini.ReadFloat("GA", "Nn2Noise", nn2Noise);
     nn2Cars = ini.ReadInteger("GA", "Nn2Cars", nn2Cars);
     nn2Min = ini.ReadInteger("GA", "Nn2Min", nn2Min);
+    splitEvery = ini.ReadInteger("GA", "SplitEvery", splitEvery);
+    valCars = std::max(ini.ReadInteger("GA", "ValCars", valCars), 1);
     tournament = std::max(ini.ReadInteger("GA", "Tournament", tournament), 1);
     immigrants = ini.ReadInteger("GA", "Immigrants", immigrants);
     maxGenerations = ini.ReadInteger("GA", "Generations", maxGenerations);
@@ -2494,15 +2502,23 @@ static void AssignNn2(Genome* g, int n) {
     const float sg = nn2Es ? nn2Sigma : nn2Noise;
     int j = 0;
     std::vector<float> eps(kNN2);
+    valIdx.clear();
     for (int k = 0; k < n; k++) {
         nn2Eps[k].clear();
         if (!IsNeural2(g[k])) continue;
         if (static_cast<int>(nn2Theta.size()) != kNN2) { for (float& w : g[k].nn) w = 0.0f; continue; } // (no theta yet: the teacher steers)
+        if (IsGaLane(k) || static_cast<int>(valIdx.size()) < valCars) {
+            // a GA lane (its genes tested with theta itself) or a validation car (the champion's genes, theta itself)
+            for (int w = 0; w < kNN2; w++) g[k].nn[w] = nn2Theta[w];
+            if (!IsGaLane(k)) valIdx.push_back(k);
+            if (thetaCar < 0 || !IsGaLane(k)) thetaCar = valIdx.empty() ? k : valIdx[0];
+            continue;
+        }
         if (j > 0 && j % 2 == 1) for (float& e : eps) e = N01();
         const float sign = j == 0 ? 0.0f : j % 2 == 1 ? 1.0f : -1.0f;
         nn2Eps[k].resize(kNN2);
         for (int w = 0; w < kNN2; w++) { nn2Eps[k][w] = sign * eps[w]; g[k].nn[w] = nn2Theta[w] + sg * nn2Eps[k][w]; }
-        if (j == 0) { nn2Eps[k].clear(); thetaCar = k; } // (theta itself: shown, not used for the step: the validation)
+        if (j == 0) nn2Eps[k].clear(); // (the first one theta itself too: not used for the step)
         j++;
     }
 }
@@ -2756,8 +2772,16 @@ static int Tournament(const std::vector<double>& avg, int mode = -1) {
 static void ReportPop(int n);
 static void NextGeneration() {
     const int n = numRunners;
-    valHome = thetaCar >= 0 && thetaCar < n && res[thetaCar].why == "end";
-    valScore = thetaCar >= 0 && thetaCar < n ? res[thetaCar].score : 1e9;
+    {
+        // the validation: the median of the cars driving theta itself (home if more than half got home)
+        std::vector<double> vs;
+        int home = 0;
+        for (int k : valIdx) if (k >= 0 && k < n) { vs.push_back(res[k].score); home += res[k].why == "end"; }
+        std::sort(vs.begin(), vs.end());
+        valScore = vs.empty() ? 1e9 : vs[vs.size() / 2];
+        valHome = !vs.empty() && home * 2 > static_cast<int>(vs.size());
+        if (vs.size() > 1) Log(Format("neural2: validation %.2f (median of %d, %.2f..%.2f, %d home)", valScore, static_cast<int>(vs.size()), vs.front(), vs.back(), home));
+    }
     ReportPop(n);
     // ranked by the average of the generations each genome drove (a new one: this run)
     std::vector<double> avg(n);
@@ -2768,6 +2792,15 @@ static void NextGeneration() {
         avg[k] = pop[k].sum / pop[k].runs;
     }
     if (human && n > 0) avg[0] = 1e18; // (car A is the human: scored and logged, never chosen)
+    if (splitEvery > 1 && !valIdx.empty()) {
+        // the GA's choice among its own lanes and the champion's re-run (its genes on the validation cars, their
+        // median); the ES's perturbations are the net's, not the genes'
+        const int champ = valIdx[0];
+        for (int k = 0; k < n; k++)
+            if (!IsGaLane(k) && k != champ) avg[k] = 1e18;
+        pop[champ].sum += valScore - res[champ].score; // (its run counted as the median)
+        avg[champ] = pop[champ].sum / pop[champ].runs;
+    }
     std::vector<int> order(n);
     for (int k = 0; k < n; k++) order[k] = k;
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return avg[a] < avg[b]; });
@@ -2893,6 +2926,22 @@ static void NextGeneration() {
     }
     for (int i = n - imm; i < n; i++) next[i] = Random();
     if (human && n > 1) std::swap(next[0], next[n - 1]); // (the best brain not on the human's car A)
+    if (splitEvery > 1) {
+        // the GA's brains (elite first) on its lanes, the champion's genes on all the ES's: the best with at least 2
+        // runs in its average (the elites run again every generation), else the champion before (one lucky run took
+        // 400 cars with it, g208: 273 of 500 home)
+        int ci = -1;
+        for (int r = 0; r < n && ci < 0; r++) if (avg[order[r]] < 1e17 && pop[order[r]].runs >= 2) ci = order[r];
+        if (ci < 0) ci = !valIdx.empty() ? valIdx[0] : order[0];
+        const Genome champ = pop[ci];
+        static Genome bred[kMaxRunners];
+        for (int i = 0; i < n; i++) bred[i] = next[i];
+        int at = 0;
+        for (int i = 0; i < n; i++) {
+            if (IsGaLane(i)) next[i] = bred[at++];
+            else { next[i] = champ; next[i].sum = 0.0; next[i].runs = 0; next[i].label.clear(); }
+        }
+    }
     StepTheta(n);
     AssignNn2(next, n);
     for (int k = 0; k < n; k++) { pop[k] = next[k]; res[k] = Result(); }
