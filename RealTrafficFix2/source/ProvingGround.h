@@ -2320,6 +2320,11 @@ static int thetaCar = -1;
 // [GA] ValCars: the ES's cars driving theta itself, unperturbed: the validation is their median (one run was luck)
 static int splitEvery = 5, valCars = 5;
 static std::vector<int> valIdx;
+// The candidate (elitism for the ES): the best perturbation of a generation, home and 0.3 s under the validation, drives
+// again on ValCars cars of the next one beside the validation; better by 0.2 s with 4 of 5 home, theta jumps to it (the
+// ES cars could not set the record nor be chosen, only a share of the step: a 99.96 was measured and dropped)
+static std::vector<float> candEps;
+static std::vector<int> candIdx;
 static bool IsGaLane(int k) { return splitEvery > 1 && k % splitEvery == 0; }
 static double valScore = 0.0, std50Prev = 0.0;
 static bool valHome = false;
@@ -2577,6 +2582,7 @@ static void AssignNn2(Genome* g, int n) {
     int j = 0;
     std::vector<float> eps(kNN2);
     valIdx.clear();
+    candIdx.clear();
     for (int k = 0; k < n; k++) {
         nn2Eps[k].clear();
         if (!IsNeural2(g[k])) continue;
@@ -2586,6 +2592,12 @@ static void AssignNn2(Genome* g, int n) {
             for (int w = 0; w < kNN2; w++) g[k].nn[w] = nn2Theta[w];
             if (!IsGaLane(k)) valIdx.push_back(k);
             if (thetaCar < 0 || !IsGaLane(k)) thetaCar = valIdx.empty() ? k : valIdx[0];
+            continue;
+        }
+        if (static_cast<int>(candEps.size()) == kNN2 && static_cast<int>(candIdx.size()) < valCars) {
+            // the candidate's re-run (the champion's genes too: beside the validation, the same conditions)
+            for (int w = 0; w < kNN2; w++) g[k].nn[w] = nn2Theta[w] + sg * candEps[w];
+            candIdx.push_back(k);
             continue;
         }
         if (j > 0 && j % 2 == 1) for (float& e : eps) e = N01();
@@ -2856,6 +2868,29 @@ static void NextGeneration() {
         valHome = !vs.empty() && home * 2 > static_cast<int>(vs.size());
         if (vs.size() > 1) Log(Format("neural2: validation %.2f (median of %d, %.2f..%.2f, %d home)", valScore, static_cast<int>(vs.size()), vs.front(), vs.back(), home));
     }
+    {
+        // the candidate against the validation, then the next candidate
+        const float sg = nn2Es ? nn2Sigma : nn2Noise;
+        if (!candIdx.empty() && static_cast<int>(candEps.size()) == kNN2 && static_cast<int>(nn2Theta.size()) == kNN2) {
+            std::vector<double> cs;
+            int home = 0;
+            for (int k : candIdx) if (k >= 0 && k < n) { cs.push_back(res[k].score); home += res[k].why == "end"; }
+            std::sort(cs.begin(), cs.end());
+            const double med = cs.empty() ? 1e9 : cs[cs.size() / 2];
+            const bool ok = home * 5 >= 4 * static_cast<int>(cs.size()) && med < valScore - 0.2;
+            if (ok) { for (int w = 0; w < kNN2; w++) nn2Theta[w] += sg * candEps[w]; SaveTheta(); }
+            Log(Format("neural2: candidate %s: median %.2f (%d of %d home) against the validation %.2f", ok ? "TAKEN" : "dropped", med, home,
+                static_cast<int>(cs.size()), valScore));
+        }
+        candEps.clear();
+        int bestK = -1;
+        for (int k = 0; k < n; k++)
+            if (!nn2Eps[k].empty() && res[k].why == "end" && (!valHome || res[k].score < valScore - 0.3) && (bestK < 0 || res[k].score < res[bestK].score)) bestK = k;
+        if (bestK >= 0) {
+            candEps = nn2Eps[bestK];
+            Log(Format("neural2: next candidate %s %.2f (validation %.2f)", kTags[bestK], res[bestK].score, valScore));
+        }
+    }
     ReportPop(n);
     // ranked by the average of the generations each genome drove (a new one: this run)
     std::vector<double> avg(n);
@@ -3004,10 +3039,19 @@ static void NextGeneration() {
         // the GA's brains (elite first) on its lanes, the champion's genes on all the ES's: the best with at least 2
         // runs in its average (the elites run again every generation), else the champion before (one lucky run took
         // 400 cars with it, g208: 273 of 500 home)
+        // (kept from generation to generation: changed only for a GA lane with 3 runs in its average that beats the
+        // champion's own score, the validation's median with the same net, by 0.3 s; a new champion every generation
+        // threw the 400 ES cars, the validation and the candidate's re-run from one set of genes to another, g244-247)
+        static Genome champKeep;
+        static bool haveChamp = false;
         int ci = -1;
-        for (int r = 0; r < n && ci < 0; r++) if (avg[order[r]] < 1e17 && pop[order[r]].runs >= 2) ci = order[r];
-        if (ci < 0) ci = !valIdx.empty() ? valIdx[0] : order[0];
-        const Genome champ = pop[ci];
+        for (int r = 0; r < n && ci < 0; r++) if (IsGaLane(order[r]) && avg[order[r]] < 1e17 && pop[order[r]].runs >= 3) ci = order[r];
+        if (!haveChamp || (ci >= 0 && avg[ci] < valScore - 0.3)) {
+            champKeep = ci >= 0 ? pop[ci] : pop[!valIdx.empty() ? valIdx[0] : order[0]];
+            if (haveChamp) Log(Format("GA: a new champion %s, %.2f in %d runs against %.2f", kTags[ci], avg[ci], pop[ci].runs, valScore));
+            haveChamp = true;
+        }
+        const Genome champ = champKeep;
         static Genome bred[kMaxRunners];
         for (int i = 0; i < n; i++) bred[i] = next[i];
         int at = 0;
@@ -4379,7 +4423,12 @@ static void DrawHudCompact(bool full = false) {
         Box(x, y, 3.0f, h, CRGBA(175, 110, 255, 255));
         Text(x + 12.0f, y + 4.0f, Format("GERACAO %d", GA::generation), 0.7f, kWhite, 0, FONT_MENU);
         Text(x + 150.0f, y + 6.0f, Format("%d rodando   %d chegaram   %d fora   de %d", running, home, out, numRunners), 0.55f, kDim);
+        // (the record: what the GA kept; the best lap ever: any car's, the ES's perturbations too)
+        double lapBest = 1e18;
+        int lapGen = -1;
+        for (const auto& gr : GA::genRows) if (gr.score < 1000.0 && gr.score < lapBest) { lapBest = gr.score; lapGen = gr.gen; }
         std::string mid = GA::bestGen >= 0 ? Format("recorde %.2f (g%d)", GA::bestScore, GA::bestGen) : std::string("recorde -");
+        if (lapGen >= 0) mid += Format("    melhor volta %.2f (g%d)", lapBest, lapGen);
         if (GA::valHome) mid += Format("    validacao %.2f", GA::valScore);
         if (!GA::genRows.empty()) mid += Format("    top10 %.2f", GA::genRows.back().top10);
         Text(x + w * 0.55f, y + 6.0f, mid, 0.55f, kGold, 1);
@@ -4509,13 +4558,19 @@ static void DrawHudCompact(bool full = false) {
         line("ms por quadro: sensores / rede", Format("%.1f / %.1f", Perf::shown[Perf::NNIN], Perf::shown[Perf::NNNET]), kWhite);
         // the records
         const float ry0 = y + 134.0f;
-        Box(x, ry0, w, 84.0f, kPanel);
-        Box(x, ry0, 3.0f, 84.0f, kGold);
+        Box(x, ry0, w, 100.0f, kPanel);
+        Box(x, ry0, 3.0f, 100.0f, kGold);
         Text(x + 10.0f, ry0 + 3.0f, "RECORDES", 0.5f, kWhite);
         ly = ry0 + 20.0f;
         line("recorde (pontos)", GA::bestGen >= 0 ? Format("%.2f  g%d", GA::bestScore, GA::bestGen) : std::string("-"), kGold);
         if (GA::bestGen >= 0) line("  a volta dele", Format("%.2f s, desvio %.2f m, %.1f s fora", GA::bestRes.time, GA::bestRes.mean, GA::bestRes.out), kWhite);
         line("melhor validacao da rede", nn2BestScore < 1e17 ? Format("%.2f", nn2BestScore) : std::string("-"), kWhite);
+        {
+            double lb = 1e18;
+            int lg = -1;
+            for (const auto& gr : GA::genRows) if (gr.score < 1000.0 && gr.score < lb) { lb = gr.score; lg = gr.gen; }
+            line("melhor volta ja feita (qualquer carro)", lg >= 0 ? Format("%.2f  g%d", lb, lg) : std::string("-"), kGood);
+        }
         {
             double sb = 0.0;
             for (float v : GA::secBest) if (v > 0.0f) sb += v;
