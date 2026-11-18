@@ -174,6 +174,15 @@ static constexpr int kNnIn = 18, kNnHid = 10, kNN = (kNnIn + 1) * kNnHid + (kNnH
 static constexpr int kNn2In = 80, kNn2Hid = 48, kNn2Hid2 = 24, kNn2Out = 8;
 static constexpr int kNn2L2 = (kNn2In + 1) * kNn2Hid, kNn2L3 = kNn2L2 + (kNn2Hid + 1) * kNn2Hid2;
 static constexpr int kNN2 = kNn2L3 + (kNn2Hid2 + 1) * kNn2Out;
+// The sensors normalized as they come (observation normalization, OpenAI-ES / ARS): each input's mean and spread over
+// every car's frames, the net fed (x - mean) / spread within +-5; updated between generations, 30% the new one, and
+// folded into theta's first layer each time so the net computes the same at the change (rays 0..1, speeds /80, slips in
+// rad: the same perturbation moved the big inputs' weights much more than the small ones')
+static std::vector<float> nn2Mu(kNn2In, 0.0f), nn2Sd(kNn2In, 1.0f);
+static std::vector<double> nn2Sum(kNn2In, 0.0), nn2Sq(kNn2In, 0.0);
+static double nn2NormN = 0.0;
+static std::vector<float> nn2BestTheta; // (ReportGeneration's best theta: folded with theta)
+static double nn2BestScore = 1e18;
 static constexpr float kNn2SteerSpan = 0.25f, kNn2SpeedSpan = 0.5f; // the most it can add: a quarter of the lock, 30% of the speed
 static float edgeComfortGA = 1.0f; // a corridor: closer than this to an edge costs (stats.deficit; [GA] EdgeComfort)
 static float deckHeight = 80.0f;
@@ -1579,9 +1588,16 @@ static float Neural2Steer(CVehicle* v, float vv, int i) {
     const std::vector<float>& w = cfg.nn;
     if (static_cast<int>(w.size()) < kNN2) { R->nnPedal = 0.0f; return R->teacherSteer; }
     Perf::Scope perfNet(Perf::NNNET);
+    float xn[kNn2In];
+    for (int q = 0; q < kNn2In; q++) {
+        nn2Sum[q] += in[q];
+        nn2Sq[q] += static_cast<double>(in[q]) * in[q];
+        xn[q] = std::clamp((in[q] - nn2Mu[q]) / nn2Sd[q], -5.0f, 5.0f);
+    }
+    nn2NormN += 1.0;
     for (int j = 0; j < kNn2Hid; j++) {
         const float* row = &w[j * (kNn2In + 1)];
-        h[j] = std::tanh(row[kNn2In] + DotSse(row, in, kNn2In));
+        h[j] = std::tanh(row[kNn2In] + DotSse(row, xn, kNn2In));
     }
     float h2[kNn2Hid2];
     for (int j = 0; j < kNn2Hid2; j++) {
@@ -2474,6 +2490,63 @@ static void LoadTheta() {
     Log(Format("neural2: theta loaded (%d weights)", kNN2));
 }
 static void SaveTheta();
+static std::string NormPath() { return baseDir + "proving\\nn2_norm.txt"; }
+static void LoadNorm() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    std::ifstream f(NormPath());
+    std::vector<float> v;
+    float x;
+    while (f >> x) v.push_back(x);
+    if (static_cast<int>(v.size()) != 2 * kNn2In) return;
+    for (int q = 0; q < kNn2In; q++) { nn2Mu[q] = v[q]; nn2Sd[q] = std::max(v[kNn2In + q], 0.01f); }
+    Log("neural2: input normalization loaded");
+}
+// a first layer made for (mu, sd) remade for (mu2, sd2): the same output for the same raw input
+static void FoldNorm(std::vector<float>& t, const std::vector<float>& mu2, const std::vector<float>& sd2) {
+    if (static_cast<int>(t.size()) != kNN2) return;
+    for (int j = 0; j < kNn2Hid; j++) {
+        float* row = &t[j * (kNn2In + 1)];
+        double b = row[kNn2In];
+        for (int q = 0; q < kNn2In; q++) {
+            b += row[q] * (mu2[q] - nn2Mu[q]) / nn2Sd[q];
+            row[q] *= sd2[q] / nn2Sd[q];
+        }
+        row[kNn2In] = static_cast<float>(b);
+    }
+}
+static void UpdateNorm() {
+    if (nn2NormN < 1000.0) return;
+    const bool first = std::all_of(nn2Sd.begin(), nn2Sd.end(), [](float v) { return v == 1.0f; }) &&
+                       std::all_of(nn2Mu.begin(), nn2Mu.end(), [](float v) { return v == 0.0f; });
+    const float a = first ? 1.0f : 0.3f;
+    std::vector<float> mu2(kNn2In), sd2(kNn2In);
+    for (int q = 0; q < kNn2In; q++) {
+        const double m = nn2Sum[q] / nn2NormN, var = std::max(nn2Sq[q] / nn2NormN - m * m, 0.0);
+        mu2[q] = (1.0f - a) * nn2Mu[q] + a * static_cast<float>(m);
+        sd2[q] = std::max((1.0f - a) * nn2Sd[q] + a * static_cast<float>(std::sqrt(var)), 0.01f);
+    }
+    FoldNorm(nn2Theta, mu2, sd2);
+    FoldNorm(nn2BestTheta, mu2, sd2);
+    nn2Mu = mu2;
+    nn2Sd = sd2;
+    std::fill(nn2Sum.begin(), nn2Sum.end(), 0.0);
+    std::fill(nn2Sq.begin(), nn2Sq.end(), 0.0);
+    nn2NormN = 0.0;
+    std::ostringstream o;
+    for (float v : nn2Mu) o << v << " ";
+    for (float v : nn2Sd) o << v << " ";
+    Disk::Write(NormPath(), o.str() + "\n");
+    if (static_cast<int>(nn2Theta.size()) == kNN2) SaveTheta();
+    if (static_cast<int>(nn2BestTheta.size()) == kNN2) {
+        std::ostringstream b;
+        b << nn2BestScore;
+        for (float w : nn2BestTheta) b << " " << w;
+        Disk::Write(baseDir + "proving\\nn2_best.txt", b.str() + "\n");
+    }
+    Log(Format("neural2: input normalization %s (theta's first layer refolded: the same net)", first ? "started" : "updated"));
+}
 // No theta of this size (a new network: more inputs, the line output): hidden weights small and random, the outputs 0
 // (the teacher itself until ES moves it); the ASI needs no tool for it
 static void InitTheta() {
@@ -2499,6 +2572,7 @@ static void SaveTheta() {
 static void AssignNn2(Genome* g, int n) {
     LoadTheta();
     InitTheta();
+    LoadNorm();
     const float sg = nn2Es ? nn2Sigma : nn2Noise;
     int j = 0;
     std::vector<float> eps(kNN2);
@@ -2943,6 +3017,7 @@ static void NextGeneration() {
         }
     }
     StepTheta(n);
+    UpdateNorm();
     AssignNn2(next, n);
     for (int k = 0; k < n; k++) { pop[k] = next[k]; res[k] = Result(); }
     generation++;
@@ -3178,8 +3253,8 @@ static void ReportGeneration(int g, const std::vector<Done>& batch, double top10
     // score; one under 50% home goes back to it (ES drifted it out of the lane twice, g58 and g65: unattended, it
     // must not keep getting worse)
     {
-        static std::vector<float> bestTheta;
-        static double bestNn = 1e18;
+        std::vector<float>& bestTheta = nn2BestTheta;
+        double& bestNn = nn2BestScore;
         static bool loaded = false;
         const std::string path = baseDir + "proving\\nn2_best.txt";
         if (!loaded) {
@@ -4227,208 +4302,241 @@ static std::string StatusText(const Runner& r) {
 // F9: compact (0, the default), the full HUD of before (1), none (2)
 static int hudMode = 0;
 
-// The compact HUD: the GA's generations and how they evolve (top right), the car followed (bottom left), the course
-// strip (bottom)
-// The net of the car followed: its 80 inputs, its two layers and its 12 outputs (green > 0, red < 0, brighter the
-// bigger), each output with what it does to the car now
-static void DrawNetPanel() {
+// The compact HUD (the user: everything, in less of the screen): a bar along the top (the generation, how its cars are
+// doing, the record and the validation, fps, the course with every car on it), a narrow column on the right (the
+// evolution and the leaders), the car followed at the bottom left, its net above it (the outputs; F10: all of it)
+static bool netFull = false;
+static void Cell(float cx, float cy, float cw, float chh, float v) {
+    const float a = std::clamp(std::abs(v), 0.0f, 1.0f);
+    Box(cx, cy, cw, chh, v >= 0.0f ? CRGBA(80, 230, 120, static_cast<unsigned char>(40 + 215 * a)) : CRGBA(255, 90, 90, static_cast<unsigned char>(40 + 215 * a)));
+}
+static void DrawNetPanel(float x, float yBottom, bool full = false) {
     R = &runners[std::clamp(camOn, 0, numRunners - 1)];
-    if (cfg.mode != "neural2" || !car) return;
-    const float x = 20.0f, w = 440.0f;
-    float y = 20.0f;
-    const float ph = 470.0f;
-    Box(x, y, w, ph, kPanel);
-    Box(x, y, 4.0f, ph, CRGBA(120, 200, 255, 255));
-    Text(x + 14.0f, y + 6.0f, Format("REDE NEURAL  %d > %d > %d > %d", kNn2In, kNn2Hid, kNn2Hid2, kNn2Out), 0.8f, kWhite, 0, FONT_MENU);
-    Text(x + w - 12.0f, y + 9.0f, Format("carro %s.%d", R->tag, R->runId), 0.55f, kDim, 2);
-    y += 34.0f;
-    auto cell = [](float cx, float cy, float cw, float chh, float v) {
-        const float a = std::clamp(std::abs(v), 0.0f, 1.0f);
-        Box(cx, cy, cw, chh, v >= 0.0f ? CRGBA(80, 230, 120, static_cast<unsigned char>(40 + 215 * a)) : CRGBA(255, 90, 90, static_cast<unsigned char>(40 + 215 * a)));
-    };
-    auto grid = [&](const char* title, const float* v, int n, int cols) {
-        Text(x + 14.0f, y, title, 0.55f, kDim);
-        y += 16.0f;
-        const float cw = (w - 28.0f) / cols;
-        for (int i = 0; i < n; i++) cell(x + 14.0f + cw * (i % cols) + 1.0f, y + 12.0f * (i / cols), cw - 2.0f, 10.0f, v[i]);
-        y += 12.0f * ((n + cols - 1) / cols) + 6.0f;
-    };
-    grid("entradas: raios, pista, movimento, rodas, cambio, linha", R->nnIn, kNn2In, 20);
-    grid("camada 1", R->nnAct, kNn2Hid, 24);
-    grid("camada 2", R->nnAct + kNn2Hid, kNn2Hid2, 24);
+    if (cfg.mode != "neural2" || !car) { R = runners; return; }
+    const float w = 340.0f;
     const float* o = R->nnAct + kNn2Hid + kNn2Hid2;
     const float lock = HandlingLockRad(car) * 180.0f / 3.14159265f;
-    const std::string names[kNn2Out] = { "volante", "acelerador / freio", "linha", "controle de tracao", "ABS", "freio de mao", "olhar a frente", "agressividade" };
+    const char* names[kNn2Out] = { "volante", "pedal", "linha", "TC", "ABS", "freio de mao", "olhar", "agressividade" };
     std::string eff[kNn2Out];
-    eff[0] = Format("%+.1f graus", o[0] * kNn2SteerSpan * lock);
-    eff[1] = Format("pedal %+.2f", kNn2SpeedSpan * o[1]);
+    eff[0] = Format("%+.1f gr", o[0] * kNn2SteerSpan * lock);
+    eff[1] = Format("%+.2f", kNn2SpeedSpan * o[1]);
     eff[2] = Format("%+.2f m", o[2] * R->lineRoom);
     eff[3] = Format("x%.2f", std::exp(0.7f * o[3]));
     eff[4] = Format("x%.2f", std::exp(0.5f * o[4]));
-    eff[5] = o[5] > 0.0f ? Format("%.0f%% abaixo de 80", 100.0f * std::min(o[5] * o[5], 1.0f)) : std::string("-");
+    eff[5] = o[5] > 0.0f ? Format("%.0f%%", 100.0f * std::min(o[5] * o[5], 1.0f)) : std::string("-");
     eff[6] = Format("x%.2f", std::exp(0.5f * o[6]));
     eff[7] = Format("x%.2f", std::exp(0.25f * o[7]));
-    Text(x + 14.0f, y, "saidas (0 = o professor, pursuit)", 0.55f, kDim);
-    y += 18.0f;
+    const float rows = 4.0f, rowH = 15.0f;
+    const bool showAll = netFull || full;
+    const float gridH = showAll ? 12.0f + 7.0f * 4 + 7.0f * 2 + 7.0f + 18.0f : 0.0f;
+    const float h = 22.0f + rows * rowH + gridH + 6.0f, y = yBottom - h;
+    Box(x, y, w, h, kPanel);
+    Box(x, y, 3.0f, h, CRGBA(120, 200, 255, 255));
+    Text(x + 10.0f, y + 4.0f, Format("REDE %d>%d>%d>%d", kNn2In, kNn2Hid, kNn2Hid2, kNn2Out), 0.55f, kWhite);
+    if (!full) Text(x + w - 8.0f, y + 4.0f, netFull ? "F10: menos" : "F10: tudo", 0.5f, kDim, 2);
+    // the outputs, two columns: name, a bar, what it does now
     for (int m = 0; m < kNn2Out; m++) {
-        Text(x + 14.0f, y, names[m], 0.56f, kWhite);
-        Bar(x + 170.0f, y + 4.0f, 160.0f, 9.0f, std::clamp(o[m], -1.0f, 1.0f), o[m] >= 0.0f ? CRGBA(80, 230, 120, 230) : CRGBA(255, 90, 90, 230), true);
-        Text(x + w - 12.0f, y, eff[m], 0.56f, kWhite, 2);
-        y += 17.0f;
+        const float cx = x + 10.0f + (m % 2) * 165.0f, cy = y + 22.0f + (m / 2) * rowH;
+        Text(cx, cy, names[m], 0.48f, kDim);
+        Bar(cx + 70.0f, cy + 4.0f, 40.0f, 6.0f, std::clamp(o[m], -1.0f, 1.0f), o[m] >= 0.0f ? CRGBA(80, 230, 120, 230) : CRGBA(255, 90, 90, 230), true);
+        Text(cx + 155.0f, cy, eff[m], 0.48f, kWhite, 2);
+    }
+    if (showAll) {
+        // its inputs (normalized, as the net sees them) and both layers
+        float gy = y + 22.0f + rows * rowH + 4.0f;
+        Text(x + 10.0f, gy, "entradas, camada 1, camada 2", 0.45f, kDim);
+        gy += 14.0f;
+        const float cw = (w - 20.0f) / 20.0f;
+        for (int i = 0; i < kNn2In; i++) Cell(x + 10.0f + cw * (i % 20), gy + 7.0f * (i / 20), cw - 1.0f, 6.0f, (R->nnIn[i] - nn2Mu[i]) / nn2Sd[i] / 3.0f);
+        gy += 7.0f * 4 + 4.0f;
+        const float c1 = (w - 20.0f) / 24.0f;
+        for (int i = 0; i < kNn2Hid; i++) Cell(x + 10.0f + c1 * (i % 24), gy + 7.0f * (i / 24), c1 - 1.0f, 6.0f, R->nnAct[i]);
+        gy += 7.0f * 2 + 4.0f;
+        for (int i = 0; i < kNn2Hid2; i++) Cell(x + 10.0f + c1 * i, gy, c1 - 1.0f, 6.0f, R->nnAct[kNn2Hid + i]);
     }
     R = runners;
 }
 
-static void DrawHudCompact() {
+static void DrawHudCompact(bool full = false) {
     const float W = hudW, H = hudH;
-    DrawNetPanel();
     const CRGBA kGood(120, 230, 120, 255), kBad(255, 110, 110, 255), kGold(255, 214, 10, 255);
-    if (GA::on) {
-        const float gw = 420.0f, x = W - 20.0f - gw;
-        float y = 20.0f;
-        const int nb = static_cast<int>(GA::batches.size());
-        const float ph = 300.0f + 18.0f * std::min(nb, 3);
-        Box(x, y, gw, ph, kPanel);
-        Box(x, y, 4.0f, ph, CRGBA(175, 110, 255, 255));
-        Text(x + 16.0f, y + 6.0f, Format("GERACAO %d", GA::generation), 0.9f, kWhite, 0, FONT_MENU);
-        Text(x + gw - 12.0f, y + 8.0f, Perf::fps > 0.0f ? Format("%.0f fps  mod %.1f ms", Perf::fps, Perf::modMs) : std::string(""), 0.58f, kDim, 2);
-        y += 34.0f;
-        // each generation still running: born of Runners (light) and runs ended (solid); the oldest closes next
-        int shown = 0;
-        for (const auto& bg : GA::batches) {
-            if (shown++ >= 3) break;
-            const int g = bg.first;
-            const int born = g < GA::birthGen ? numRunners : g == GA::birthGen ? GA::birthCount : 0;
-            const int done = static_cast<int>(bg.second.size());
-            const char* what = shown == 1 && nb > 1 ? "fechando" : g == GA::birthGen ? "nascendo" : "rodando";
-            Text(x + 16.0f, y, Format("g%d %s", g, what), 0.6f, kWhite);
-            Box(x + 150.0f, y + 5.0f, 170.0f, 9.0f, CRGBA(255, 255, 255, 30));
-            Box(x + 150.0f, y + 5.0f, 170.0f * born / std::max(numRunners, 1), 9.0f, CRGBA(175, 110, 255, 90));
-            Box(x + 150.0f, y + 5.0f, 170.0f * done / std::max(numRunners, 1), 9.0f, CRGBA(175, 110, 255, 255));
-            Text(x + gw - 12.0f, y, Format("%d/%d", done, numRunners), 0.6f, kDim, 2);
-            y += 18.0f;
-        }
-        y += 4.0f;
-        // the last generation closed and the record
-        const auto& h = GA::history;
-        const auto& h10 = GA::history10;
-        if (!h10.empty())
-            Text(x + 16.0f, y, Format("ultima (g%d): melhor %.1f   media dos 10 melhores %.1f", GA::generation - 1, h.back(), h10.back()), 0.6f, kWhite);
-        else Text(x + 16.0f, y, "nenhuma geracao fechada ainda", 0.6f, kDim);
-        y += 18.0f;
-        if (GA::bestGen >= 0)
-            Text(x + 16.0f, y, Format("recorde %.1f (g%d, %s)   %.1f s, desvio %.2f m", GA::bestScore, GA::bestGen, GA::modes[GA::best.mode].c_str(),
-                GA::bestRes.time, GA::bestRes.mean), 0.6f, kGold);
-        y += 22.0f;
-        // the evolution: the mean of each generation's 10 best (bars, taller = better) and its best (white tick)
-        {
-            const float bx = x + 16.0f, bw = gw - 32.0f, bh = 70.0f;
-            Box(bx, y, bw, bh, CRGBA(255, 255, 255, 16));
-            const int n = std::min<int>(static_cast<int>(h10.size()), 30);
-            if (n > 0) {
-                double lo = 1e18, hi = -1e18;
-                for (int i = static_cast<int>(h10.size()) - n; i < static_cast<int>(h10.size()); i++) {
-                    if (h10[i] < 1000.0) { lo = std::min(lo, h10[i]); hi = std::max(hi, h10[i]); }
-                    if (i < static_cast<int>(h.size()) && h[i] < 1000.0) { lo = std::min(lo, h[i]); hi = std::max(hi, h[i]); }
-                }
-                if (hi <= lo) hi = lo + 1.0;
-                const float step = bw / 30.0f;
-                auto hgt = [&](double v) { return static_cast<float>(0.15 + 0.85 * (hi - std::min(v, hi)) / (hi - lo)) * bh; };
-                for (int i = 0; i < n; i++) {
-                    const int j = static_cast<int>(h10.size()) - n + i;
-                    const float f = hgt(h10[j]);
-                    Box(bx + step * i + 1.0f, y + bh - f, step - 2.0f, f, CRGBA(120, 200, 255, 200));
-                    if (j < static_cast<int>(h.size()) && h[j] < 1000.0) Box(bx + step * i + 1.0f, y + bh - hgt(h[j]) - 1.0f, step - 2.0f, 3.0f, kWhite);
-                }
-                Text(bx + 4.0f, y + 2.0f, Format("%.1f", lo), 0.5f, kDim);
-                Text(bx + 4.0f, y + bh - 16.0f, Format("%.1f", hi), 0.5f, kDim);
+    static bool prevF10 = false;
+    const bool f10 = KeyPressed(VK_F10) != 0;
+    if (f10 && !prevF10) netFull = !netFull;
+    prevF10 = f10;
+
+    // --- the top bar: the generation and its cars, the record and the validation, fps; the course under it
+    int running = 0, home = 0, out = 0;
+    for (int k = 0; k < numRunners; k++) {
+        const std::string& r = runners[k].result;
+        running += r.empty();
+        home += r == "end";
+        out += !r.empty() && r != "end";
+    }
+    {
+        const float x = 20.0f, y = 26.0f, w = W - 40.0f, h = 46.0f; // (under another mod's text at the top left)
+        Box(x, y, w, h, kPanel);
+        Box(x, y, 3.0f, h, CRGBA(175, 110, 255, 255));
+        Text(x + 12.0f, y + 4.0f, Format("GERACAO %d", GA::generation), 0.7f, kWhite, 0, FONT_MENU);
+        Text(x + 150.0f, y + 6.0f, Format("%d rodando   %d chegaram   %d fora   de %d", running, home, out, numRunners), 0.55f, kDim);
+        std::string mid = GA::bestGen >= 0 ? Format("recorde %.2f (g%d)", GA::bestScore, GA::bestGen) : std::string("recorde -");
+        if (GA::valHome) mid += Format("    validacao %.2f", GA::valScore);
+        if (!GA::genRows.empty()) mid += Format("    top10 %.2f", GA::genRows.back().top10);
+        Text(x + w * 0.55f, y + 6.0f, mid, 0.55f, kGold, 1);
+        Text(x + w - 10.0f, y + 6.0f, Perf::fps > 0.0f ? Format("%.0f fps  mod %.1f ms", Perf::fps, Perf::modMs) : std::string(""), 0.5f, kDim, 2);
+        // the course: its parts and every car on it (the followed one in gold)
+        R = runners;
+        if (course.length > 1.0f) {
+            const float x0 = x + 12.0f, x1 = x + w - 12.0f, cy = y + 34.0f;
+            Box(x0, cy - 1.0f, x1 - x0, 2.0f, CRGBA(255, 255, 255, 80));
+            for (const auto& sec : course.sections) {
+                const float sx = x0 + (x1 - x0) * sec.first / course.length;
+                Box(sx - 0.5f, cy - 5.0f, 1.0f, 10.0f, CRGBA(255, 255, 255, 110));
             }
-            y += bh + 4.0f;
-            if (h10.size() >= 6) {
-                const double d = h10.back() - h10[h10.size() - 6];
-                Text(x + 16.0f, y, Format("10 melhores: %+.1f s em 5 geracoes   %s", d, d < -0.2 ? "evoluindo" : d > 0.2 ? "piorou" : "parado"), 0.6f,
-                    d < -0.2 ? kGood : d > 0.2 ? kBad : kDim);
+            for (int k = numRunners - 1; k >= 0; k--) {
+                if (!runners[k].result.empty()) continue;
+                const float sx = x0 + (x1 - x0) * std::clamp(runners[k].sMax / course.length, 0.0f, 1.0f);
+                Box(sx - 2.0f, cy - 2.0f, 4.0f, 4.0f, Alpha(ColorOf(k), 200));
             }
-            else Text(x + 16.0f, y, "barras: media dos 10 melhores   traco: o melhor", 0.56f, kDim);
-            y += 18.0f;
-            Text(x + 16.0f, y, Format("sigma %.3f%s   arquivo %d", GA::sigma, GA::stall > 0 ? Format(" (sem melhora %d)", GA::stall).c_str() : "",
-                static_cast<int>(GA::archive.size())), 0.56f, kDim);
-            y += 18.0f;
-            Text(x + 16.0f, y, Format("pontos = tempo + %.0f x m.s alem da borda + %.0f x s com 4 rodas fora", GA::edgePenalty, GA::offPenalty), 0.56f, kDim);
-            y += 20.0f;
-        }
-        // the closing generation's 5 best so far
-        if (!GA::batches.empty()) {
-            std::vector<const GA::Done*> top;
-            for (const auto& dn : GA::batches.begin()->second) top.push_back(&dn);
-            const int nt = std::min<int>(5, static_cast<int>(top.size()));
-            std::partial_sort(top.begin(), top.begin() + nt, top.end(), [](const GA::Done* a, const GA::Done* b) { return a->r.score < b->r.score; });
-            for (int i = 0; i < nt; i++) {
-                const GA::Done& d = *top[i];
-                Text(x + 16.0f, y, Format("%d. %s %s", i + 1, d.id.c_str(), GA::modes[d.g.mode].c_str()), 0.56f, kWhite);
-                Text(x + gw - 12.0f, y, d.r.why == "end" ? Format("%.1f  (%.1f s, %.2f m)", d.r.score, d.r.time, d.r.mean) : d.r.why, 0.56f,
-                    d.r.why == "end" ? kGood : kBad, 2);
-                y += 16.0f;
+            if (camOn >= 0 && camOn < numRunners) {
+                const float sx = x0 + (x1 - x0) * std::clamp(runners[camOn].sMax / course.length, 0.0f, 1.0f);
+                Box(sx - 1.0f, cy - 7.0f, 2.0f, 14.0f, kGold);
+                Text(sx, cy - 20.0f, SectionAt(course, course.s.empty() ? 0.0f : runners[camOn].sMax), 0.42f, kGold, 1);
             }
         }
-        Text(x + 16.0f, 20.0f + ph - 18.0f, "F9 HUD   PgUp/PgDn carros   Home auto", 0.5f, kDim);
     }
 
-    // the car followed
+    // --- the right column: the evolution and the leaders
+    {
+        const float w = 300.0f, x = W - 20.0f - w;
+        float y = 80.0f;
+        // (from the report's rows: both kinds of generations fill them; history10 only the steady state)
+        std::vector<double> hb, h10;
+        for (const auto& gr : GA::genRows) { hb.push_back(gr.score); h10.push_back(gr.top10); }
+        const float ch = 52.0f;
+        Box(x, y, w, ch + 40.0f, kPanel);
+        Text(x + 10.0f, y + 3.0f, "EVOLUCAO", 0.5f, kWhite);
+        Text(x + w - 8.0f, y + 3.0f, "barra: top10  traco: melhor", 0.42f, kDim, 2);
+        const float bx = x + 10.0f, by = y + 18.0f, bw = w - 20.0f;
+        const int n = std::min<int>(static_cast<int>(h10.size()), 40);
+        if (n > 0) {
+            double lo = 1e18, hi = -1e18;
+            for (int i = static_cast<int>(h10.size()) - n; i < static_cast<int>(h10.size()); i++) {
+                if (h10[i] < 1000.0) { lo = std::min(lo, h10[i]); hi = std::max(hi, h10[i]); }
+                if (i < static_cast<int>(hb.size()) && hb[i] < 1000.0) { lo = std::min(lo, hb[i]); hi = std::max(hi, hb[i]); }
+            }
+            if (hi <= lo) hi = lo + 1.0;
+            const float step = bw / 40.0f;
+            auto hgt = [&](double v) { return static_cast<float>(0.12 + 0.88 * (hi - std::min(v, hi)) / (hi - lo)) * ch; };
+            for (int i = 0; i < n; i++) {
+                const int j = static_cast<int>(h10.size()) - n + i;
+                const float f = hgt(h10[j]);
+                Box(bx + step * i, by + ch - f, step - 1.0f, f, CRGBA(120, 200, 255, 170));
+                if (j < static_cast<int>(hb.size()) && hb[j] < 1000.0) Box(bx + step * i, by + ch - hgt(hb[j]) - 1.0f, step - 1.0f, 2.0f, kWhite);
+            }
+        }
+        if (h10.size() >= 6) {
+            const double d = h10.back() - h10[h10.size() - 6];
+            Text(x + 10.0f, by + ch + 4.0f, Format("top10 %+.2f s em 5 ger.  %s", d, d < -0.2 ? "evoluindo" : d > 0.2 ? "piorou" : "parado"), 0.46f,
+                d < -0.2 ? kGood : d > 0.2 ? kBad : kDim);
+        }
+        Text(x + w - 8.0f, by + ch + 4.0f, Format("sigma %.3f", GA::sigma), 0.46f, kDim, 2);
+        y += ch + 46.0f;
+        // the leaders: the finished ones by score, then the ones running by how far they got
+        const std::vector<int> order = Standings();
+        const int rows = std::min<int>(full ? 16 : 8, numRunners);
+        Box(x, y, w, 20.0f + rows * 15.0f, kPanel);
+        Text(x + 10.0f, y + 3.0f, "LIDERES", 0.5f, kWhite);
+        for (int i = 0; i < rows; i++) {
+            const int k = order[i];
+            const Runner& rr = runners[k];
+            const float ry = y + 19.0f + i * 15.0f;
+            if (k == camOn) Box(x + 4.0f, ry, w - 8.0f, 14.0f, CRGBA(255, 255, 255, 28));
+            Box(x + 10.0f, ry + 3.0f, 8.0f, 8.0f, ColorOf(k));
+            Text(x + 22.0f, ry, Format("%d. %s", i + 1, rr.tag), 0.46f, kWhite);
+            const float prog = course.length > 1.0f ? rr.sMax / course.length : 0.0f;
+            const std::string what = rr.result.empty() ? Format("%.0f%%  %.0f km/h", 100.0f * prog, rr.speedNow)
+                                   : rr.result == "end" ? Format("%.2f", GA::res[k].score) : rr.result;
+            Text(x + w - 8.0f, ry, what, 0.46f, rr.result.empty() ? kDim : rr.result == "end" ? kGood : kBad, 2);
+        }
+        y += 20.0f + rows * 15.0f + 6.0f;
+        if (full && !GA::secNames.empty()) {
+            // the last generation's sectors: the best of each (any car) and what the winner lost there
+            const int ns = static_cast<int>(GA::secNames.size());
+            Box(x, y, w, 20.0f + ns * 13.0f + 16.0f, kPanel);
+            Text(x + 10.0f, y + 3.0f, Format("SETORES (g%d)", GA::secGen), 0.5f, kWhite);
+            Text(x + w - 8.0f, y + 3.0f, "melhor   vencedor perde", 0.42f, kDim, 2);
+            double sb = 0.0, sw = 0.0;
+            for (int q = 0; q < ns; q++) {
+                const float ry = y + 19.0f + q * 13.0f;
+                const float bst = q < static_cast<int>(GA::secBest.size()) ? GA::secBest[q] : -1.0f;
+                const float win = q < static_cast<int>(GA::secWin.size()) ? GA::secWin[q] : -1.0f;
+                if (bst > 0.0f) sb += bst;
+                if (win > 0.0f) sw += win;
+                Text(x + 10.0f, ry, GA::secNames[q], 0.42f, kDim);
+                Text(x + 210.0f, ry, bst > 0.0f ? Format("%.2f", bst) : std::string("-"), 0.42f, kWhite, 2);
+                if (bst > 0.0f && win > 0.0f)
+                    Text(x + w - 8.0f, ry, Format("%+.2f", win - bst), 0.42f, win - bst > 0.15f ? kBad : kDim, 2);
+            }
+            Text(x + 10.0f, y + 19.0f + ns * 13.0f + 1.0f, Format("soma dos melhores %.2f   vencedor %.2f", sb, sw), 0.44f, kGold);
+        }
+    }
+    if (full) {
+        // the GA's state: the validation, the spread, the share home, sigma, the ES, a plateau, the split, the cost
+        const float x = 20.0f, y = 80.0f, w = 340.0f;
+        Box(x, y, w, 128.0f, kPanel);
+        Box(x, y, 3.0f, 128.0f, CRGBA(175, 110, 255, 255));
+        Text(x + 10.0f, y + 3.0f, "ALGORITMO", 0.5f, kWhite);
+        float ly = y + 20.0f;
+        auto line = [&](const std::string& a, const std::string& b, CRGBA c) {
+            Text(x + 10.0f, ly, a, 0.46f, kDim);
+            Text(x + w - 8.0f, ly, b, 0.46f, c, 2);
+            ly += 15.0f;
+        };
+        const GA::GenRow* last = GA::genRows.empty() ? nullptr : &GA::genRows.back();
+        line("validacao (mediana de 5)", GA::valHome ? Format("%.2f", GA::valScore) : std::string("nao chegou"), GA::valHome ? kGood : kBad);
+        if (last) {
+            line("ultima geracao: chegaram", Format("%d de %d  (%.0f%%)", last->home, last->runs, last->runs ? 100.0 * last->home / last->runs : 0.0), kWhite);
+            line("dispersao dos 50 melhores", Format("%.2f s%s", last->std50, last->plateau ? "  (plato)" : ""), kWhite);
+            line("rede: passos ES / mudanca", Format("%d / %.3f", last->esSteps, last->nnOut), kWhite);
+        }
+        line("sigma dos genes", Format("%.3f", GA::sigma), kWhite);
+        line("GA / ES", GA::splitEvery > 1 ? Format("%d / %d carros", (numRunners + GA::splitEvery - 1) / GA::splitEvery, numRunners - (numRunners + GA::splitEvery - 1) / GA::splitEvery) : std::string("juntos"), kWhite);
+        line("ms por quadro: sensores / rede", Format("%.1f / %.1f", Perf::shown[Perf::NNIN], Perf::shown[Perf::NNNET]), kWhite);
+    }
+
+    // --- the car followed, bottom left, and its net above it
     R = &runners[std::clamp(camOn, 0, numRunners - 1)];
     if (car) {
-        const float pw = 470.0f, ph = 100.0f, x = 20.0f, y = H - 40.0f - ph;
-        Box(x, y, pw, ph, kPanel);
-        Box(x, y, pw, 3.0f, ColorOf(R->index));
-        const std::string who = GA::on && GA::steady ? Format("%s.%d  %s  g%d", R->tag, R->runId, cfg.mode.c_str(), R->bornGen)
-                                                     : Format("%s  %s", R->tag, cfg.mode.c_str());
-        Text(x + 12.0f, y + 6.0f, who, 0.75f, ColorOf(R->index), 0, FONT_MENU);
-        Text(x + pw - 12.0f, y + 8.0f, camPick >= 0 ? "camera: escolhida" : "camera: destaque da geracao nova", 0.52f, kDim, 2);
-        Text(x + 100.0f, y + 30.0f, Format("%.0f", R->speedNow), 1.8f, kWhite, 2, FONT_PRICEDOWN);
-        Text(x + 104.0f, y + 44.0f, "km/h", 0.6f, kDim);
+        const float w = 340.0f, h = 70.0f, x = 20.0f, y = H - 20.0f - h;
+        Box(x, y, w, h, kPanel);
+        Box(x, y, w, 2.0f, ColorOf(R->index));
+        Text(x + 10.0f, y + 4.0f, Format("%s.%d  g%d  %s", R->tag, R->runId, R->bornGen, camPick >= 0 ? "(escolhido)" : "(lider)"), 0.52f, ColorOf(R->index));
+        Text(x + w - 8.0f, y + 4.0f, SectionAt(course, course.s.empty() ? 0.0f : course.s[nearIdx]), 0.48f, kDim, 2);
+        Text(x + 74.0f, y + 20.0f, Format("%.0f", R->speedNow), 1.3f, kWhite, 2, FONT_PRICEDOWN);
+        Text(x + 78.0f, y + 30.0f, "km/h", 0.45f, kDim);
         const float pace = PaceOf(R->index);
-        if (!R->result.empty())
-            Text(x + 160.0f, y + 32.0f, R->result == "end" ? Format("chegou: %.1f s", R->endTime) : R->result, 0.7f, R->result == "end" ? kGood : kBad);
-        else if (pace < 1e8f)
-            Text(x + 160.0f, y + 32.0f, GA::bestLapTime > 0.0f ? Format("ritmo %.1f s  (%+.1f do recorde)", pace, pace - GA::bestLapTime) : Format("ritmo %.1f s", pace), 0.7f,
-                GA::bestLapTime > 0.0f && pace < GA::bestLapTime ? kGood : kWhite);
-        else Text(x + 160.0f, y + 32.0f, Format("t %.0f s", runT), 0.7f, kDim);
-        Text(x + pw - 12.0f, y + 32.0f, SectionAt(course, course.s.empty() ? 0.0f : course.s[nearIdx]), 0.6f, kDim, 2);
-        // across the road (the bar is the lane, edge to edge), the pedals, ABS / TC
-        const float bx = x + 160.0f;
+        std::string pl = R->result.empty() ? (pace < 1e8f && GA::bestLapTime > 0.0f ? Format("ritmo %.1f (%+.1f)", pace, pace - GA::bestLapTime) : Format("t %.0f s", runT))
+                                            : R->result == "end" ? Format("chegou %.2f", R->endTime) : R->result;
+        Text(x + 125.0f, y + 21.0f, pl, 0.5f, R->result.empty() ? (GA::bestLapTime > 0.0f && pace < GA::bestLapTime ? kGood : kWhite) : R->result == "end" ? kGood : kBad);
+        // across the lane, gas / brake, the aids
         if (course.halfWidth > 0.0f)
-            Bar(bx, y + 58.0f, 180.0f, 9.0f, -offsetNow / course.halfWidth,
-                R->marginNow < 0.0f ? CRGBA(255, 90, 90, 230) : R->marginNow < edgeComfortGA ? CRGBA(255, 200, 60, 230) : CRGBA(120, 230, 120, 230), true);
-        Text(bx + 186.0f, y + 54.0f, Format("desvio %.2f m", stats.time > 0.0 ? stats.absE / stats.time : 0.0), 0.52f, kDim);
-        Bar(bx, y + 76.0f, 85.0f, 8.0f, gasOut, CRGBA(76, 217, 100, 230));
-        Bar(bx + 95.0f, y + 76.0f, 85.0f, 8.0f, brakeOut, CRGBA(255, 89, 94, 230));
-        Text(bx + 186.0f, y + 72.0f, Format("%s%s%s", R->absOn ? "ABS " : "", R->tcOn ? "TC " : "", R->skidFNow || R->skidRNow ? "DERRAPANDO" : ""), 0.52f, kGold);
-        Text(x + 12.0f, y + 72.0f, Format("%.2f g", std::abs(R->latGNow)), 0.55f, kDim);
+            Bar(x + 125.0f, y + 42.0f, 120.0f, 6.0f, -offsetNow / course.halfWidth,
+                R->marginNow < 0.0f ? CRGBA(255, 90, 90, 230) : CRGBA(120, 230, 120, 230), true);
+        Bar(x + 125.0f, y + 54.0f, 58.0f, 6.0f, gasOut, CRGBA(76, 217, 100, 230));
+        Bar(x + 187.0f, y + 54.0f, 58.0f, 6.0f, brakeOut, CRGBA(255, 89, 94, 230));
+        Text(x + w - 8.0f, y + 38.0f, Format("%.1f g", std::abs(R->latGNow)), 0.46f, kDim, 2);
+        Text(x + w - 8.0f, y + 51.0f, Format("%s%s%s", R->absOn ? "ABS " : "", R->tcOn ? "TC " : "", R->skidFNow || R->skidRNow ? "DESLIZA" : ""), 0.46f, kGold, 2);
+        if (full) {
+            const float ex = x, ey = y - 34.0f;
+            Box(ex, ey, w, 30.0f, kPanel);
+            Text(ex + 10.0f, ey + 2.0f, Format("mira %.2f s  aderencia %.2f  contra %.2f  acel %.2f", cfg.lookTime, cfg.gripFactor, cfg.counterSteer, cfg.gtAccel), 0.42f, kDim);
+            Text(ex + 10.0f, ey + 15.0f, Format("rotacao %+.2f rad/s  deslize %.2f rad  vento %+.1f", car->m_vecTurnSpeed.z * GAME_SPEED_TO_MPS, R->slipNow, R->windNow), 0.42f, kDim);
+            DrawNetPanel(x, ey - 6.0f, true);
+        }
+        else DrawNetPanel(x, y - 6.0f);
     }
-
-    // the course strip: its parts and every car on it (the newest generation's brighter)
-    R = runners;
-    if (course.length > 1.0f) {
-        const float x0 = 40.0f, x1 = W - 40.0f, y = H - 18.0f;
-        Box(x0 - 12.0f, y - 12.0f, x1 - x0 + 24.0f, 24.0f, kPanel);
-        Box(x0, y - 1.0f, x1 - x0, 2.0f, CRGBA(255, 255, 255, 90));
-        for (const auto& sec : course.sections) {
-            const float sx = x0 + (x1 - x0) * sec.first / course.length;
-            Box(sx - 1.0f, y - 6.0f, 2.0f, 12.0f, CRGBA(255, 255, 255, 120));
-        }
-        int young = -1;
-        for (int k = 0; k < numRunners; k++) young = std::max(young, runners[k].bornGen);
-        for (int k = numRunners - 1; k >= 0; k--) {
-            if (!runners[k].result.empty()) continue;
-            const float sx = x0 + (x1 - x0) * std::clamp(runners[k].sMax / course.length, 0.0f, 1.0f);
-            const bool hot = runners[k].bornGen == young;
-            Box(sx - 3.0f, y - 3.0f, 6.0f, 6.0f, hot ? ColorOf(k) : CRGBA(255, 255, 255, 60));
-        }
-        if (camOn >= 0 && camOn < numRunners) {
-            const float sx = x0 + (x1 - x0) * std::clamp(runners[camOn].sMax / course.length, 0.0f, 1.0f);
-            Box(sx - 1.0f, y - 11.0f, 2.0f, 22.0f, kGold);
-        }
-    }
+    Text(W - 20.0f, H - 18.0f, "F9 HUD   F10 rede   PgUp/PgDn carros   Home lider", 0.42f, kDim, 2);
     R = runners;
 }
 
@@ -4447,7 +4555,15 @@ static void DrawHud() {
     if (f9 && !prevF9) hudMode = (hudMode + 1) % 3;
     prevF9 = f9;
     if (hudMode == 2) { Text(W - 20.0f, H - 30.0f, "F9: HUD", 0.5f, kDim, 2); return; }
+    // (the compact and full HUDs 25% bigger, text and panels together: the text was too small, the user)
+    if (hudMode == 0 || hudMode == 1) {
+        hudU *= 1.25f;
+        hudW = static_cast<float>(RsGlobal.maximumWidth) / hudU;
+        hudH = 1080.0f / 1.25f;
+    }
     if (hudMode == 0) { DrawHudCompact(); return; }
+    // (the full HUD: the compact one with more in it; the old full one took most of the screen, the user)
+    if (hudMode == 1) { DrawHudCompact(true); return; }
     const std::vector<int> order = Standings();
     if (human && runT < countdownS + 1.0f) {
         // the countdown
