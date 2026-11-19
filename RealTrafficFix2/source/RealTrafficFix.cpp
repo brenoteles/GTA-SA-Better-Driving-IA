@@ -971,6 +971,25 @@ static bool AmbientRoadHasRoom(const CVector& pos, const CVector2D& dir, CCarPat
     return count < lanes * 200 / 35; // one car per 35 m of lane at most (25: the streets at the start were packed)
 }
 
+// The test town (tools/make_town.py): the proving grid's top deck, and the mix of vehicles spawned there
+static bool InTestTown(const CVector& p) { return p.z > 2000.0f && p.x > -150.0f && p.x < 2950.0f && p.y > -3000.0f && p.y < -1700.0f; }
+static int TownModel() {
+    static const short kCars[] = { 400, 401, 404, 405, 410, 412, 418, 419, 421, 422, 426, 436, 439, 445, 458, 466, 467, 474, 475,
+        479, 489, 491, 492, 496, 500, 507, 516, 517, 518, 526, 529, 533, 540, 542, 543, 546, 547, 549, 550, 551, 554, 555, 558,
+        560, 561, 562, 565, 566, 567, 579, 580, 585, 587, 589, 600, 602, 603 };
+    static const short kFast[] = { 402, 411, 415, 429, 451, 477, 480, 506, 541, 559 };
+    static const short kBig[] = { 413, 414, 440, 482, 498, 499, 456, 455, 524, 578, 431, 437 };
+    static const short kTaxi[] = { 420, 438 };
+    static const short kBike[] = { 461, 521, 463, 581, 586, 468 };
+    const int r = CGeneral::GetRandomNumberInRange(0, 100);
+    auto pick = [](const short* m, int n) { return static_cast<int>(m[CGeneral::GetRandomNumberInRange(0, n)]); };
+    if (r < 62) return pick(kCars, static_cast<int>(std::size(kCars)));
+    if (r < 74) return pick(kFast, static_cast<int>(std::size(kFast)));
+    if (r < 86) return pick(kBig, static_cast<int>(std::size(kBig)));
+    if (r < 91) return pick(kTaxi, static_cast<int>(std::size(kTaxi)));
+    return pick(kBike, static_cast<int>(std::size(kBike)));
+}
+
 static void UpdateAmbientSpawn() {
     if (!cfgAmbientSpawn) return;
     const unsigned int now = CTimer::m_snTimeInMilliseconds;
@@ -1112,6 +1131,9 @@ static void UpdateAmbientSpawn() {
         // The model the game's population would pick here, loaded, a road vehicle
         int carClass = 0;
         int model = CCarCtrl::ChooseModel(&carClass);
+        // (the test town, over the sea and the airport: the game's population there is a handful of models; a city mix
+        // instead: sedans, sports cars, SUVs, vans, trucks, buses, taxis, motorbikes)
+        if (InTestTown(nodePos)) model = TownModel();
         if (model <= 0) continue;
         if (CStreaming::ms_aInfoForModel[model].m_nLoadState != LOADSTATE_LOADED) {
             // Asked for (the next ones get more variety than the few models loaded) and another spot tried: one model not
@@ -5939,6 +5961,11 @@ public:
         // In a queue (someone in front of it): never round it. In long queues the ones stopped 25 s counted as stuck and
         // cars behind went round them into the oncoming lane
         if (InQueue(leader)) return false;
+        // At the head of a queue for a red light or cross traffic (its own sensors say so, the light still red): waiting,
+        // however long (the test town's actuated reds last up to ~35 s, and the cars behind went round the queue through
+        // the junction with the game's weaving style)
+        if (CTimer::m_snTimeInMilliseconds - lx.lastProcessed < 500 && lx.waitState == 1 &&
+            (lx.lightColor == LIGHT_RED || lx.lightColor == LIGHT_YELLOW || lx.limiter == LIMIT_CROSS_TRAFFIC)) return false;
         // Stopped this long, whatever for: stuck (no light holds anyone 25 s). A bike wedged against a wall at the head of a
         // queue, "waiting for the light", held the whole street
         if (lx.stillTime > 25.0f && queuedTime > 10.0f) return true;
@@ -6029,6 +6056,8 @@ public:
         }
         if (!cfgBypassBlocked || !queued || xdata.waitState != 2) { xdata.queuedTime = 0.0f; return false; }
         if (now < xdata.noBypassUntil) return false;
+        // A red light ahead: the queue is waiting for it, nobody is blocking
+        if (xdata.lightColor == LIGHT_RED || xdata.lightColor == LIGHT_YELLOW) { xdata.queuedTime = 0.0f; return false; }
         // Not in or near a junction: going round a car there means going through the junction across everyone
         {
             CPathNode* nextNode = GetNode(vehicle->m_autoPilot.m_startingRouteNode);

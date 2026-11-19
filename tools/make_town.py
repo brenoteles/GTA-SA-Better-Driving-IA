@@ -35,8 +35,11 @@ APPROACH = 12.0                  # a node this far before every junction (its li
 
 # --- The network -------------------------------------------------------------------------------------------------
 # A road: its points (x, y) or (x, y, radius: a rounded corner there), lanes along it (fwd) and against it (back),
-# the kind (node spacing, speed class). Roads meet at points they share exactly: those are the junctions.
+# the kind (node spacing, speed class). Roads meet where they cross or touch (found below): those are the junctions.
 # GTA drives on the right; +y is north.
+# Like GTA's own map (and SUMO's edges): a road with more than one lane each way is two one-way carriageways with a
+# median, never one two-way link with 2+ lanes each way (none in the whole map: the game swapped such cars from the
+# leftmost to the rightmost lane at every link whose direction flipped). Two-way links: 1+1 only.
 X_STREETS = (500, 800, 1100, 1400, 1700, 2000, 2300)
 Y_A, Y_B, Y_C = -2150, -2350, -2550
 ROADS = []
@@ -46,43 +49,58 @@ def road(name, pts, fwd, back, kind):
     ROADS.append({'name': name, 'pts': [tuple(p) for p in pts], 'fwd': fwd, 'back': back, 'kind': kind})
 
 
-def grid_line(y):
-    return [(x, y) for x in X_STREETS]
+def half_width(lanes, median):
+    """The distance from a divided road's middle to each carriageway's centre line"""
+    return lanes * LANE / 2 + median / 2
 
 
+def divided(name, a, b, lanes, median, kind):
+    """Two one-way carriageways from a to b (straight): the one along a->b on its right, the other back on its left"""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    rx, ry = dy / L, -dx / L
+    h = half_width(lanes, median)
+    road(name + ' >', [(a[0] + rx * h, a[1] + ry * h), (b[0] + rx * h, b[1] + ry * h)], lanes, 0, kind)
+    road(name + ' <', [(b[0] - rx * h, b[1] - ry * h), (a[0] - rx * h, a[1] - ry * h)], lanes, 0, kind)
+
+
+H_A, H_B, H_1400 = half_width(2, 2.0), half_width(3, 3.0), half_width(2, 2.0)
+YA_N = Y_A + H_A                 # Av. A's north carriageway (westbound): the streets' north end
+YB_S = Y_B - H_B                 # Av. B's south carriageway (eastbound)
 # Avenues (west -> east)
-road('Av. A (2+2, semaforos)', grid_line(Y_A), 2, 2, 'avenue')
-road('Av. B (3+3, semaforos)', grid_line(Y_B), 3, 3, 'avenue')
-road('Av. C (1+1, sem semaforos)', grid_line(Y_C) + [], 1, 1, 'street')
-# Streets (north -> south: from Av. A at y -2150 down to Av. C at y -2550); fwd = southbound
+divided('Av. A (2+2, canteiro, semaforos)', (500, Y_A), (2300, Y_A), 2, 2.0, 'avenue')
+divided('Av. B (3+3, canteiro, semaforos)', (500, Y_B), (2300, Y_B), 3, 3.0, 'avenue')
+road('Av. C (1+1, semaforo so na Rua x=1400)', [(x, Y_C) for x in X_STREETS if x != 1400], 1, 1, 'street')
+# Streets (north -> south: from Av. A's north carriageway down to Av. C); fwd = southbound
 for x, fwd, back, label in ((500, 1, 1, '1+1'), (800, 0, 2, 'mao unica norte, 2'), (1100, 2, 0, 'mao unica sul, 2'),
-                            (1400, 2, 2, '2+2'), (1700, 0, 1, 'mao unica norte, 1'), (2000, 3, 0, 'mao unica sul, 3'),
-                            (2300, 1, 1, '1+1')):
-    pts = [(x, Y_A), (x, Y_B), (x, Y_C)]
+                            (1700, 0, 1, 'mao unica norte, 1'), (2000, 3, 0, 'mao unica sul, 3'), (2300, 1, 1, '1+1')):
+    pts = [(x, YA_N), (x, Y_C)]
     if x == 2300:
-        pts = [(x, Y_A), (x, Y_B), (x, -2450), (x, Y_C)]
+        pts = [(x, YA_N), (x, -2450), (x, Y_C)]
     road('Rua x=%d (%s)' % (x, label), pts, fwd, back, 'street')
+divided('Rua x=1400 (2+2, canteiro)', (1400, YA_N), (1400, Y_C), 2, 2.0, 'street')
 
 # The ring freeway: one way, clockwise (north side eastbound), 3 lanes; its exits and entries on the right (inside)
 RING = [(350, -1850), (2450, -1850), (2700, -1850, 200), (2700, -2100), (2700, -2600), (2700, -2850, 200),
         (1700, -2850), (100, -2850, 200), (100, -2450), (100, -1850, 200), (350, -1850)]
 road('Rodovia anel (3 faixas, mao unica)', RING, 3, 0, 'freeway')
 # Exits and entries (one lane, one way)
-road('Saida norte -> Av. A', [(350, -1850), (500, -1900, 60), (500, Y_A)], 1, 0, 'ramp')
-road('Entrada norte (Rua x=2300)', [(2300, Y_A), (2300, -1910, 50), (2450, -1850)], 1, 0, 'ramp')
+road('Saida norte -> Av. A', [(350, -1850), (500, -1900, 60), (500, YA_N)], 1, 0, 'ramp')
+road('Entrada norte (Rua x=2300)', [(2300, YA_N), (2300, -1910, 50), (2450, -1850)], 1, 0, 'ramp')
 road('Saida leste -> rotatoria', [(2700, -2100), (2600, -2230, 60), (2550, -2410)], 1, 0, 'ramp')
 road('Entrada leste (rotatoria)', [(2550, -2490), (2590, -2570, 40), (2700, -2600)], 1, 0, 'ramp')
-road('Saida sul -> Rua x=1400', [(1700, -2850), (1420, -2790, 60), (1400, -2700, 40), (1400, Y_C)], 1, 0, 'ramp')
+road('Saida sul -> Rua x=1400', [(1700, -2850), (1430, -2790, 60), (1400 + H_1400, -2700, 40), (1400 + H_1400, Y_C)], 1, 0, 'ramp')
 road('Entrada oeste (Av. C)', [(500, Y_C), (250, -2610, 60), (130, -2560, 50), (100, -2450)], 1, 0, 'ramp')
 # The roundabout: one lane, counter-clockwise; arms north (the exit), south (the entry), west (to Rua x=2300)
 RC, RR = (2550, -2450), 40.0
 road('Rotatoria', [(2590, -2450), (2550, -2410), (2510, -2450), (2550, -2490), (2590, -2450)], 1, 0, 'round')
 road('Ligacao rotatoria (1+1)', [(2300, -2450), (2510, -2450)], 1, 1, 'street')
 # A winding rural road west of the town (1+1): Av. B's west end round to Av. A's
-road('Estrada rural (1+1, curvas)', [(500, Y_B), (380, -2385, 40), (220, -2300, 60), (300, -2180, 50), (500, Y_A)], 1, 1, 'rural')
+road('Estrada rural (1+1, curvas)', [(500, YB_S), (380, -2390, 40), (220, -2300, 60), (300, -2180, 50), (500, YA_N)], 1, 1, 'rural')
 
-# Junctions with traffic lights: every junction of Av. A and Av. B
-LIT = {(x, y) for x in X_STREETS for y in (Y_A, Y_B)}
+# Junctions with traffic lights: every crossing of Av. A and Av. B (each carriageway crossing within 25 m of the point)
+LIT = [(x, y) for x in X_STREETS for y in (Y_A, Y_B)] + [(1400, Y_C)]  # (Av. C x Rua 1400 x the south exit: SUMO found 11 of its 13 collisions there unsignalised)
+LIT_RADIUS = 25.0
 
 
 # --- Geometry ----------------------------------------------------------------------------------------------------
@@ -206,13 +224,61 @@ def curve_densify(line, nodes, kind):
     return out
 
 
+def cross_points():
+    """Where two roads cross or one ends on another: a point both share (kept: a junction), the same coordinates in both"""
+    def seg_x(p, q, r, t_):
+        d = (q[0] - p[0]) * (t_[1] - r[1]) - (q[1] - p[1]) * (t_[0] - r[0])
+        if abs(d) < 1e-9:
+            return None
+        t = ((r[0] - p[0]) * (t_[1] - r[1]) - (r[1] - p[1]) * (t_[0] - r[0])) / d
+        u = ((r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0])) / d
+        e = 1e-6
+        if -e <= t <= 1 + e and -e <= u <= 1 + e:
+            return (p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t)
+        return None
+    found = 1
+    while found:
+        found = 0
+        for ia in range(len(ROADS)):
+            for ib in range(ia + 1, len(ROADS)):
+                A, B = ROADS[ia], ROADS[ib]
+                hit_any = True
+                while hit_any:
+                    hit_any = False
+                    for i in range(len(A['line3']) - 1):
+                        for j in range(len(B['line3']) - 1):
+                            pt = seg_x(A['line3'][i], A['line3'][i + 1], B['line3'][j], B['line3'][j + 1])
+                            if not pt:
+                                continue
+                            na = next((q for q in A['line3'] if math.dist(q[:2], pt) < 0.5), None)
+                            nb = next((q for q in B['line3'] if math.dist(q[:2], pt) < 0.5), None)
+                            if na and nb and na[:2] == nb[:2] and na[2] and nb[2]:
+                                continue
+                            # the point both use: one of theirs if close, else the crossing itself
+                            use = (na or nb or pt)[:2]
+                            for R, k, q in ((A, i, na), (B, j, nb)):
+                                line = R['line3']
+                                if q:
+                                    line[line.index(q)] = (use[0], use[1], True)
+                                else:
+                                    line.insert(k + 1, (use[0], use[1], True))
+                            found += 1
+                            hit_any = True
+                            break
+                        if hit_any:
+                            break
+
+
 def build():
     key = lambda p: (round(p[0], 2), round(p[1], 2))  # noqa: E731
     nodes = {}                  # key -> dict(x, y, idx)
     links = {}                  # (ka, kb) sorted pair -> dict(a, b, fwd(a->b), back, kind, road)
     order = []
     for r in ROADS:
-        line = round_arc(r['pts']) if r['kind'] == 'round' else expand(r)
+        r['line3'] = round_arc(r['pts']) if r['kind'] == 'round' else expand(r)
+    cross_points()
+    for r in ROADS:
+        line = r['line3']
         pts = sample(line, SPACING[r['kind']])
         pts = curve_densify(line, pts, r['kind'])
         r['line'] = [p[:2] for p in line]
@@ -238,7 +304,8 @@ def build():
             raise SystemExit('dead end at %s' % (k,))
         if len(adj[k]) > 15:
             raise SystemExit('too many roads at %s' % (k,))
-    lit = {key(p) for p in LIT}
+    lit = {k for k in order if len(adj[k]) > 2 and
+           min(math.dist((nodes[k]['x'], nodes[k]['y']), p) for p in LIT) < LIT_RADIUS}
     # Each link's navi: its node (the end its 'left' lanes go to), its light
     for pair, l in links.items():
         a, b = pair
@@ -370,10 +437,15 @@ def lane_edges(l, nodes):
 def outputs(nodes, order, links, adj, lit, addr):
     town_txt = []
     js = {'deck_z': DECK_Z, 'lane_width': LANE, 'roads': [], 'junctions': [], 'links': []}
-    jid = {}
+    jid, centres = {}, []
     for k in order:
         if len(adj[k]) > 2:
-            jid[k] = 'J%d' % (len(jid) + 1)
+            p = (nodes[k]['x'], nodes[k]['y'])
+            c = next((c for c in centres if math.dist(c[1], p) < 30.0), None)
+            if not c:
+                c = ['J%d' % (len(centres) + 1), p]
+                centres.append(c)
+            jid[k] = c[0]
             js['junctions'].append({'id': jid[k], 'x': round(nodes[k]['x'], 1), 'y': round(nodes[k]['y'], 1),
                                     'roads': len(adj[k]), 'lights': k in lit, 'node': list(addr[k])})
     for r in ROADS:
@@ -459,11 +531,14 @@ def draw_map(nodes, links, adj, lit, jid, path):
                 cx, cy = mx + rx * off * sgn, my + ry * off * sgn
                 ax.add_patch(FancyArrow(cx - ux * sgn * 7, cy - uy * sgn * 7, ux * sgn * 12, uy * sgn * 12, width=1.2,
                                         head_width=4.5, head_length=5, color='white', zorder=4, lw=0))
+    labelled = set()
     for k, name in jid.items():
         n = nodes[k]
-        ax.plot(n['x'], n['y'], 'o', ms=9 if k in lit else 6, color='#e53935' if k in lit else '#1e88e5', zorder=5,
-                markeredgecolor='white', markeredgewidth=0.8)
-        ax.text(n['x'] + 9, n['y'] + 9, name, fontsize=9, color='#111', zorder=6, weight='bold')
+        ax.plot(n['x'], n['y'], 'o', ms=6 if k in lit else 5, color='#e53935' if k in lit else '#1e88e5', zorder=5,
+                markeredgecolor='white', markeredgewidth=0.6)
+        if name not in labelled:
+            labelled.add(name)
+            ax.text(n['x'] + 12, n['y'] + 12, name, fontsize=10, color='#111', zorder=6, weight='bold')
     for r in ROADS:
         line = r['line']
         street = r['name'].startswith('Rua')

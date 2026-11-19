@@ -50,6 +50,8 @@ def main(base, override, out, lanes_csv=None):
     net = Network(load_all(merged_paths(base, override)))
     node = net.node
     roads = {k for k, n in node.items() if not n.boats}
+    if os.environ.get('SUMO_MIN_Z'):  # only one level of the map (the test town: SUMO_MIN_Z=2000)
+        roads = {k for k in roads if node[k].z > float(os.environ['SUMO_MIN_Z'])}
     if lanes_csv:
         import csv
         changed = 0
