@@ -120,8 +120,8 @@ footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule)
     <h2>Resumo</h2>
     <div class="summary">
       <div class="stat"><b>34</b><span>itens feitos</span></div>
-      <div class="stat"><b>7</b><span>em teste no jogo</span></div>
-      <div class="stat"><b>12</b><span>a fazer</span></div>
+      <div class="stat"><b>8</b><span>em teste no jogo</span></div>
+      <div class="stat"><b>11</b><span>a fazer</span></div>
       <div class="stat"><b>5</b><span>bloqueados, pausados ou descartados</span></div>
     </div>
     <div class="bar" role="img" aria-label="34 feitos, 7 em teste, 12 a fazer, 5 bloqueados ou descartados de 58 itens">
@@ -156,7 +156,7 @@ footer { color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule)
         <li class="test"><span class="box"></span><div class="item"><strong>a. F&iacute;sica medida, volante cinem&aacute;tico e ABS no tr&aacute;fego</strong><span class="res">J&aacute; ligados no <code>RealTrafficFix.ini</code> (KinematicSteer, SteerBandwidth 1,5, AiABS, RacerGripShare 0,42), mas testados s&oacute; sem tr&aacute;fego. Provar com o Cadrona r&aacute;pido Grove &rarr; Bayside; se pior que 7,2-8,7 min, desligar um por vez.</span><span class="meta">aa01d6b</span></div><span class="st test">em teste</span></li>
         <li class="todo"><span class="box"></span><div class="item"><strong>b. Perfil de velocidade ao longo da rota</strong><span class="res">O do TUM usado no GA: passada para frente (acelera&ccedil;&atilde;o), para tr&aacute;s (frenagem) e elipse de atrito, no lugar da varredura de curvas. Frenagem mais suave antes de curvas e cruzamentos.</span></div><span class="st todo">a fazer</span></li>
         <li class="todo"><span class="box"></span><div class="item"><strong>c. Velocidade limitada pelo volante nas curvas que o jogo dirige</strong><span class="res">v &le; &radic;(G&middot;L / tan|volante|). Em (1793, 892) o carro acelerou com o volante no batente a 2,3 g e rodou. Escrito e revertido sem teste.</span></div><span class="st todo">a fazer</span></li>
-        <li class="todo"><span class="box"></span><div class="item"><strong>d. Pursuit com olhar &agrave; frente pela velocidade e reflexo de giro</strong><span class="res">O volante que venceu todas as gera&ccedil;&otilde;es do GA (LookaheadTime &ge; 0,3 s, amortecimento do giro). Comparar com o controlador de faixa atual.</span></div><span class="st todo">a fazer</span></li>
+        <li class="test"><span class="box"></span><div class="item"><strong>d. O melhor piloto do GA (g225) dirigindo o tr&aacute;fego</strong><span class="res">NeuralDriver.h: pursuit na faixa com os genes do GA, amortecimento de giro e o res&iacute;duo da rede no volante (e no pedal s&oacute; com a rua livre); ligado para todos os carros (NeuralDriver = 1). Offline a rede quase n&atilde;o reage &agrave; situa&ccedil;&atilde;o (res&iacute;duo quase constante): quem dirige &eacute; o pursuit. Ainda sem teste no jogo; comparar NeuralResidual 1 contra 0.</span></div><span class="st test">sem teste</span></li>
         <li class="todo"><span class="box"></span><div class="item"><strong>e. Ader&ecirc;ncia aprendida por tipo de curva</strong><span class="res">5 faixas de raio, cada uma aprende pelo resultado, limitada pela ader&ecirc;ncia da f&oacute;rmula.</span></div><span class="st todo">a fazer</span></li>
         <li class="drop"><span class="box"></span><div class="item"><strong>f. Rede neural, linha de corrida e pontua&ccedil;&atilde;o de pista no tr&aacute;fego</strong><span class="res">S&oacute; para corrida; o tr&aacute;fego segue o centro da faixa.</span></div><span class="st drop">fora do tr&aacute;fego</span></li>
       </ul>

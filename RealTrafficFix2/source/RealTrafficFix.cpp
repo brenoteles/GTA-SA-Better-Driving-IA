@@ -240,6 +240,8 @@ public:
     bool onGhost = false;
     float ghostSpeed = 1000.0f;
     float lkGain = 1.0f;            // lane controller: the yaw the car really makes over what its turn model says
+    float nnLook = 0.0f, nnPedal = 0.0f; // the proving ground's driver (NeuralDriver.h): its net's look-ahead and pedal outputs
+    unsigned int nnFrame = 0;
     float absScale = 1.0f;          // AI ABS: eased off while a wheel still locks
     float lkPrevYaw = 0.0f, lkPrevSteer = 0.0f;
     unsigned int lkSteadySince = 0;
@@ -496,6 +498,7 @@ static bool cfgAdaptiveLimits = true;
 // - the AI's grip: 10 x adhesive x tractionMult m/s2 from the formula, but the front axle saturates first; racing lines
 //   were followed within ~0.2-0.5 m at 42% of it (zig-zag, slalom, Z turns, chicanes, a hairpin after 385 km/h)
 static bool cfgKinematicSteer = true;
+static bool cfgNeuralDriver = true;      // the proving ground's best driver steers the lanes (NeuralDriver.h)
 static bool cfgAmbientSpawnAhead = true; // ambient cars mostly ahead of a moving player
 static float cfgSteerBandwidth = 1.5f;   // rad/s: the error comes back like a critically damped spring at every speed
 static bool cfgAiAbs = true;
@@ -3776,6 +3779,8 @@ static void ProjectOnLine(const LaneLine& line, const CVector2D& pos, float& alo
     }
 }
 
+#include "NeuralDriver.h"
+
 // Steering (> 0: left) to follow lane laneF; refRate / refAccel: the lane's own sideways speed and acceleration (m/s,
 // m/s2, > 0 to the right) while it moves in a lane change. NAN where the game steers (why: see laneKeepOff)
 static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed, float laneF,
@@ -3823,6 +3828,14 @@ static float LaneControllerSteer(CVehicle* veh, ExtendedData& xdata, float speed
     laneKeepErrMax = std::max(laneKeepErrMax, std::abs(yOff));
     why = -1;
 
+    if (cfgNeuralDriver && NeuralDriver::ready) {
+        const float maxSteer = std::max(plugin::CallAndReturn<float, 0x427FE0, CVehicle*>(veh), xdata.bRacer ? 0.45f : 0.0f);
+        const float nn = NeuralDriver::Steer(veh, xdata, line, s0, v, refOffset, maxSteer);
+        if (std::isfinite(nn)) {
+            xdata.laneKeepFrame = frameCounter;
+            return nn;
+        }
+    }
     if (cfgKinematicSteer) {
         // Kinematic steering (proving ground): at the rear axle, in the line's frame, e' = v sin(psi) and psi' = v (k -
         // kLine): k = kLine - wn^2/v^2 e - 2 wn/v sin(psi), wheel = atan(L k). In a lane change the S's own sideways
@@ -4584,6 +4597,7 @@ static void FollowPathHook(CVehicle* veh, float* steer, float* gas, float* brake
     if (!handbrakeTurn) ApplyCounterSteer(veh, xdata, speed, steer);
     ApplyPedalControl(veh, xdata, speed, gas, brake, handbrake);
     ApplyAccelLimit(veh, xdata, speed, gas, brake);
+    if (cfgNeuralDriver) NeuralDriver::Pedal(veh, xdata, speed, gas, brake);
     ApplyDriverAids(veh, xdata, speed, *steer, gas, brake);
     ApplyWheelspin(veh, xdata, speed, steer, gas, brake);
     if (lowSpeedBrake) { *gas = 0.0f; *brake = 1.0f; }
@@ -4917,6 +4931,14 @@ public:
         ReadIniBool(ini, "SteerRateLimit", cfgSteerRateLimit);
         ReadIniBool(ini, "LaneKeep", cfgLaneKeep);
         ReadIniBool(ini, "KinematicSteer", cfgKinematicSteer);
+        ReadIniBool(ini, "NeuralDriver", cfgNeuralDriver);
+        ReadIniFloat(ini, "NeuralResidual", NeuralDriver::residual);
+        ReadIniFloat(ini, "NeuralPedal", NeuralDriver::pedalResidual);
+        ReadIniFloat(ini, "NeuralLookaheadTime", NeuralDriver::lookTime);
+        ReadIniFloat(ini, "NeuralLookaheadMin", NeuralDriver::lookMin);
+        ReadIniFloat(ini, "NeuralLookaheadMax", NeuralDriver::lookMax);
+        ReadIniFloat(ini, "NeuralGain", NeuralDriver::gain);
+        ReadIniFloat(ini, "NeuralCounterSteer", NeuralDriver::counterSteer);
         ReadIniBool(ini, "HoldUntilCollision", cfgHoldUntilCollision);
         ReadIniBool(ini, "AmbientSpawnAhead", cfgAmbientSpawnAhead);
         ReadIniFloat(ini, "SteerBandwidth", cfgSteerBandwidth);
@@ -5134,6 +5156,10 @@ public:
         if (cfgAdaptiveLimits) LoadLearnedLimits();
         steerFile = dir + "RealTrafficFix.steer.txt";
         if (cfgSteerModel) LoadSteerModel();
+        if (cfgNeuralDriver) {
+            NeuralDriver::Load(dir + "RealTrafficFix.neural.txt");
+            lg << (NeuralDriver::ready ? "NeuralDriver: the proving ground's driver loaded\n" : "NeuralDriver: RealTrafficFix.neural.txt missing or wrong size, kinematic steering instead\n");
+        }
 
         // Runs once per game frame, before CWorld::Process (where the AI reads the cruise speed),
         // for every vehicle, not only the ones being rendered

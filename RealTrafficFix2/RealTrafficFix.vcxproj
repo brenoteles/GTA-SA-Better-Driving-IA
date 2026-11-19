@@ -97,6 +97,8 @@ xcopy /Y "$(TargetPath)" "$(GTA_SA_DIR)\scripts"
 
 if not exist "$(GTA_SA_DIR)\scripts\RealTrafficFix.ini" xcopy /Y "$(ProjectDir)RealTrafficFix.ini" "$(GTA_SA_DIR)\scripts"
 
+xcopy /Y "$(ProjectDir)RealTrafficFix.neural.txt" "$(GTA_SA_DIR)\scripts"
+
 )</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -133,6 +135,8 @@ taskkill /IM gta_sa.exe /F /FI "STATUS eq RUNNING"
 xcopy /Y "$(TargetPath)" "$(GTA_SA_DIR)\scripts"
 
 if not exist "$(GTA_SA_DIR)\scripts\RealTrafficFix.ini" xcopy /Y "$(ProjectDir)RealTrafficFix.ini" "$(GTA_SA_DIR)\scripts"
+
+xcopy /Y "$(ProjectDir)RealTrafficFix.neural.txt" "$(GTA_SA_DIR)\scripts"
 
 )</Command>
     </PostBuildEvent>

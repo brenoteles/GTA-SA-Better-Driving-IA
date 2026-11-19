@@ -1651,6 +1651,9 @@ void Update() {
         out << Format("lane controller (predictive steering on the car model, keeping and changes): %d vehicle-frames, off the centre avg %.2f m, max %.2f m; the game's steering instead: no road data %d, sharp turn ahead %d, out of the lane %d, road data too short %d\n",
             laneKeepFrames, laneKeepFrames ? laneKeepErrSum / laneKeepFrames : 0.0, laneKeepErrMax, laneKeepOff[0], laneKeepOff[1],
             laneKeepOff[2], laneKeepOff[3]);
+        out << Format("neural driver (proving ground, g225): %s, %d vehicle-frames, net wheel output avg |%.3f| (x %.2f), its pedal on %d frames (x %.2f)\n",
+            NeuralDriver::ready ? "on" : "off", NeuralDriver::frames, NeuralDriver::frames ? NeuralDriver::residualSum / NeuralDriver::frames : 0.0,
+            NeuralDriver::residual, NeuralDriver::pedalFrames, NeuralDriver::pedalResidual);
         out << Format("weaving (3 yaw-rate reversals > 0.15 rad/s within 4 s, above 54 km/h): test car %d, all cars %d\n",
             weaveEventsWatched, weaveEvents);
         out << Format("game lane put back to the lane the car is in (lane controller driving): %d\n", laneHoldCount);
