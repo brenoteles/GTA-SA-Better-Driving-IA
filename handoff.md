@@ -1,8 +1,48 @@
 # Handoff: Real Traffic Fix (GTA SA Better Driving IA)
 
-State at the end of the 2026-11-15 sessions. Read the GA section first (the latest work), then the Cadrona section
-(the traffic regression, still open), then `docs/sensores.html` (the progress checklist, published as
-https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; behind: it predates the race, proving ground and GA work).
+State on 2026-11-18. The focus moves back from the proving ground to the traffic AI: read the next section first, then
+the Cadrona section (the traffic regression, still open). Progress checklist: `docs/sensores.html` (published as
+https://claude.ai/artifact/ApRAiDCM7Dbfki8r8famLs; brought up to date with the race, proving ground and GA work).
+
+## 2026-11-18: proving ground closed, back to the traffic
+
+The race/proving-ground phase (2026-11-14 .. 2026-11-17) is paused, not deleted. Final state of the GA: generation 260,
+500 neural2 cars, best lap 102.47 s (g225, mean offset 0.60 m, ScoreVersion 7), 300-470 of 500 home per generation in
+the last ones; validation = median of 5 cars driving theta itself (ValCars), champion and candidate re-runs (7b2bc35).
+Everything is saved in the game's `scripts\proving\` (ga_state.txt, nn2_central.txt, nn2_best.txt, nn2_norm.txt,
+ga_best.ini, ga_generations.tsv, ga_report.html) and resumes with `python tools/proving.py start`.
+
+Before any traffic test: `scripts\RealTrafficFix.proving.ini` must NOT be in the game folder (while it exists the bench
+takes over: grid platform, 500 cars, no AutoTest). Move it aside (`python tools/proving.py stop` or rename it); the repo
+copy `RealTrafficFix2/RealTrafficFix.proving.ini` stays.
+
+How the phase went (details in the sections below):
+1. Race mode (11-14): the user raced the AI side by side; race_learn.py took the player's grip and line (ghost).
+   The AI still lost ~30 s a lap to the player, braking in curves and losing the line.
+2. Physics bench (11-14, later session): flat grid platform 300 m above the sea, CJ driving with the AI's physics, A/B cars. Found how
+   GTA SA's AI grip really works (no slip below the grip, turn = v tan(steer)/L, grip = 10 x adhesive x tractionMult,
+   front axle goes first, brakes lock past ~70% pedal, no ABS). Ported to traffic: KinematicSteer, SteerBandwidth 1.5,
+   AiABS, RacerGripShare 0.42 (all on in RealTrafficFix.ini; tested only without traffic).
+3. Genetic algorithm (11-15..11-17): 10 -> 40 -> 60 -> 100 -> 300 -> 500 cars on a 5.1 km circuit with every hard case
+   (slalom, moose at 300 km/h, spirals, U-turn, crosswind, humps); 7 steering algorithms competed (kinematic, stanley,
+   pursuit, mod, gt4, mpc, neural); pursuit won every generation, then all cars became neural2 (residual net on
+   pursuit, 80 -> 48 -> 24 -> 8) with a TUM-style minimum-curvature/minimum-time line and speed profile. Gemini
+   reviewed every 5 generations, every claim validated into ga.sqlite; later the ASI ran alone (no LLM).
+   Best lap: g110 129.6 s -> g147 112.2 s -> g225 102.5 s.
+
+What can go to the traffic AI (none of it ported yet beyond item a):
+a. Physics model and kinematic steering + ABS: ported, must be proven WITH traffic (Cadrona regression, below).
+b. Speed profile along the route (TUM calc_vel_profile: forward accel pass, backward brake pass, friction ellipse)
+   instead of the curve scan: smoother braking before curves and junctions.
+c. Steer-based turn speed cap v <= sqrt(G L / tan|steer|) for junction turns the game steers (spin at (1793, 892)).
+d. Pursuit with a speed-scaled lookahead (LookaheadTime >= 0.3 s) + yaw-damping reflex: the steering that won the GA.
+e. Grip per kind of curve learned by result (5 radius bands), capped by the formula grip.
+f. Not for traffic: the neural net, racing line and track-limit score (racing only; traffic keeps its lane centre).
+
+Traffic next steps, in order: (1) full Cadrona FAST Grove -> Bayside with the current ini (compare 7.19-8.72 min of
+02/11); if worse, KinematicSteer = 0, then AiABS = 0, one per run; (2) then the Sandking 495 FAST reference run;
+(3) items c and b above, one per test; (4) the open list at the end of this file (CityGapFactor, CARLA 4-7, lane
+additions, traps).
 
 ## 2026-11-16/17: every AI a neural network, TUM line, sectors - read this first
 
