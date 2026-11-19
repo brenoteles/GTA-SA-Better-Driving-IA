@@ -45,6 +45,14 @@ static const Waypoint baysideToLS[] = {
     { "Santa Maria Beach",              400.0f, -1780.0f, 0 },
     { "LS airport freeway",            1700.0f, -2150.0f, 1 },
 };
+// The test town (tools/make_town.py, the proving grid's top deck): Av. A -> the ring freeway -> its east exit into the
+// roundabout -> Av. B -> the rural road -> Av. C
+static const Waypoint townTrip[] = {
+    { "rodovia (lado norte)",   1500.0f, -1850.0f, 1 },
+    { "rotatoria",              2550.0f, -2450.0f, 0 },
+    { "Av. B",                  1400.0f, -2350.0f, 0 },
+    { "estrada rural",           220.0f, -2300.0f, 0 },
+};
 static const Location locations[] = {
     { "LS Ganton/Grove",        2440.0f, -1660.0f, 13.0f },
     { "LS Downtown",            1480.0f, -1740.0f, 13.0f },
@@ -68,6 +76,7 @@ static const Location locations[] = {
     // One long trip through everything: city streets, lights, freeways, ramps, countryside, bridges
     { "Grove Street -> Bayside", 2495.0f, -1668.0f, 13.0f, false, true, -2410.0f, 2330.0f },
     { "Bayside -> LS Downtown",  -2420.0f, 2340.0f, 5.0f, false, true, 1550.0f, -1350.0f, baysideToLS, 4, true },
+    { "Cidade de testes",          650.0f, -2150.0f, 2260.0f, false, true, 1250.0f, -2550.0f, townTrip, 4 },
 };
 static std::string routeFilter; // Route = part of the trip's name: only that trip (all of them when empty)
 static constexpr int NUM_LOCATIONS = sizeof(locations) / sizeof(locations[0]);
@@ -97,6 +106,7 @@ static bool SnapWaypoint(CVehicle* veh, const CVector2D& at, int kind) {
             CPathNode* node = GetNode(addr);
             if (!node || node->WaterNode || node->InteriorNode || node->NumberAdjNodes < 1) continue;
             if (kind == 1 && node->Speed < 2) continue;
+            if (std::abs(GetNodePos(node).z - veh->GetPosition().z) > 300.0f) continue; // (another level: the test town)
             if (kind == 2 && node->SpecialFunction != CPathNode::SPECIAL_PARKING_PARALLEL &&
                 node->SpecialFunction != CPathNode::SPECIAL_PARKING_PERPENDICULAR) continue;
             float d = (GetNodePos(node).To2D() - at).Magnitude();

@@ -187,6 +187,8 @@ public:
     // Destination: every driver is going somewhere, chosen when it appears, and its route there is calculated (A* on
     // the game's road graph). The route decides the exit of every junction and the lane to be in before it
     CVector2D destination;
+    float destZ = 0.0f;               // the height it was set from: the destination's node on that level (the test town is
+                                      // 2 km over the LS airport's roads)
     CNodeAddress destNode;
     bool hasDestination = false;
     bool fixedDestination = false;    // given from outside (AutoTest): kept until it gets there, even far beyond the loaded roads
@@ -1006,7 +1008,7 @@ static void UpdateAmbientSpawn() {
         int nearCount = 0;
         for (int i = 0; i < CPools::ms_pVehiclePool->m_nSize; i++) {
             CVehicle* v = CPools::ms_pVehiclePool->GetAt(i);
-            if (v && v->m_pDriver && (v->GetPosition() - c).Magnitude2D() < 250.0f) nearCount++;
+            if (v && v->m_pDriver && (v->GetPosition() - c).Magnitude2D() < 250.0f && std::abs(v->GetPosition().z - c.z) < 150.0f) nearCount++;
         }
         ambientNear = nearCount;
         if (nearCount >= cfgAmbientTarget) return;
@@ -1028,6 +1030,8 @@ static void UpdateAmbientSpawn() {
                     CNodeAddress addr(static_cast<short>(area), static_cast<short>(i));
                     CPathNode* node = GetNode(addr);
                     if (!node || node->SwitchedOff || node->WaterNode || node->InteriorNode) continue;
+                    // (another level: the test town over the airport, the airport under it)
+                    if (std::abs(GetNodePos(node).z - center.z) > 150.0f) continue;
                     float dist = (GetNodePos(node) - center).Magnitude2D();
                     if (dist < 250.0f) {
                         for (int n = 0; n < node->NumberAdjNodes; n++) {
@@ -2356,12 +2360,16 @@ static void PickDestination(ExtendedData& xdata, CVehicle* veh) {
     int loaded[NUM_PATH_MAP_AREAS], numLoaded = 0;
     for (int a = 0; a < NUM_PATH_MAP_AREAS; a++) if (ThePaths.m_pPathNodes[a] && ThePaths.m_dwNumVehicleNodes[a] > 0) loaded[numLoaded++] = a;
     const bool wide = static_cast<int>(CGeneral::GetRandomNumberInRange(0, 100)) < cfgDestinationWideRoads;
+    // (only roads it can get to: its own road network, the game's flood fill group; the test town is one apart)
+    CPathNode* here = GetNode(veh->m_autoPilot.m_currentAddress);
+    const int group = here ? here->Group : -1;
     const float minDist = wide ? 1200.0f : 800.0f, maxDist = wide ? 2500.0f : 2000.0f;
     for (int t = 0; t < 120 && numLoaded > 0; t++) {
         int area = loaded[CGeneral::GetRandomNumberInRange(0, numLoaded)];
         CNodeAddress addr(static_cast<short>(area), static_cast<short>(CGeneral::GetRandomNumberInRange(0, static_cast<int>(ThePaths.m_dwNumVehicleNodes[area]))));
         CPathNode* node = GetNode(addr);
         if (!IsUsableCarNode(addr, node) || node->NumberAdjNodes < 2) continue;
+        if (group >= 0 && node->Group != group) continue;
         bool isWide = node->Speed >= 2 || IsWideRoadNode(addr, node);
         float dist = (GetNodePos(node) - pos).Magnitude2D();
         if (dist < 150.0f) continue; // "arrived" at once: a new pick every frame
@@ -2506,6 +2514,7 @@ static void ResolveFixedDestination(ExtendedData& xdata) {
             CNodeAddress addr(static_cast<short>(a), static_cast<short>(i));
             CPathNode* node = GetNode(addr);
             if (!IsUsableCarNode(addr, node) || node->NumberAdjNodes < 2) continue;
+            if (std::abs(GetNodePos(node).z - xdata.destZ) > 300.0f) continue; // (another level)
             float d = (GetNodePos(node).To2D() - xdata.destination).Magnitude();
             if (d < best) { best = d; xdata.destNode = addr; }
         }
@@ -2519,6 +2528,7 @@ void SetFixedDestination(CVehicle* veh, const CVector2D& destination, float radi
     xdata.goalRadius = radius;
     xdata.goalFreeway = freeway;
     xdata.destination = destination;
+    xdata.destZ = veh->GetPosition().z;
     xdata.destNode.Clear();
     xdata.hasDestination = true;
     xdata.fixedDestination = true;
@@ -4828,6 +4838,8 @@ static std::string DriverTypeName(CVehicle* veh) { return profileNames[vehExData
 
 #include "AutoTest.h"
 #include "ProvingGround.h"
+#include "TownDraw.h"
+static std::string townFile;
 
 class RealTrafficFix {
 public:
@@ -5152,6 +5164,7 @@ public:
         if (cfgRoadEdges) LoadRoadEdges(dir + "RealTrafficFix.roadedges.txt");
         wdPath = dir + "RealTrafficFix.watchdog.txt";
         CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
+        townFile = dir + "RealTrafficFix.town.txt";
         learnedFile = dir + "RealTrafficFix.limits.txt"; // v2 measurement (the old .learned.txt values were inflated);
         if (cfgAdaptiveLimits) LoadLearnedLimits();
         steerFile = dir + "RealTrafficFix.steer.txt";
@@ -5271,6 +5284,7 @@ public:
         Events::drawingEvent += DrawDebug;
         Events::drawingEvent += AutoTest::Draw;
         Events::drawingEvent += ProvingGround::Draw;
+        Events::drawingEvent += [] { TownDraw::Draw(townFile); };
         Events::menuDrawingEvent += [] { AutoTest::Menu(&FrontEndMenuManager); };
 
         Events::onPauseAllSounds += [] {

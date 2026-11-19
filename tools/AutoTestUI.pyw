@@ -50,6 +50,7 @@ SCENARIOS = {
     'Rodovias (7 trechos)': {'Scenario': '', 'HighwayOnly': '1'},
     'Cidade (11 locais)': {'Scenario': '', 'HighwayOnly': '0'},
     'Varredura da rota (laser, sem trafego)': {'Scenario': 'scan', 'HighwayOnly': '0', 'Route': 'Grove Street'},
+    'Cidade de testes (make_town.py)': {'Scenario': 'route', 'HighwayOnly': '0', 'Route': 'Cidade de testes'},
 }
 
 LIVE_RE = re.compile(r'\[live ([\d.]+) min\] driving collisions (\d+) \(([\d.]+)/min\), spawn (\d+), oscillations (\d+) \| '
@@ -542,7 +543,7 @@ if __name__ == '__main__':
     if '--scenario' in sys.argv:
         want = sys.argv[sys.argv.index('--scenario') + 1]
         for name, sc in SCENARIOS.items():
-            if sc['Scenario'] == want:
+            if sc['Scenario'] == want or sc.get('Route') == want:  # (--scenario 'Cidade de testes': that trip)
                 app.scenario.set(name)
     if '--notraffic' in sys.argv:  # only the test car
         app.notraffic.set(True)
